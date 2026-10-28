@@ -207,7 +207,10 @@ At the end, the script prints a summary marking each appliance OK or FAILED. The
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
 - [x] Operator approval of the precheck, and background runs
 - [ ] Email or webhook notification (most useful for background runs)
-- [ ] Optional Exadata infrastructure (`patchmgr`) phases
+- [ ] Exadata infrastructure patching with `patchmgr`:
+  - [ ] Storage cells (rolling or non-rolling)
+  - [ ] Compute nodes
+  - [ ] Switches (RoCE or InfiniBand, depending on the rack)
 
 ## Disclaimer
 
