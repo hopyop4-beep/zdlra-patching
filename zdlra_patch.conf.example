@@ -1,0 +1,15 @@
+# Copy to zdlra_patch.conf and edit. This file is sourced by bash.
+# Do not commit your real zdlra_patch.conf (it is in .gitignore).
+
+RACLI="/opt/oracle.RecoveryAppliance/bin/racli"
+
+# "patch" for a bundle patch, "upgrade" for a release upgrade
+PATCH_ACTION="patch"
+
+# Full path to the patch bundle zip downloaded from My Oracle Support
+PATCH_ZIP="/radump/patches/<bundle>.zip"
+
+PATCH_STAGE_DIR="/radump/zdlra_patch_stage"
+WORK_DIR="/radump/zdlra_patch_runs"
+MIN_FREE_GB=50
+REQUIRED_USER="root"
