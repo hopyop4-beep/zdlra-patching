@@ -26,6 +26,9 @@
 #   -y, --yes           do not prompt before patch steps (precheck approval is still asked)
 #   -b, --background    after precheck approval, run the remaining phases detached
 #                       from the terminal, with no further prompts
+#   -d, --detach        run only the precheck, detached from the terminal; approve it
+#                       afterwards with --approve (for long prechecks)
+#   -a, --approve       review and approve the precheck of --run-id ID (after --detach)
 #   -r, --run-id ID     continue an existing run (reuses its folder and approval)
 #   -s, --status        show the state of the latest run, or of --run-id ID
 #   -h, --help          show this help
@@ -35,7 +38,7 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 ALL_PHASES=(precheck snapshot stage patch1 patch2 postcheck report)
 
@@ -46,8 +49,12 @@ CONFIG_FILE="${SCRIPT_DIR}/zdlra_patch.conf"
 DRY_RUN=1
 ASSUME_YES=0
 BACKGROUND=0
+DETACH=0
+APPROVE_MODE=0
 BG_CHILD=0                      # set internally on the detached process
 STATUS_MODE=0
+FINAL_STATUS=""                 # status to record on success instead of "completed"
+PRESERVE_STATUS=0               # 1 = a failure now leaves the run's status unchanged
 
 RACLI="/opt/oracle.RecoveryAppliance/bin/racli"
 PATCH_ACTION="patch"            # "patch" for a bundle patch, "upgrade" for a release upgrade
@@ -128,22 +135,31 @@ on_error() {
 }
 trap 'on_error $LINENO $?' ERR
 
+# Record the outcome in the run's status. A failure is recorded only when a phase had
+# started: an invocation that stops during setup (e.g. the lock is held by a running
+# job) or on a refused approval check must not overwrite the status of the run.
 on_exit() {
     local rc=$?
     if (( ! STATUS_MODE && ! LOCK_HANDED_OFF )); then
-        if (( rc == 0 )); then set_status "completed"; else set_status "failed in ${CURRENT_PHASE} (exit $rc)"; fi
+        if (( rc == 0 )); then
+            if [[ -n "$FINAL_STATUS" ]]; then set_status "$FINAL_STATUS"
+            elif (( ! PRESERVE_STATUS )); then set_status "completed"; fi
+        elif [[ "$CURRENT_PHASE" != setup ]] && (( ! PRESERVE_STATUS )); then
+            set_status "failed in ${CURRENT_PHASE} (exit $rc)"
+        fi
     fi
     if (( LOCK_HELD && ! LOCK_HANDED_OFF )); then rm -f "$LOCK_FILE"; fi
 }
 trap on_exit EXIT
 
-# Take the lock. A detached process takes it over from the process that started it
-# (ZDLRA_LOCK_FROM); a lock whose process is gone is treated as stale.
+# Take the lock. A detached process takes it over from the process that started it:
+# that process writes the detached pid into the lock before exiting, so the lock is
+# never left looking stale in between. A lock whose process is gone is stale.
 acquire_lock() {
     if [[ -e "$LOCK_FILE" ]]; then
         local owner
         owner="$(cat "$LOCK_FILE" 2>/dev/null || true)"
-        if [[ -n "${ZDLRA_LOCK_FROM:-}" && "$owner" == "$ZDLRA_LOCK_FROM" ]]; then
+        if [[ -n "${ZDLRA_LOCK_FROM:-}" && ( "$owner" == "$ZDLRA_LOCK_FROM" || "$owner" == "$$" ) ]]; then
             info "Taking over the lock from pid $owner."
         elif [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
             die "Lock file $LOCK_FILE is held by running pid $owner. Is another run active?"
@@ -174,6 +190,8 @@ parse_args() {
             -x|--execute)    DRY_RUN=0; shift ;;
             -y|--yes)        ASSUME_YES=1; shift ;;
             -b|--background) BACKGROUND=1; shift ;;
+            -d|--detach)     DETACH=1; shift ;;
+            -a|--approve)    APPROVE_MODE=1; shift ;;
             -r|--run-id)     RUN_ID="$2"; shift 2 ;;
             -s|--status)     STATUS_MODE=1; shift ;;
             --bg-child)      BG_CHILD=1; ASSUME_YES=1; shift ;;
@@ -184,7 +202,16 @@ parse_args() {
         esac
     done
     (( STATUS_MODE )) && return 0
+    if (( APPROVE_MODE )); then
+        [[ -n "$RUN_ID" ]] || die "--approve needs --run-id ID"
+        (( ${#PHASES[@]} == 0 )) || die "--approve takes no phases."
+        return 0
+    fi
     (( ${#PHASES[@]} )) || { usage; exit 1; }
+    if (( DETACH )); then
+        [[ "${PHASES[*]}" == precheck ]] || die "--detach runs the precheck only: $SCRIPT_NAME --detach precheck"
+        (( ! BACKGROUND )) || die "Use --detach or --background, not both."
+    fi
     local p idx last=-1
     for p in "${PHASES[@]}"; do
         idx="$(phase_index "$p")" || die "Unknown phase: $p"
@@ -361,6 +388,12 @@ precheck_fingerprint() {
 # --yes does not skip this; it needs a terminal.
 approve_precheck() {
     (( PRECHECK_REQUIRE_APPROVAL )) || return 0
+    # A detached precheck has nobody to ask: record that it is waiting instead.
+    if (( BG_CHILD )); then
+        FINAL_STATUS="awaiting approval: precheck finished; approve with --approve --run-id $RUN_ID"
+        info "Precheck finished. Approve it with: $SCRIPT_PATH -c $CONFIG_FILE --approve --run-id $RUN_ID"
+        return 0
+    fi
     [[ -t 0 ]] || die "Precheck approval needs an interactive terminal."
     local dir="${RUN_DIR}/precheck_before" fails=0 warns=0 name
     [[ -f "${dir}/failure_names.txt" ]] && fails=$(wc -l < "${dir}/failure_names.txt")
@@ -403,6 +436,8 @@ approve_precheck() {
 # Patch steps call this: the run must have an approved, recent, unchanged precheck.
 require_approval() {
     (( PRECHECK_REQUIRE_APPROVAL )) || return 0
+    # Refusing here changes nothing, so it must not mark the run as failed.
+    PRESERVE_STATUS=1
     local f="${RUN_DIR}/precheck_approval.txt"
     [[ -f "$f" ]] || die "Run $RUN_ID has no approved precheck. Run precheck first, or pass --run-id of an approved run."
     local by epoch fp age max
@@ -414,6 +449,7 @@ require_approval() {
     (( age <= max )) || die "Precheck approval is $(( age / 3600 ))h old (limit ${PRECHECK_APPROVAL_MAX_AGE_HOURS}h). Run precheck again."
     [[ "$fp" == "$(precheck_fingerprint)" ]] || die "Precheck results changed after they were approved. Run precheck again."
     info "Precheck approved by $by, $(( age / 60 )) minute(s) ago."
+    PRESERVE_STATUS=0
 }
 
 # ---------------------------------------------------------------------------
@@ -435,6 +471,8 @@ phase_precheck() {
     # TODO: confirm protected databases are not mid-backup (query RASYS views).
     # TODO: confirm the patch is valid for the current version (compare racli version with patch README).
 
+    # Marks the precheck as passed, so a detached precheck can be approved later with --approve.
+    touch "${RUN_DIR}/precheck_passed"
     approve_precheck
 }
 
@@ -524,6 +562,7 @@ start_background() {
         > "${RUN_DIR}/background.out" 2>&1 < /dev/null &
     local pid=$!
     echo "$pid" > "${RUN_DIR}/background.pid"
+    echo "$pid" > "$LOCK_FILE"
     LOCK_HANDED_OFF=1
     set_status "running in background (pid $pid): ${BG_PHASES[*]}"
     info "Remaining phases started in the background as pid $pid: ${BG_PHASES[*]}"
@@ -541,9 +580,28 @@ main() {
     init_run
     acquire_lock
 
+    # --approve: review the saved results of a detached precheck.
+    # A declined or impossible approval leaves the run's status as it was, so it can be retried.
+    if (( APPROVE_MODE )); then
+        CURRENT_PHASE="approve"
+        PRESERVE_STATUS=1
+        [[ -f "${RUN_DIR}/precheck_passed" ]] || die "Run $RUN_ID has no passed precheck to approve."
+        if [[ -f "${RUN_DIR}/precheck_approval.txt" ]]; then
+            info "Run $RUN_ID is already approved by $(sed -n 's/^approved_by=//p' "${RUN_DIR}/precheck_approval.txt")."
+            return 0
+        fi
+        approve_precheck
+        FINAL_STATUS="precheck approved"
+        return 0
+    fi
+
     # With --background, phases up to and including precheck run here, the rest detached.
+    # With --detach, the precheck itself runs detached.
     local fg_phases=("${PHASES[@]}") p
-    if (( BACKGROUND && ! BG_CHILD )); then
+    if (( DETACH && ! BG_CHILD )); then
+        fg_phases=()
+        BG_PHASES=("${PHASES[@]}")
+    elif (( BACKGROUND && ! BG_CHILD )); then
         fg_phases=()
         BG_PHASES=()
         local split=0
@@ -559,6 +617,9 @@ main() {
     fi
 
     for p in ${fg_phases[@]+"${fg_phases[@]}"}; do
+        # Check approval before marking a patch step as running, so a refusal leaves
+        # the run's status as it was.
+        [[ "$p" == patch* ]] && require_approval
         CURRENT_PHASE="$p"
         set_status "running $p"
         "phase_${p}"

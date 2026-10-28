@@ -6,23 +6,28 @@
 # blackout around it:
 #
 #   1. preflight   ssh to the node, patch script present, emcli logged in, blackout settings
-#   2. precheck    runs on the node in this terminal; you review it and type APPROVE
-#   3. blackout    created after approval, before anything changes
-#   4. patch       remaining phases start on the node in the background (they keep
-#                  running if this terminal or the jump server connection drops)
-#   5. watch       status is checked every POLL_SECONDS until the run ends
-#   6. blackout    ended when the run completes; left in place when it fails
+#   2. precheck    starts on the node, detached: it keeps running if this terminal or
+#                  the jump server connection drops; status is checked every POLL_SECONDS
+#   3. approve     when the precheck finishes, you review it here and type APPROVE
+#   4. blackout    created after approval, before anything changes
+#   5. patch       remaining phases start on the node in the background
+#   6. watch       status is checked every POLL_SECONDS until the run ends
+#   7. blackout    ended when the run completes; left in place when it fails
+#
+# Ctrl-C while watching stops watching only; the work on the node continues.
 #
 # Usage:
 #   ./zdlra_patch_run.sh -z ZDLRA [-x] [-p "phase phase ..."]
-#   ./zdlra_patch_run.sh -z ZDLRA --watch RUN_ID [-x]     resume watching a run
+#   ./zdlra_patch_run.sh -z ZDLRA --resume RUN_ID [-x]   continue from step 2/3 for a precheck run
+#   ./zdlra_patch_run.sh -z ZDLRA --watch RUN_ID [-x]    continue from step 6 for a patch run
 #
 # Options:
 #   -z, --zdlra NAME        appliance (required)
 #   -x, --execute           real run: patch for real and create/end the blackout
 #                           (default is dry run on the node and no blackout)
 #   -p, --phases LIST       phases after precheck (default: all of them)
-#   -w, --watch RUN_ID      skip to step 5 for a run that is already going
+#   -r, --resume RUN_ID     pick up a run whose precheck is running, finished or approved
+#   -w, --watch RUN_ID      watch a run whose patch phases are already going
 #       --keep-blackout     do not end the blackout when the run completes
 #   -c, --config FILE       config file (default: zdlra_jump.conf next to this script)
 #   -h, --help              show this help
@@ -35,6 +40,7 @@ INVENTORY="${SCRIPT_DIR}/../staging/appliances.conf"
 ZDLRA=""
 DRY_RUN=1
 PHASES="snapshot stage patch1 patch2 postcheck report"
+RESUME_RUN_ID=""
 WATCH_RUN_ID=""
 KEEP_BLACKOUT=0
 
@@ -44,10 +50,11 @@ REMOTE_CONFIG="/root/zdlra-patching/zdlra_patch.conf"
 POLL_SECONDS=60
 declare -A PATCH_NODE=()
 declare -A BLACKOUT_TARGETS=()   # not used here; lets the shared config load
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30)
+SSH_OPTS=(-n -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30)   # -n: never read this terminal
 
 NODE=""
 RUN_ID=""
+STAGE="precheck"                 # what is running on the node: precheck or patch
 BLACKOUT_ACTIVE=0
 
 log()  { local lvl="$1"; shift; printf '%s [%-5s] %s\n' "$(date '+%F %T')" "$lvl" "$*" >&2; }
@@ -64,6 +71,7 @@ parse_args() {
             -z|--zdlra)      ZDLRA="$2"; shift 2 ;;
             -x|--execute)    DRY_RUN=0; shift ;;
             -p|--phases)     PHASES="$2"; shift 2 ;;
+            -r|--resume)     RESUME_RUN_ID="$2"; shift 2 ;;
             -w|--watch)      WATCH_RUN_ID="$2"; shift 2 ;;
             --keep-blackout) KEEP_BLACKOUT=1; shift ;;
             -c|--config)     CONFIG_FILE="$2"; shift 2 ;;
@@ -75,7 +83,11 @@ parse_args() {
     [[ "$ZDLRA" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "Bad appliance name: $ZDLRA"
     [[ "$PHASES" =~ ^[a-z0-9\ ]+$ ]] || die "Bad phase list: $PHASES"
     [[ " $PHASES " != *" precheck "* ]] || die "Leave precheck out of --phases; it always runs first."
-    [[ -z "$WATCH_RUN_ID" || "$WATCH_RUN_ID" =~ ^[0-9_]+$ ]] || die "Bad run id: $WATCH_RUN_ID"
+    local id
+    for id in "$RESUME_RUN_ID" "$WATCH_RUN_ID"; do
+        [[ -z "$id" || "$id" =~ ^[0-9_]+$ ]] || die "Bad run id: $id"
+    done
+    [[ -z "$RESUME_RUN_ID" || -z "$WATCH_RUN_ID" ]] || die "Use --resume or --watch, not both."
 }
 
 load_config() {
@@ -95,6 +107,8 @@ pick_node() {
     [[ "$NODE" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "Bad node name: $NODE"
 }
 
+on_node() { ssh "${SSH_OPTS[@]}" "${SSH_USER}@${NODE}" "$@"; }
+
 remote_cmd() {
     local cmd="$REMOTE_SCRIPT -c $REMOTE_CONFIG $*"
     (( DRY_RUN )) || cmd+=" --execute"
@@ -106,12 +120,16 @@ blackout() { "${SCRIPT_DIR}/oem_blackout.sh" "$1" -z "$ZDLRA" -c "$CONFIG_FILE" 
 # Field from the patch script's --status output, e.g. "Status" or "Run".
 status_field() { awk -v k="$1:" '$1 == k && !done { $1 = ""; sub(/^ +/, ""); print; done = 1 }'; }   # reads all input: an early exit breaks the pipe
 
+run_status() { on_node "$REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID" 2>/dev/null | status_field Status; }
+
+xflag() { (( DRY_RUN )) || echo " -x"; }
+
 # ---------------------------------------------------------------------------
 step_preflight() {
     info "== preflight =="
     info "Appliance $ZDLRA, patch node $NODE, dry run: $DRY_RUN"
-    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${NODE}" true || die "Cannot ssh to ${SSH_USER}@${NODE} without a password."
-    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${NODE}" "[ -x '$REMOTE_SCRIPT' ] && [ -f '$REMOTE_CONFIG' ]" \
+    on_node true || die "Cannot ssh to ${SSH_USER}@${NODE} without a password."
+    on_node "[ -x '$REMOTE_SCRIPT' ] && [ -f '$REMOTE_CONFIG' ]" \
         || die "${NODE}: $REMOTE_SCRIPT or $REMOTE_CONFIG not found."
     # A dry-run blackout start checks the emcli login, reason and targets without creating anything.
     local saved=$DRY_RUN
@@ -119,58 +137,81 @@ step_preflight() {
     DRY_RUN=$saved
 }
 
-step_precheck() {
-    info "== precheck (on $NODE) =="
-    # -t gives the remote script a terminal, so you can review and type APPROVE.
-    ssh -t -o ConnectTimeout=15 "${SSH_USER}@${NODE}" "$(remote_cmd precheck)" \
-        || die "Precheck failed or was not approved. Nothing was changed and no blackout was created."
-    RUN_ID="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${NODE}" "$REMOTE_SCRIPT -c $REMOTE_CONFIG --status" | status_field Run)"
+step_precheck_start() {
+    info "== precheck (on $NODE, detached) =="
+    on_node "$(remote_cmd --detach precheck)" || die "Could not start the precheck on $NODE."
+    RUN_ID="$(on_node "$REMOTE_SCRIPT -c $REMOTE_CONFIG --status" | status_field Run)"
     [[ "$RUN_ID" =~ ^[0-9_]+$ ]] || die "Could not read the run id from $NODE."
+    info "Precheck running in run $RUN_ID"
+}
+
+on_interrupt() {
+    echo >&2
+    if [[ "$STAGE" == precheck ]]; then
+        warn "Stopped watching. The precheck keeps running on $NODE; nothing has changed yet."
+        warn "Continue later:  $0 -z $ZDLRA --resume $RUN_ID$(xflag)"
+    else
+        warn "Stopped watching. The patch keeps running on $NODE."
+        warn "Watch again:     $0 -z $ZDLRA --watch $RUN_ID$(xflag)"
+        (( BLACKOUT_ACTIVE )) && warn "The blackout is still on. End it later: ${SCRIPT_DIR}/oem_blackout.sh stop -z $ZDLRA -x"
+    fi
+    exit 130
+}
+
+# Poll the run's status until it reaches an end state for the current stage.
+# Prints the final status; returns 0 for a good end state, 1 for a failure.
+# Runs in a subshell when its output is captured, so the Ctrl-C trap is set in main.
+#   precheck: "awaiting approval", "precheck approved" or "completed" are good
+#   patch:    "completed" is good
+watch_until_done() {
+    info "== watch $STAGE (every ${POLL_SECONDS}s; Ctrl-C stops watching only) =="
+    local status last="" misses=0
+    while :; do
+        status="$(run_status || true)"
+        if [[ -n "$status" ]]; then
+            misses=0
+            if [[ "$status" != "$last" ]]; then
+                info "$NODE: $status"
+                last="$status"
+            fi
+            case "$STAGE:$status" in
+                *:*failed*)                                 echo "$status"; return 1 ;;
+                precheck:*awaiting\ approval*|precheck:*precheck\ approved*|*:*completed*)
+                                                            echo "$status"; return 0 ;;
+            esac
+        else
+            misses=$((misses + 1))
+            warn "Could not read status from $NODE (attempt $misses); the work continues there."
+        fi
+        sleep "$POLL_SECONDS"
+    done
+}
+
+# Review and approve a finished precheck, unless it is already approved or the
+# node's config does not ask for approval ($1 = status from the node).
+step_approve() {
+    case "$1" in
+        *precheck\ approved*) info "Precheck in run $RUN_ID is already approved."; return 0 ;;
+        *completed*)          info "Precheck finished; the node's config does not ask for approval."; return 0 ;;
+    esac
+    info "== approve (on $NODE) =="
+    # -t gives the remote script a terminal for the review and the APPROVE prompt.
+    ssh -t -o ConnectTimeout=15 "${SSH_USER}@${NODE}" "$(remote_cmd --approve --run-id "$RUN_ID")" \
+        || die "Precheck not approved. Nothing was changed and no blackout was created. Continue later: $0 -z $ZDLRA --resume $RUN_ID$(xflag)"
     info "Precheck approved in run $RUN_ID"
 }
 
 step_blackout_start() {
     info "== blackout =="
-    blackout start || die "Blackout was not created; patching not started. Run $RUN_ID is approved and can be continued."
+    blackout start || die "Blackout was not created; patching not started. Continue later: $0 -z $ZDLRA --resume $RUN_ID$(xflag)"
     (( DRY_RUN )) || BLACKOUT_ACTIVE=1
 }
 
 step_patch() {
     info "== patch (on $NODE, background) =="
-    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${NODE}" "$(remote_cmd --run-id "$RUN_ID" --background $PHASES)" \
+    on_node "$(remote_cmd --run-id "$RUN_ID" --background $PHASES)" \
         || die "Could not start the patch phases on $NODE. The blackout is still on: ${SCRIPT_DIR}/oem_blackout.sh stop -z $ZDLRA -x"
-}
-
-on_interrupt() {
-    echo >&2
-    warn "Stopped watching. The patch keeps running on $NODE."
-    warn "Watch again:  $0 -z $ZDLRA --watch $RUN_ID $( (( DRY_RUN )) || echo -x )"
-    (( BLACKOUT_ACTIVE )) && warn "The blackout is still on. End it later: ${SCRIPT_DIR}/oem_blackout.sh stop -z $ZDLRA -x"
-    exit 130
-}
-
-step_watch() {
-    info "== watch (every ${POLL_SECONDS}s; Ctrl-C stops watching, not patching) =="
-    trap on_interrupt INT
-    local out status last="" misses=0
-    while :; do
-        if out="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${NODE}" "$REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID" 2>/dev/null)"; then
-            misses=0
-            status="$(status_field Status <<<"$out")"
-            if [[ "$status" != "$last" ]]; then
-                info "$NODE: $status"
-                last="$status"
-            fi
-            case "$status" in
-                *completed*) trap - INT; return 0 ;;
-                *failed*)    trap - INT; return 1 ;;
-            esac
-        else
-            misses=$((misses + 1))
-            warn "Could not read status from $NODE (attempt $misses); the run continues there."
-        fi
-        sleep "$POLL_SECONDS"
-    done
+    STAGE="patch"
 }
 
 step_blackout_stop() {
@@ -190,18 +231,28 @@ main() {
     parse_args "$@"
     load_config
     pick_node
+    trap on_interrupt INT
 
     if [[ -n "$WATCH_RUN_ID" ]]; then
         RUN_ID="$WATCH_RUN_ID"
+        STAGE="patch"
         (( DRY_RUN )) || BLACKOUT_ACTIVE=1
     else
         step_preflight
-        step_precheck
+        if [[ -n "$RESUME_RUN_ID" ]]; then
+            RUN_ID="$RESUME_RUN_ID"
+            info "Resuming run $RUN_ID (status: $(run_status || echo unknown))"
+        else
+            step_precheck_start
+        fi
+        local status
+        status="$(watch_until_done)" || die "Precheck failed in run $RUN_ID ($status). Nothing was changed and no blackout was created."
+        step_approve "$status"
         step_blackout_start
         step_patch
     fi
 
-    if step_watch; then
+    if watch_until_done >/dev/null; then
         info "Run $RUN_ID completed on $NODE."
         step_blackout_stop
         info "Done. Report on $NODE: $REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID"

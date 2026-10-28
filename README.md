@@ -113,11 +113,19 @@ cp jump/zdlra_jump.conf.example jump/zdlra_jump.conf   # then edit it
 ```
 
 1. **Preflight:** checks SSH to the node, that the patch script and its config are there, the `emcli` login, the blackout reason, and the targets.
-2. **Precheck:** runs on the node in your terminal. You review the results and type `APPROVE`.
-3. **Blackout:** created after you approve, before anything changes. By default it ends by itself after `BLACKOUT_HOURS` (12), as a safety net.
-4. **Patch:** the remaining phases start on the node in the background. They keep running if your connection to the jump server drops.
-5. **Watch:** the script checks the node's status every `POLL_SECONDS` and prints each phase. Ctrl-C stops watching, not patching. To watch again, run `--watch <run id>`.
-6. **End of the blackout:** the blackout ends when the run completes, unless you pass `--keep-blackout`. If the run fails, the blackout stays on while you investigate.
+2. **Precheck:** starts on the node detached from your session, because it can take a long time. It keeps running if your connection to the jump server drops. The script checks its status every `POLL_SECONDS`.
+3. **Approve:** when the precheck finishes, the review screen opens in your terminal and you type `APPROVE`. If the precheck failed, or you don't approve, nothing has changed and no blackout exists.
+4. **Blackout:** created after you approve, before anything changes. By default it ends by itself after `BLACKOUT_HOURS` (12), as a safety net.
+5. **Patch:** the remaining phases start on the node in the background.
+6. **Watch:** the script prints each phase as the node reports it.
+7. **End of the blackout:** the blackout ends when the run completes, unless you pass `--keep-blackout`. If the run fails, the blackout stays on while you investigate.
+
+Ctrl-C only stops watching; the work on the node carries on. To pick up again:
+
+- `--resume <run id>`: the precheck is still running, finished, or approved (for example, you were away when it finished, or you declined at first).
+- `--watch <run id>`: the patch phases are already running.
+
+On the node itself, the same split is available as `zdlra_patch.sh --detach precheck`, followed by `zdlra_patch.sh --approve --run-id <run id>`.
 
 `jump/oem_blackout.sh start|status|stop -z <appliance>` also works on its own. The jump server needs root SSH access to the node without a password. The OS user running the scripts needs `emcli` access, either logged in already or through `EM_USER`. `jump/zdlra_jump.conf` is in `.gitignore`.
 
