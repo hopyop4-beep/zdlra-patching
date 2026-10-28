@@ -286,7 +286,11 @@ stage_appliance() {
     info "== check ==";      step_check "$z"
     info "== extract ==";    step_extract "$z"
     info "== post ==";       step_post "$z"
-    info "${z}: staged in $STAGE_DIR on ${NODES[*]}"
+    if (( DRY_RUN )); then
+        info "${z}: dry run passed; would stage in $STAGE_DIR on ${NODES[*]}"
+    else
+        info "${z}: staged in $STAGE_DIR on ${NODES[*]}"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -319,7 +323,9 @@ main() {
     (( skipped > 0 )) && info "  ($skipped appliance(s) not started)"
     info "Log: $LOG_FILE"
     (( DRY_RUN )) && info "Dry run: nothing was copied or unpacked. Add --execute to run it."
-    (( failed == 0 ))
+    # exit, not a failing test, so the ERR trap does not report a bogus line number.
+    if (( failed > 0 )); then exit 1; fi
+    return 0
 }
 
 main "$@"
