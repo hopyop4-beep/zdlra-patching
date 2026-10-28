@@ -202,6 +202,11 @@ At the end, the script prints a summary marking each appliance OK or FAILED. The
 - [x] Call an external precheck script and fail on errors
 - [ ] Fill in the replication and incoming-backup SQL (placeholders in place)
 - [ ] Verify the bundle checksum
+- [ ] Use the folder `zdlra_stage.sh` unpacked into:
+  - [ ] Precheck: the staged folder and expected files are on every compute node, and the archive's SHA-256 still matches
+  - [ ] `stage` phase: check the staged files instead of unzipping the bundle again
+  - [ ] Run the precheck script that came in the staged folder
+  - [ ] Fill in the staging hooks: unpack the patch zips where `racli` expects them, ownership and permissions, put the precheck script in place
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
