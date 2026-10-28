@@ -13,3 +13,13 @@ PATCH_STAGE_DIR="/radump/zdlra_patch_stage"
 WORK_DIR="/radump/zdlra_patch_runs"
 MIN_FREE_GB=50
 REQUIRED_USER="root"
+
+# External precheck script (download it yourself; it is not part of this repo).
+# The precheck phase fails if the script exits non-zero, times out, or prints
+# a line matching PRECHECK_FAIL_PATTERN.
+PRECHECK_SCRIPT="/root/zdlra/precheck/<precheck-script>"
+PRECHECK_ARGS=()                     # e.g. PRECHECK_ARGS=(--option value)
+PRECHECK_TIMEOUT=3600
+PRECHECK_FAIL_PATTERN=""             # e.g. PRECHECK_FAIL_PATTERN='^(FAIL|CRITICAL)'
+PRECHECK_REQUIRED=1
+POSTCHECK_RERUN_PRECHECK=1

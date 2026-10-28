@@ -10,7 +10,7 @@ The script breaks a patch into phases. You can run them one at a time or all tog
 
 | Phase | What it does |
 |-------|--------------|
-| `precheck` | Checks appliance status, versions and free space |
+| `precheck` | Checks appliance status and free space, then runs your external precheck script |
 | `snapshot` | Saves configuration and state before patching |
 | `stage` | Unpacks the patch bundle into the staging directory |
 | `patch1` | Runs `racli <patch\|upgrade> appliance --step=1` |
@@ -38,6 +38,20 @@ vi zdlra_patch.conf
 
 Each run writes its log, snapshots and report to `$WORK_DIR/<run id>/`.
 
+## External precheck script
+
+The `precheck` phase calls a precheck script you provide, such as the one Oracle supplies to support customers. Set it in the config:
+
+```bash
+PRECHECK_SCRIPT="/root/zdlra/precheck/<precheck-script>"
+PRECHECK_ARGS=()
+PRECHECK_FAIL_PATTERN='^(FAIL|CRITICAL)'
+```
+
+The phase fails if the script exits with a non-zero code, runs past `PRECHECK_TIMEOUT`, or prints a line that matches `PRECHECK_FAIL_PATTERN`. Its output is saved to `<run id>/precheck_before/`. By default `postcheck` runs it again and saves the output to `precheck_after/`.
+
+The script runs in dry-run mode too, because it only reads. **Do not commit the script or its output to this repo.** Get it from Oracle and keep it on the appliance.
+
 ## Before you use it
 
 - Read the README that comes with your patch bundle, and the current Oracle note on ZDLRA patching and upgrades on My Oracle Support. Check every `racli` command in the script against them, because the steps can change between releases.
@@ -46,7 +60,7 @@ Each run writes its log, snapshots and report to `$WORK_DIR/<run id>/`.
 
 ## Roadmap
 
-- [ ] Run the full `racli` check suite and fail on any error
+- [x] Call an external precheck script and fail on errors
 - [ ] Find active backup, copy-to-tape and replication jobs before patching starts
 - [ ] Verify the bundle checksum
 - [ ] Check success markers in the logs after each step

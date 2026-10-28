@@ -48,6 +48,14 @@ WORK_DIR="/radump/zdlra_patch_runs"
 MIN_FREE_GB=50
 REQUIRED_USER="root"
 
+# External precheck script (e.g. the Oracle-supplied precheck). Not shipped in this repo.
+PRECHECK_SCRIPT=""              # full path; empty = skip with a warning
+PRECHECK_ARGS=()                # arguments passed to the script
+PRECHECK_TIMEOUT=3600           # seconds before the precheck is killed
+PRECHECK_FAIL_PATTERN=""        # optional extended regex; a match in its output fails the phase
+PRECHECK_REQUIRED=1             # 1 = stop if PRECHECK_SCRIPT is not set
+POSTCHECK_RERUN_PRECHECK=1      # 1 = run the same script again after patching
+
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR=""
 LOG_FILE=""
@@ -144,6 +152,37 @@ init_run() {
     [[ -x "$RACLI" ]] || die "racli not found at $RACLI"
 }
 
+# Run the external precheck script. It is read-only, so it runs in dry-run mode too.
+# Pass/fail: non-zero exit code, timeout, or a PRECHECK_FAIL_PATTERN match in its output.
+# $1 = label for the output folder (before/after)
+run_external_precheck() {
+    local label="$1"
+    if [[ -z "$PRECHECK_SCRIPT" ]]; then
+        (( PRECHECK_REQUIRED )) && die "PRECHECK_SCRIPT is not set in the config."
+        warn "PRECHECK_SCRIPT is not set; skipping external precheck."
+        return 0
+    fi
+    [[ -x "$PRECHECK_SCRIPT" ]] || die "Precheck script not found or not executable: $PRECHECK_SCRIPT"
+
+    local out_dir="${RUN_DIR}/precheck_${label}"
+    local out_file="${out_dir}/output.txt"
+    mkdir -p "$out_dir"
+    info "Running precheck ($label): $PRECHECK_SCRIPT ${PRECHECK_ARGS[*]-} (timeout ${PRECHECK_TIMEOUT}s)"
+
+    local rc=0
+    ( cd "$out_dir" && timeout "$PRECHECK_TIMEOUT" "$PRECHECK_SCRIPT" ${PRECHECK_ARGS[@]+"${PRECHECK_ARGS[@]}"} ) \
+        > "$out_file" 2>&1 || rc=$?
+    info "Precheck output: $out_file"
+
+    (( rc == 124 )) && die "Precheck timed out after ${PRECHECK_TIMEOUT}s."
+    (( rc == 0 ))   || die "Precheck exited with code $rc. See $out_file"
+    if [[ -n "$PRECHECK_FAIL_PATTERN" ]] && grep -Eq "$PRECHECK_FAIL_PATTERN" "$out_file"; then
+        grep -En "$PRECHECK_FAIL_PATTERN" "$out_file" | head -20 | while read -r line; do err "  $line"; done
+        die "Precheck output matched PRECHECK_FAIL_PATTERN. See $out_file"
+    fi
+    info "Precheck ($label) passed."
+}
+
 # ---------------------------------------------------------------------------
 # Phases
 # ---------------------------------------------------------------------------
@@ -152,8 +191,7 @@ phase_precheck() {
     run_ro "$RACLI" version || warn "racli version failed"
     run_ro "$RACLI" status appliance || die "Appliance status check failed"
 
-    # TODO: run the appliance check suite and fail on any error.
-    #       e.g. "$RACLI" run check --all   (confirm syntax for your release)
+    run_external_precheck before
 
     local free_gb
     free_gb=$(df -BG --output=avail "$(dirname "$PATCH_STAGE_DIR")" | tail -1 | tr -dc '0-9')
@@ -210,7 +248,10 @@ phase_postcheck() {
         diff -ru "${RUN_DIR}/snapshot_before" "$snap" > "${RUN_DIR}/snapshot.diff" || true
         info "Before/after diff: ${RUN_DIR}/snapshot.diff"
     fi
-    # TODO: rerun the check suite, confirm backups and replication resume, test a restore validate.
+    if (( POSTCHECK_RERUN_PRECHECK )); then
+        run_external_precheck after
+    fi
+    # TODO: confirm backups and replication resume, test a restore validate.
 }
 
 phase_report() {
