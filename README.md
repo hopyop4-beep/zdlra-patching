@@ -200,7 +200,7 @@ At the end, the script prints a summary marking each appliance OK or FAILED. The
 ## Roadmap
 
 - [x] Call an external precheck script and fail on errors
-- [ ] Fill in the replication and incoming-backup SQL (placeholders in place); copy-to-tape
+- [ ] Fill in the replication and incoming-backup SQL (placeholders in place)
 - [ ] Verify the bundle checksum
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
