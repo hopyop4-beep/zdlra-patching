@@ -1,0 +1,34 @@
+# Settings for the jump server (OMS) scripts: oem_blackout.sh and zdlra_patch_run.sh.
+# Copy to zdlra_jump.conf (not committed) and edit. This file is sourced by bash.
+
+# --- Enterprise Manager -----------------------------------------------------
+EMCLI="emcli"                       # full path if emcli is not on PATH
+EM_USER=""                          # set to log in when emcli is not logged in (prompts for the password)
+
+# Must be one of the reasons from: emcli get_blackout_reasons
+BLACKOUT_REASON="<reason from emcli get_blackout_reasons>"
+
+# Safety net: the blackout ends by itself after this many hours. -1 = no end time.
+BLACKOUT_HOURS=12
+# 1 = also black out the targets that belong to the listed targets (-propagate_targets)
+BLACKOUT_PROPAGATE=1
+
+# Targets to black out per appliance, as EM "name:type" pairs separated by ";".
+# Find the names and types with: ./oem_blackout.sh targets -z <appliance>
+# (Assign entries one by one; the scripts declare these lists themselves.)
+BLACKOUT_TARGETS[zdlra01]="<target name>:<target type>;<host name>:host"
+
+# --- Appliances -------------------------------------------------------------
+# Compute node that runs zdlra_patch.sh, per appliance. If an appliance is not
+# listed, the first node in ../staging/appliances.conf is used, then the
+# appliance name itself.
+PATCH_NODE[zdlra01]="zdlra01db01"
+
+SSH_USER="root"
+
+# Where zdlra_patch.sh and its config live on the compute node.
+REMOTE_SCRIPT="/root/zdlra-patching/zdlra_patch.sh"
+REMOTE_CONFIG="/root/zdlra-patching/zdlra_patch.conf"
+
+# Seconds between status checks while the patch runs in the background.
+POLL_SECONDS=60

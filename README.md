@@ -100,6 +100,27 @@ Results are saved to `<run id>/precheck_before/`: the full output, plus the fail
 
 The script runs in dry-run mode too, because it only reads. **Do not commit the script or its output to this repo.** Get it from Oracle and keep it on the appliance.
 
+## Running a patch from the jump server (OMS)
+
+Start patching from the jump server, which is also the OMS. `jump/zdlra_patch_run.sh` runs `zdlra_patch.sh` on the appliance's compute node over SSH and puts an OEM blackout around it:
+
+```bash
+cp jump/zdlra_jump.conf.example jump/zdlra_jump.conf   # then edit it
+./jump/oem_blackout.sh targets -z zdlra01               # find EM target names and types for the config
+
+./jump/zdlra_patch_run.sh -z zdlra01                    # dry run: no blackout, dry run on the node
+./jump/zdlra_patch_run.sh -z zdlra01 --execute          # real run
+```
+
+1. **Preflight:** checks SSH to the node, that the patch script and its config are there, the `emcli` login, the blackout reason, and the targets.
+2. **Precheck:** runs on the node in your terminal. You review the results and type `APPROVE`.
+3. **Blackout:** created after you approve, before anything changes. By default it ends by itself after `BLACKOUT_HOURS` (12), as a safety net.
+4. **Patch:** the remaining phases start on the node in the background. They keep running if your connection to the jump server drops.
+5. **Watch:** the script checks the node's status every `POLL_SECONDS` and prints each phase. Ctrl-C stops watching, not patching. To watch again, run `--watch <run id>`.
+6. **End of the blackout:** the blackout ends when the run completes, unless you pass `--keep-blackout`. If the run fails, the blackout stays on while you investigate.
+
+`jump/oem_blackout.sh start|status|stop -z <appliance>` also works on its own. The jump server needs root SSH access to the node without a password. The OS user running the scripts needs `emcli` access, either logged in already or through `EM_USER`. `jump/zdlra_jump.conf` is in `.gitignore`.
+
 ## Staging the patches (Windows PC)
 
 The firewall stops patches from moving between hosts directly, so they go through a Windows PC. `staging/Copy-ZdlraPatches.ps1` does the first hop, from a ZDLRA to the PC. It uses the OpenSSH client built into Windows.
