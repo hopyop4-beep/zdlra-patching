@@ -15,11 +15,21 @@ MIN_FREE_GB=50
 REQUIRED_USER="root"
 
 # External precheck script (download it yourself; it is not part of this repo).
-# The precheck phase fails if the script exits non-zero, times out, or prints
-# a line matching PRECHECK_FAIL_PATTERN.
+# Failures are read from the summary at the end of its output:
+#   FAILURE SUMMARY
+#   ***********************************
+#   <date> [FAIL] <failure name>
+# The phase fails on any failure that is not waived, on a timeout, or on a
+# non-zero exit code.
 PRECHECK_SCRIPT="/root/zdlra/precheck/<precheck-script>"
 PRECHECK_ARGS=()                     # e.g. PRECHECK_ARGS=(--option value)
 PRECHECK_TIMEOUT=3600
-PRECHECK_FAIL_PATTERN=""             # e.g. PRECHECK_FAIL_PATTERN='^(FAIL|CRITICAL)'
+PRECHECK_SUMMARY_HEADER="FAILURE SUMMARY"
+PRECHECK_FAIL_PATTERN='\[FAIL\]'
+# Known, accepted failures. Each entry matches part of a failure name.
+# Waived failures are logged as warnings and do not stop the run.
+PRECHECK_WAIVERS=(
+#   "failure name you have reviewed and accepted"
+)
 PRECHECK_REQUIRED=1
 POSTCHECK_RERUN_PRECHECK=1

@@ -52,7 +52,9 @@ REQUIRED_USER="root"
 PRECHECK_SCRIPT=""              # full path; empty = skip with a warning
 PRECHECK_ARGS=()                # arguments passed to the script
 PRECHECK_TIMEOUT=3600           # seconds before the precheck is killed
-PRECHECK_FAIL_PATTERN=""        # optional extended regex; a match in its output fails the phase
+PRECHECK_SUMMARY_HEADER="FAILURE SUMMARY"   # failures are read from after this line
+PRECHECK_FAIL_PATTERN='\[FAIL\]'            # extended regex for a failure line
+PRECHECK_WAIVERS=()             # failure names (substrings) accepted as known; logged, not fatal
 PRECHECK_REQUIRED=1             # 1 = stop if PRECHECK_SCRIPT is not set
 POSTCHECK_RERUN_PRECHECK=1      # 1 = run the same script again after patching
 
@@ -153,7 +155,15 @@ init_run() {
 }
 
 # Run the external precheck script. It is read-only, so it runs in dry-run mode too.
-# Pass/fail: non-zero exit code, timeout, or a PRECHECK_FAIL_PATTERN match in its output.
+# Failures are the PRECHECK_FAIL_PATTERN lines after PRECHECK_SUMMARY_HEADER, e.g.
+#   FAILURE SUMMARY
+#   ***********************************
+#   <date> [FAIL] <failure name>
+# The phase fails on any failure not listed in PRECHECK_WAIVERS, a timeout, or a
+# non-zero exit code. Files written to precheck_<label>/:
+#   output.txt          full output
+#   failures.txt        failure lines from the summary
+#   failure_names.txt   failure names only (date and tag removed), sorted
 # $1 = label for the output folder (before/after)
 run_external_precheck() {
     local label="$1"
@@ -172,13 +182,48 @@ run_external_precheck() {
     local rc=0
     ( cd "$out_dir" && timeout "$PRECHECK_TIMEOUT" "$PRECHECK_SCRIPT" ${PRECHECK_ARGS[@]+"${PRECHECK_ARGS[@]}"} ) \
         > "$out_file" 2>&1 || rc=$?
-    info "Precheck output: $out_file"
-
+    info "Precheck output: $out_file (exit code $rc)"
     (( rc == 124 )) && die "Precheck timed out after ${PRECHECK_TIMEOUT}s."
-    (( rc == 0 ))   || die "Precheck exited with code $rc. See $out_file"
-    if [[ -n "$PRECHECK_FAIL_PATTERN" ]] && grep -Eq "$PRECHECK_FAIL_PATTERN" "$out_file"; then
-        grep -En "$PRECHECK_FAIL_PATTERN" "$out_file" | head -20 | while read -r line; do err "  $line"; done
-        die "Precheck output matched PRECHECK_FAIL_PATTERN. See $out_file"
+
+    # Read failures from the last summary section (colour codes removed). If the
+    # header is missing, fall back to searching the whole output.
+    local plain fail_file="${out_dir}/failures.txt" names_file="${out_dir}/failure_names.txt" have_summary=0
+    plain="$(sed 's/\x1b\[[0-9;]*m//g' "$out_file")"
+    if grep -qF "$PRECHECK_SUMMARY_HEADER" <<<"$plain"; then
+        have_summary=1
+        awk -v h="$PRECHECK_SUMMARY_HEADER" 'index($0, h) { buf = ""; next } { buf = buf $0 "\n" } END { printf "%s", buf }' <<<"$plain" \
+            | grep -E "$PRECHECK_FAIL_PATTERN" > "$fail_file" || true
+    else
+        warn "No '$PRECHECK_SUMMARY_HEADER' section found; searching the whole output for failures."
+        grep -E "$PRECHECK_FAIL_PATTERN" <<<"$plain" > "$fail_file" || true
+    fi
+    sed -E "s/.*${PRECHECK_FAIL_PATTERN}[[:space:]]*//; s/[[:space:]]+$//" "$fail_file" | LC_ALL=C sort -u > "$names_file"
+
+    local name waiver blocking=0 waived=0
+    while IFS= read -r name; do
+        for waiver in ${PRECHECK_WAIVERS[@]+"${PRECHECK_WAIVERS[@]}"}; do
+            if [[ "$name" == *"$waiver"* ]]; then
+                warn "  [waived] $name"
+                waived=$((waived + 1))
+                continue 2
+            fi
+        done
+        err "  [FAIL] $name"
+        blocking=$((blocking + 1))
+    done < "$names_file"
+    info "Precheck ($label): $blocking failure(s), $waived waived. List: $fail_file"
+
+    if [[ "$label" == after && -f "${RUN_DIR}/precheck_before/failure_names.txt" ]]; then
+        local before="${RUN_DIR}/precheck_before/failure_names.txt"
+        LC_ALL=C comm -13 "$before" "$names_file" | while IFS= read -r name; do warn "  new since before patching: $name"; done
+        LC_ALL=C comm -23 "$before" "$names_file" | while IFS= read -r name; do info "  resolved by patching: $name"; done
+    fi
+
+    (( blocking == 0 )) || die "Precheck ($label) found $blocking failure(s) that are not waived."
+    # With a summary, the summary decides: the script may exit non-zero for waived failures.
+    if (( rc != 0 )); then
+        (( have_summary )) || die "Precheck exited with code $rc and printed no summary. See $out_file"
+        warn "Precheck exited with code $rc; every failure in its summary is waived."
     fi
     info "Precheck ($label) passed."
 }

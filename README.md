@@ -45,10 +45,26 @@ The `precheck` phase calls a precheck script you provide, such as the one Oracle
 ```bash
 PRECHECK_SCRIPT="/root/zdlra/precheck/<precheck-script>"
 PRECHECK_ARGS=()
-PRECHECK_FAIL_PATTERN='^(FAIL|CRITICAL)'
+PRECHECK_WAIVERS=("a failure you have reviewed and accepted")
 ```
 
-The phase fails if the script exits with a non-zero code, runs past `PRECHECK_TIMEOUT`, or prints a line that matches `PRECHECK_FAIL_PATTERN`. Its output is saved to `<run id>/precheck_before/`. By default `postcheck` runs it again and saves the output to `precheck_after/`.
+The script reads failures from the summary at the end of the precheck output:
+
+```
+FAILURE SUMMARY
+***********************************
+<date> [FAIL] <failure name>
+```
+
+Each failure is listed in the run log. The phase fails if:
+
+- there is any failure that is not in `PRECHECK_WAIVERS`
+- the script runs past `PRECHECK_TIMEOUT`
+- the script exits with a non-zero code
+
+Waived failures are logged as warnings. If your version of the script uses a different header or tag, change `PRECHECK_SUMMARY_HEADER` or `PRECHECK_FAIL_PATTERN`.
+
+Results are saved to `<run id>/precheck_before/`: the full output, the failure lines and a sorted list of failure names. By default `postcheck` runs the script again and saves the results to `precheck_after/`. It then logs which failures are new since patching and which were resolved.
 
 The script runs in dry-run mode too, because it only reads. **Do not commit the script or its output to this repo.** Get it from Oracle and keep it on the appliance.
 
