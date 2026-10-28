@@ -1,0 +1,6 @@
+# Appliance-to-compute-node list for zdlra_stage.sh.
+# Copy to appliances.conf (not committed). One appliance per line:
+#   <appliance name>  <node> [<node> ...]
+# Appliances not listed here are asked for their nodes with olsnodes over ssh.
+zdlra01  zdlra01db01 zdlra01db02
+zdlra02  zdlra02db01 zdlra02db02

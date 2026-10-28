@@ -5,3 +5,4 @@ runs/
 # Real per-appliance manifests stay local
 staging/manifests/*.txt
 !staging/manifests/example.txt
+staging/appliances.conf
