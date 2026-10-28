@@ -121,27 +121,28 @@ The script:
 
 Each step opens its own SSH connection, so set up key authentication (`-SshKey`). Otherwise you type the password several times. For other options, run `Get-Help .\staging\Copy-ZdlraPatches.ps1 -Full`.
 
-### Unpacking on the compute nodes
+### Staging on the appliances (jump server)
 
-Copy the archive and its `.sha256` file to one compute node. Then run `staging/zdlra_stage.sh` there as root:
+Copy the archive and its `.sha256` file to a Linux jump server that can reach the appliances. Then run `staging/zdlra_stage.sh` there for one or more appliances:
 
 ```bash
-# Dry run: verifies and checks, but copies and unpacks nothing
-./staging/zdlra_stage.sh -a /radump/zdlra01_patches_20261028_174710.zip
+# Dry run for two appliances
+./staging/zdlra_stage.sh -a ~/zdlra01_patches_20261028_174710.zip -z zdlra01 -z zdlra02
 
-# Real run, with the node list given explicitly
-./staging/zdlra_stage.sh -a /radump/zdlra01_patches_20261028_174710.zip -n node1,node2 --execute
+# Real run; carry on to the next appliance if one fails
+./staging/zdlra_stage.sh -a ~/zdlra01_patches_20261028_174710.zip -z zdlra01 -z zdlra02 --keep-going --execute
 ```
 
-| Step | What it does |
+| Step | What it does, for each appliance |
 |------|--------------|
-| verify | Checks the archive's SHA-256 against the `.sha256` file |
-| distribute | Copies the archive to the other compute nodes with `scp`, to the same path |
+| verify | Checks the archive's SHA-256 against the `.sha256` file, once, on the jump server |
+| nodes | Finds the compute nodes: from `staging/appliances.conf`, or from `olsnodes` on the appliance |
+| distribute | Copies the archive to `/radump` on every node, skipping nodes that already have an identical copy. With `--relay`, it copies to the first node only, and that node copies on to the others |
 | check | On every node: verifies the SHA-256 and free space, and makes sure the target folder doesn't exist yet |
 | extract | Unpacks the archive on every node into `/radump/zdlra_stage/<archive name>/` |
 | post | Per-node steps after unpacking: `TODO` hooks, to be filled in |
 
-The node list comes from `olsnodes` unless you pass `--nodes`. Root SSH equivalence between the nodes is required.
+At the end, the script prints a summary marking each appliance OK or FAILED. The jump server needs SSH access to the nodes without a password; the user is `root` by default and you can change it with `-u`. See `staging/appliances.conf.example` for the inventory format. Real inventories are in `.gitignore`.
 
 ## Before you use it
 
