@@ -10,12 +10,14 @@ The script breaks a patch into phases. You can run them one at a time or all tog
 
 | Phase | What it does |
 |-------|--------------|
-| `precheck` | Checks appliance status and free space, runs your external precheck script, then asks you to approve the results |
+| `precheck` | Checks appliance status and free space, runs your external precheck script, and shows the replication and incoming-backup activity. Then asks you to approve the results |
+| `quiesce` | Pauses replication and records which servers it paused. Then waits, up to a time limit, for replication in progress and incoming backups to finish. `--skip-backup-wait` skips the backup wait |
 | `snapshot` | Saves configuration and state before patching |
 | `stage` | Unpacks the patch bundle into the staging directory |
 | `patch1` | Runs `racli <patch\|upgrade> appliance --step=1` |
 | `patch2` | Runs `racli <patch\|upgrade> appliance --step=2` |
 | `postcheck` | Runs the checks again and compares the result with the snapshot |
+| `resume` | Resumes only the replication servers that this run paused |
 | `report` | Writes a summary of the run |
 
 You must list phases in this order. You can leave phases out, but you can't reorder them.
@@ -42,6 +44,21 @@ vi zdlra_patch.conf
 ```
 
 Each run writes its log, snapshots and report to `$WORK_DIR/<run id>/`.
+
+## Replication and incoming backups
+
+The `precheck`, `quiesce` and `resume` phases run SQL with `sqlplus` as the raadmin account. `RA_SQL_CONNECT` sets the connection; use a wallet alias, so no password goes in the config. The queries and statements are settings in `zdlra_patch.conf`, and for now they are `TODO` placeholders:
+
+| Setting | What it must do |
+|---|---|
+| `REPLICATION_SERVERS_SQL` | Print the replication servers to pause, one per line (from `ra_replication_config`) |
+| `REPLICATION_PAUSE_SQL` / `REPLICATION_RESUME_SQL` | Statement to run for each server; `{server}` is replaced |
+| `ACTIVE_REPLICATION_SQL` | Print one number: replication still in progress |
+| `ACTIVE_BACKUPS_SQL` | Print one number: incoming backups still running |
+
+While any of these are empty, a dry run warns and skips `quiesce`, and a real run stops before patching. Set `QUIESCE_ALLOW_UNCONFIGURED=1` to override that.
+
+If a run fails after `quiesce`, replication stays paused. Once the appliance is healthy, resume it with `zdlra_patch.sh --run-id <id> resume --execute`.
 
 ## Precheck approval and background runs
 
@@ -183,7 +200,7 @@ At the end, the script prints a summary marking each appliance OK or FAILED. The
 ## Roadmap
 
 - [x] Call an external precheck script and fail on errors
-- [ ] Find active backup, copy-to-tape and replication jobs before patching starts
+- [ ] Fill in the replication and incoming-backup SQL (placeholders in place); copy-to-tape
 - [ ] Verify the bundle checksum
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout

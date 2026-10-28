@@ -31,6 +31,7 @@
 #   -r, --resume RUN_ID     pick up a run whose precheck is running, finished or approved
 #   -w, --watch RUN_ID      watch a run whose patch phases are already going
 #       --keep-blackout     do not end the blackout or resume OEM jobs when the run completes
+#       --skip-backup-wait  quiesce on the node does not wait for incoming backups to finish
 #   -c, --config FILE       config file (default: zdlra_jump.conf next to this script)
 #   -h, --help              show this help
 
@@ -41,7 +42,8 @@ CONFIG_FILE="${SCRIPT_DIR}/zdlra_jump.conf"
 INVENTORY="${SCRIPT_DIR}/../staging/appliances.conf"
 ZDLRA=""
 DRY_RUN=1
-PHASES="snapshot stage patch1 patch2 postcheck report"
+PHASES="quiesce snapshot stage patch1 patch2 postcheck resume report"
+SKIP_BACKUP_WAIT=0
 RESUME_RUN_ID=""
 WATCH_RUN_ID=""
 KEEP_BLACKOUT=0
@@ -79,6 +81,7 @@ parse_args() {
             -r|--resume)     RESUME_RUN_ID="$2"; shift 2 ;;
             -w|--watch)      WATCH_RUN_ID="$2"; shift 2 ;;
             --keep-blackout) KEEP_BLACKOUT=1; shift ;;
+            --skip-backup-wait) SKIP_BACKUP_WAIT=1; shift ;;
             -c|--config)     CONFIG_FILE="$2"; shift 2 ;;
             -h|--help)       usage; exit 0 ;;
             *)               die "Unknown argument: $1 (see --help)" ;;
@@ -150,6 +153,8 @@ jobs_cmd_text() { local c=("${@//\{zdlra\}/$ZDLRA}"); echo "${c[*]}"; }
 
 # What to undo by hand after a failure or interruption, once the work has started.
 print_undo() {
+    # The node records which replication servers this run paused; its resume phase undoes only those.
+    [[ "$STAGE" == patch ]] && err "Resume replication (if quiesce paused it): ssh ${SSH_USER}@${NODE} $(remote_cmd --run-id "$RUN_ID" resume)"
     (( JOBS_SUSPENDED )) && err "Resume OEM jobs: $(jobs_cmd_text ${OEM_JOBS_RESUME_CMD[@]+"${OEM_JOBS_RESUME_CMD[@]}"})"
     (( BLACKOUT_ACTIVE )) && err "End blackout:    ${SCRIPT_DIR}/oem_blackout.sh stop -z $ZDLRA -x"
     return 0
@@ -257,7 +262,9 @@ step_jobs_suspend() {
 
 step_patch() {
     info "== patch (on $NODE, background) =="
-    if ! on_node "$(remote_cmd --run-id "$RUN_ID" --background $PHASES)"; then
+    local opts="--run-id $RUN_ID --background"
+    (( SKIP_BACKUP_WAIT )) && opts+=" --skip-backup-wait"
+    if ! on_node "$(remote_cmd $opts $PHASES)"; then
         err "Could not start the patch phases on $NODE."
         print_undo
         exit 1

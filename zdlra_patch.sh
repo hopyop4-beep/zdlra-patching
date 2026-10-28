@@ -13,11 +13,14 @@
 #
 # Phases (run in this order by "all"; phases you list must keep this order):
 #   precheck    appliance health and the external precheck script, then operator approval
+#   quiesce     pause replication, wait for in-flight replication and incoming backups
+#               to finish (needs an approved precheck)
 #   snapshot    save configuration and state so you can compare after patching
 #   stage       verify and unpack the patch bundle on the staging filesystem
 #   patch1      racli <action> appliance --step=1   (needs an approved precheck)
 #   patch2      racli <action> appliance --step=2   (needs an approved precheck)
 #   postcheck   rerun health checks and compare with the snapshot
+#   resume      resume the replication that quiesce paused
 #   report      write a summary of this run
 #
 # Options:
@@ -31,6 +34,7 @@
 #   -a, --approve       review and approve the precheck of --run-id ID (after --detach)
 #   -r, --run-id ID     continue an existing run (reuses its folder and approval)
 #   -s, --status        show the state of the latest run, or of --run-id ID
+#       --skip-backup-wait  quiesce does not wait for incoming backups to finish
 #   -h, --help          show this help
 
 set -Eeuo pipefail
@@ -38,9 +42,9 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.3.0"
+VERSION="0.4.0"
 
-ALL_PHASES=(precheck snapshot stage patch1 patch2 postcheck report)
+ALL_PHASES=(precheck quiesce snapshot stage patch1 patch2 postcheck resume report)
 
 # ---------------------------------------------------------------------------
 # Defaults (override in the config file)
@@ -55,6 +59,7 @@ BG_CHILD=0                      # set internally on the detached process
 STATUS_MODE=0
 FINAL_STATUS=""                 # status to record on success instead of "completed"
 PRESERVE_STATUS=0               # 1 = a failure now leaves the run's status unchanged
+SKIP_BACKUP_WAIT=0
 
 RACLI="/opt/oracle.RecoveryAppliance/bin/racli"
 PATCH_ACTION="patch"            # "patch" for a bundle patch, "upgrade" for a release upgrade
@@ -77,6 +82,21 @@ PRECHECK_REQUIRED=1             # 1 = stop if PRECHECK_SCRIPT is not set
 PRECHECK_REQUIRE_APPROVAL=1     # 1 = operator must type APPROVE after the precheck
 PRECHECK_APPROVAL_MAX_AGE_HOURS=24   # patch steps refuse an approval older than this
 POSTCHECK_RERUN_PRECHECK=1      # 1 = run the same script again after patching
+
+# SQL on the appliance, as the raadmin account (see the config example).
+SQLPLUS="sqlplus"
+RA_SQL_CONNECT=""               # e.g. /@raadmin (wallet alias); empty = SQL steps not set up
+# TODO(site): queries and statements, to be provided. Each query prints one value per
+# line; the count queries print a single number. {server} is replaced in the statements.
+REPLICATION_SERVERS_SQL=""      # active replication servers to pause (from ra_replication_config)
+REPLICATION_PAUSE_SQL=""        # e.g. begin dbms_ra.pause_replication_server('{server}'); end;
+REPLICATION_RESUME_SQL=""       # e.g. begin dbms_ra.resume_replication_server('{server}'); end;
+ACTIVE_REPLICATION_SQL=""       # count of replication still in flight
+ACTIVE_BACKUPS_SQL=""           # count of incoming backups still running
+QUIESCE_POLL_SECONDS=60
+QUIESCE_TIMEOUT_MINUTES=120     # give up waiting after this long
+QUIESCE_WAIT_FOR_BACKUPS=1      # 0 = do not wait for incoming backups (same as --skip-backup-wait)
+QUIESCE_ALLOW_UNCONFIGURED=0    # 1 = a real run may continue with these SQL settings empty
 
 RUN_ID=""
 RUN_DIR=""
@@ -119,8 +139,8 @@ run_ro() {
 
 confirm() {
     (( ASSUME_YES || DRY_RUN )) && return 0
-    local reply
-    read -r -p "$1 [type YES to continue]: " reply
+    local reply=""
+    read -r -p "$1 [type YES to continue]: " reply || true    # no input counts as "no"
     [[ "$reply" == "YES" ]] || die "Aborted by operator."
 }
 
@@ -193,6 +213,7 @@ parse_args() {
             -d|--detach)     DETACH=1; shift ;;
             -a|--approve)    APPROVE_MODE=1; shift ;;
             -r|--run-id)     RUN_ID="$2"; shift 2 ;;
+            --skip-backup-wait) SKIP_BACKUP_WAIT=1; shift ;;
             -s|--status)     STATUS_MODE=1; shift ;;
             --bg-child)      BG_CHILD=1; ASSUME_YES=1; shift ;;
             -h|--help)       usage; exit 0 ;;
@@ -453,6 +474,95 @@ require_approval() {
 }
 
 # ---------------------------------------------------------------------------
+# SQL on the appliance (raadmin)
+# ---------------------------------------------------------------------------
+sql_ready() { [[ -n "$RA_SQL_CONNECT" ]]; }
+
+# Run SQL as raadmin and print the result rows, trimmed. Fails on ORA-/SP2- errors.
+# The connect string is passed on stdin, so it never shows in the process list.
+sql_rows() {
+    local out
+    out="$("$SQLPLUS" -S -L /nolog <<EOF
+whenever sqlerror exit failure
+connect $RA_SQL_CONNECT
+set heading off feedback off pagesize 0 linesize 400 trimspool on verify off
+$1
+exit
+EOF
+)" || { err "SQL failed: $1"; printf '%s\n' "$out" | sed 's/^/  /' >&2; return 1; }
+    if grep -qE '^(ORA|SP2)-[0-9]+' <<<"$out"; then
+        err "SQL error: $1"; printf '%s\n' "$out" | sed 's/^/  /' >&2; return 1
+    fi
+    sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' <<<"$out"
+}
+
+# A count query must print one whole number.
+sql_count() {
+    local n
+    n="$(sql_rows "$1")" || return 1
+    [[ "$n" =~ ^[0-9]+$ ]] || { err "Expected a number from: $1 (got: $n)"; return 1; }
+    echo "$n"
+}
+
+# Statements that change something go through dry-run handling like run().
+sql_exec() {
+    if (( DRY_RUN )); then
+        info "[dry-run] SQL: $1"
+        return 0
+    fi
+    info "[exec] SQL: $1"
+    sql_rows "$1" >/dev/null
+}
+
+# Which SQL settings are still empty (TODO placeholders).
+missing_sql_settings() {
+    local v missing=()
+    for v in RA_SQL_CONNECT REPLICATION_SERVERS_SQL REPLICATION_PAUSE_SQL REPLICATION_RESUME_SQL \
+             ACTIVE_REPLICATION_SQL ACTIVE_BACKUPS_SQL; do
+        [[ -n "${!v}" ]] || missing+=("$v")
+    done
+    echo "${missing[*]-}"
+}
+
+# Read-only summary for the precheck review: what quiesce will pause and wait for.
+report_activity() {
+    local missing
+    missing="$(missing_sql_settings)"
+    if [[ -n "$missing" ]]; then
+        warn "Replication/backup checks not set up yet (TODO in config: $missing)."
+        return 0
+    fi
+    local servers n
+    servers="$(sql_rows "$REPLICATION_SERVERS_SQL")" || die "Could not list replication servers."
+    info "Replication servers to pause: $(tr '\n' ' ' <<<"${servers:-none}")"
+    n="$(sql_count "$ACTIVE_REPLICATION_SQL")" || die "Could not count active replication."
+    info "Replication in flight now: $n"
+    n="$(sql_count "$ACTIVE_BACKUPS_SQL")" || die "Could not count incoming backups."
+    info "Incoming backups running now: $n"
+}
+
+# Poll a count query until it reaches 0 or the timeout passes.
+# $1 = label, $2 = count query
+wait_for_zero() {
+    local label="$1" query="$2" n waited=0 limit=$(( QUIESCE_TIMEOUT_MINUTES * 60 ))
+    while :; do
+        n="$(sql_count "$query")" || die "Could not count $label."
+        if (( n == 0 )); then
+            info "No $label running."
+            return 0
+        fi
+        (( waited < limit )) || die "$n $label still running after ${QUIESCE_TIMEOUT_MINUTES} min. Stopping before patching."
+        info "Waiting: $n $label running (${waited}s of ${limit}s)"
+        if (( DRY_RUN )); then
+            info "[dry-run] would keep waiting for $label to finish"
+            return 0
+        fi
+        sleep "$QUIESCE_POLL_SECONDS"
+        waited=$(( waited + QUIESCE_POLL_SECONDS ))
+    done
+}
+
+# ---------------------------------------------------------------------------
 # Phases
 # ---------------------------------------------------------------------------
 phase_precheck() {
@@ -467,13 +577,73 @@ phase_precheck() {
     info "Free space near $PATCH_STAGE_DIR: ${free_gb}G (need ${MIN_FREE_GB}G)"
     (( free_gb >= MIN_FREE_GB )) || die "Not enough free space."
 
-    # TODO: check for running backup/copy-to-tape/replication jobs and decide whether to wait.
-    # TODO: confirm protected databases are not mid-backup (query RASYS views).
+    # Read-only look at what quiesce will deal with, so it is part of the review.
+    report_activity
+
     # TODO: confirm the patch is valid for the current version (compare racli version with patch README).
 
     # Marks the precheck as passed, so a detached precheck can be approved later with --approve.
     touch "${RUN_DIR}/precheck_passed"
     approve_precheck
+}
+
+# TODO(site): confirm the replication pause process (it may be done from the upstream
+# appliance) and fill in the SQL settings; the steps below are placeholders around them.
+phase_quiesce() {
+    info "== quiesce =="
+    local missing
+    missing="$(missing_sql_settings)"
+    if [[ -n "$missing" ]]; then
+        if (( DRY_RUN || QUIESCE_ALLOW_UNCONFIGURED )); then
+            warn "Quiesce not set up yet (TODO in config: $missing); skipping."
+            return 0
+        fi
+        die "Quiesce is not set up (TODO in config: $missing). Fill these in, or set QUIESCE_ALLOW_UNCONFIGURED=1 to patch without it."
+    fi
+
+    # Pause each active replication server, and record it so resume undoes only these.
+    local servers server paused="${RUN_DIR}/replication_paused.txt"
+    local name_re='^[A-Za-z0-9_.$#-]+$'    # in a variable: inside [[ =~ ]] bash would expand $#
+    servers="$(sql_rows "$REPLICATION_SERVERS_SQL")" || die "Could not list replication servers."
+    touch "$paused"
+    while IFS= read -r server; do
+        [[ -n "$server" ]] || continue
+        [[ "$server" =~ $name_re ]] || die "Unexpected replication server name: $server"
+        if grep -qxF "$server" "$paused"; then
+            info "Replication server $server already paused by this run."
+            continue
+        fi
+        sql_exec "${REPLICATION_PAUSE_SQL//\{server\}/$server}" || die "Could not pause replication server $server."
+        (( DRY_RUN )) || echo "$server" >> "$paused"
+        info "Paused replication server $server"
+    done <<<"$servers"
+
+    wait_for_zero "replication tasks" "$ACTIVE_REPLICATION_SQL"
+
+    if (( SKIP_BACKUP_WAIT || ! QUIESCE_WAIT_FOR_BACKUPS )); then
+        local n
+        n="$(sql_count "$ACTIVE_BACKUPS_SQL")" || n="?"
+        warn "Not waiting for incoming backups (override); $n running now."
+    else
+        wait_for_zero "incoming backups" "$ACTIVE_BACKUPS_SQL"
+    fi
+}
+
+phase_resume() {
+    info "== resume =="
+    local paused="${RUN_DIR}/replication_paused.txt" server
+    if [[ ! -s "$paused" ]]; then
+        info "This run paused no replication servers; nothing to resume."
+        return 0
+    fi
+    [[ -n "$REPLICATION_RESUME_SQL" ]] || die "REPLICATION_RESUME_SQL is not set; resume these by hand: $(tr '\n' ' ' < "$paused")"
+    while IFS= read -r server; do
+        [[ -n "$server" ]] || continue
+        sql_exec "${REPLICATION_RESUME_SQL//\{server\}/$server}" || die "Could not resume replication server $server."
+        info "Resumed replication server $server"
+    done < "$paused"
+    (( DRY_RUN )) || mv "$paused" "${paused%.txt}_resumed_$(date +%Y%m%d_%H%M%S).txt"
+    # TODO: confirm replication catches up and backups arrive again.
 }
 
 phase_snapshot() {
@@ -542,6 +712,10 @@ phase_report() {
         if [[ -f "$approval" ]]; then
             echo "Approved:  $(sed -n 's/^approved_by=//p' "$approval") at $(sed -n 's/^approved_at=//p' "$approval")"
         fi
+        local paused
+        paused="$(cat "${RUN_DIR}"/replication_paused*.txt 2>/dev/null | sort -u | tr '
+' ' ')"
+        echo "Paused:    ${paused:-no replication servers}"
         echo "Log:       $LOG_FILE"
     } > "$report"
     # TODO: optional email/webhook notification (useful when the run is in the background).
@@ -554,6 +728,7 @@ phase_report() {
 start_background() {
     local args=(-c "$CONFIG_FILE" --run-id "$RUN_ID" --bg-child)
     (( DRY_RUN )) || args+=(--execute)
+    (( SKIP_BACKUP_WAIT )) && args+=(--skip-backup-wait)
     args+=("${BG_PHASES[@]}")
 
     local launcher=(nohup)
@@ -611,15 +786,15 @@ main() {
             [[ "$p" == precheck ]] && split=1
         done
         # Without precheck in this run, check the existing approval now, not after detaching.
-        if (( ! ${#fg_phases[@]} )) && [[ " ${BG_PHASES[*]} " == *" patch"* ]]; then
+        if (( ! ${#fg_phases[@]} )) && [[ " ${BG_PHASES[*]} " == *" patch"* || " ${BG_PHASES[*]} " == *" quiesce "* ]]; then
             require_approval
         fi
     fi
 
     for p in ${fg_phases[@]+"${fg_phases[@]}"}; do
-        # Check approval before marking a patch step as running, so a refusal leaves
+        # Check approval before marking a changing step as running, so a refusal leaves
         # the run's status as it was.
-        [[ "$p" == patch* ]] && require_approval
+        [[ "$p" == patch* || "$p" == quiesce ]] && require_approval
         CURRENT_PHASE="$p"
         set_status "running $p"
         "phase_${p}"
