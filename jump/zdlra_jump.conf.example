@@ -18,6 +18,13 @@ BLACKOUT_PROPAGATE=1
 # (Assign entries one by one; the scripts declare these lists themselves.)
 BLACKOUT_TARGETS[zdlra01]="<target name>:<target type>;<host name>:host"
 
+# --- OEM backup jobs ----------------------------------------------------------
+# Your own script(s) that suspend and resume the OEM backup jobs, as a command and
+# its arguments. {zdlra} is replaced with the appliance name. The command must exit
+# 0 on success. Leave a command empty to skip that step (a warning is logged).
+OEM_JOBS_SUSPEND_CMD=(/path/to/your_oem_jobs_script.sh suspend {zdlra})
+OEM_JOBS_RESUME_CMD=(/path/to/your_oem_jobs_script.sh resume {zdlra})
+
 # --- Appliances -------------------------------------------------------------
 # Compute node that runs zdlra_patch.sh, per appliance. If an appliance is not
 # listed, the first node in ../staging/appliances.conf is used, then the

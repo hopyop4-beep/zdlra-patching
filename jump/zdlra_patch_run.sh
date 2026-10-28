@@ -10,16 +10,18 @@
 #                  the jump server connection drops; status is checked every POLL_SECONDS
 #   3. approve     when the precheck finishes, you review it here and type APPROVE
 #   4. blackout    created after approval, before anything changes
-#   5. patch       remaining phases start on the node in the background
-#   6. watch       status is checked every POLL_SECONDS until the run ends
-#   7. blackout    ended when the run completes; left in place when it fails
+#   5. OEM jobs    your OEM_JOBS_SUSPEND_CMD suspends the OEM backup jobs
+#   6. patch       remaining phases start on the node in the background
+#   7. watch       status is checked every POLL_SECONDS until the run ends
+#   8. finish      when the run completes: OEM jobs resumed, then the blackout ended.
+#                  When it fails, both are left as they are while you investigate.
 #
 # Ctrl-C while watching stops watching only; the work on the node continues.
 #
 # Usage:
 #   ./zdlra_patch_run.sh -z ZDLRA [-x] [-p "phase phase ..."]
 #   ./zdlra_patch_run.sh -z ZDLRA --resume RUN_ID [-x]   continue from step 2/3 for a precheck run
-#   ./zdlra_patch_run.sh -z ZDLRA --watch RUN_ID [-x]    continue from step 6 for a patch run
+#   ./zdlra_patch_run.sh -z ZDLRA --watch RUN_ID [-x]    continue from step 7 for a patch run
 #
 # Options:
 #   -z, --zdlra NAME        appliance (required)
@@ -28,7 +30,7 @@
 #   -p, --phases LIST       phases after precheck (default: all of them)
 #   -r, --resume RUN_ID     pick up a run whose precheck is running, finished or approved
 #   -w, --watch RUN_ID      watch a run whose patch phases are already going
-#       --keep-blackout     do not end the blackout when the run completes
+#       --keep-blackout     do not end the blackout or resume OEM jobs when the run completes
 #   -c, --config FILE       config file (default: zdlra_jump.conf next to this script)
 #   -h, --help              show this help
 
@@ -50,12 +52,15 @@ REMOTE_CONFIG="/root/zdlra-patching/zdlra_patch.conf"
 POLL_SECONDS=60
 declare -A PATCH_NODE=()
 declare -A BLACKOUT_TARGETS=()   # not used here; lets the shared config load
+OEM_JOBS_SUSPEND_CMD=()
+OEM_JOBS_RESUME_CMD=()
 SSH_OPTS=(-n -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30)   # -n: never read this terminal
 
 NODE=""
 RUN_ID=""
 STAGE="precheck"                 # what is running on the node: precheck or patch
 BLACKOUT_ACTIVE=0
+JOBS_SUSPENDED=0
 
 log()  { local lvl="$1"; shift; printf '%s [%-5s] %s\n' "$(date '+%F %T')" "$lvl" "$*" >&2; }
 info() { log INFO "$@"; }
@@ -124,6 +129,32 @@ run_status() { on_node "$REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_
 
 xflag() { (( DRY_RUN )) || echo " -x"; }
 
+# Run one of the OEM job commands from the config, with {zdlra} filled in.
+# $1 = label for messages, rest = the command and its arguments.
+run_jobs_cmd() {
+    local label="$1"; shift
+    if (( $# == 0 )); then
+        warn "No OEM job command set for '$label' in $CONFIG_FILE; skipping."
+        return 0
+    fi
+    local cmd=("${@//\{zdlra\}/$ZDLRA}")
+    if (( DRY_RUN )); then
+        info "[dry-run] $label OEM jobs: ${cmd[*]}"
+        return 0
+    fi
+    info "[exec] $label OEM jobs: ${cmd[*]}"
+    "${cmd[@]}"
+}
+
+jobs_cmd_text() { local c=("${@//\{zdlra\}/$ZDLRA}"); echo "${c[*]}"; }
+
+# What to undo by hand after a failure or interruption, once the work has started.
+print_undo() {
+    (( JOBS_SUSPENDED )) && err "Resume OEM jobs: $(jobs_cmd_text ${OEM_JOBS_RESUME_CMD[@]+"${OEM_JOBS_RESUME_CMD[@]}"})"
+    (( BLACKOUT_ACTIVE )) && err "End blackout:    ${SCRIPT_DIR}/oem_blackout.sh stop -z $ZDLRA -x"
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 step_preflight() {
     info "== preflight =="
@@ -135,6 +166,11 @@ step_preflight() {
     local saved=$DRY_RUN
     DRY_RUN=1; blackout start || { DRY_RUN=$saved; die "Blackout settings are not ready (see above)."; }
     DRY_RUN=$saved
+    local c
+    for c in ${OEM_JOBS_SUSPEND_CMD[0]-} ${OEM_JOBS_RESUME_CMD[0]-}; do
+        [[ -x "$c" ]] || command -v "$c" >/dev/null 2>&1 || die "OEM job command not found or not executable: $c"
+    done
+    (( ${#OEM_JOBS_SUSPEND_CMD[@]} )) || warn "OEM_JOBS_SUSPEND_CMD is not set; OEM backup jobs will not be suspended."
 }
 
 step_precheck_start() {
@@ -153,7 +189,8 @@ on_interrupt() {
     else
         warn "Stopped watching. The patch keeps running on $NODE."
         warn "Watch again:     $0 -z $ZDLRA --watch $RUN_ID$(xflag)"
-        (( BLACKOUT_ACTIVE )) && warn "The blackout is still on. End it later: ${SCRIPT_DIR}/oem_blackout.sh stop -z $ZDLRA -x"
+        warn "Watching again resumes OEM jobs and ends the blackout when the run completes. To do it by hand:"
+        print_undo
     fi
     exit 130
 }
@@ -207,11 +244,35 @@ step_blackout_start() {
     (( DRY_RUN )) || BLACKOUT_ACTIVE=1
 }
 
+step_jobs_suspend() {
+    info "== suspend OEM backup jobs =="
+    if ! run_jobs_cmd suspend ${OEM_JOBS_SUSPEND_CMD[@]+"${OEM_JOBS_SUSPEND_CMD[@]}"}; then
+        err "Suspending OEM jobs failed; patching not started. Some jobs may already be suspended."
+        JOBS_SUSPENDED=1
+        print_undo
+        exit 1
+    fi
+    (( DRY_RUN || ${#OEM_JOBS_SUSPEND_CMD[@]} == 0 )) || JOBS_SUSPENDED=1
+}
+
 step_patch() {
     info "== patch (on $NODE, background) =="
-    on_node "$(remote_cmd --run-id "$RUN_ID" --background $PHASES)" \
-        || die "Could not start the patch phases on $NODE. The blackout is still on: ${SCRIPT_DIR}/oem_blackout.sh stop -z $ZDLRA -x"
+    if ! on_node "$(remote_cmd --run-id "$RUN_ID" --background $PHASES)"; then
+        err "Could not start the patch phases on $NODE."
+        print_undo
+        exit 1
+    fi
     STAGE="patch"
+}
+
+step_jobs_resume() {
+    if (( KEEP_BLACKOUT )); then
+        info "OEM jobs left suspended (--keep-blackout). Resume them with: $(jobs_cmd_text ${OEM_JOBS_RESUME_CMD[@]+"${OEM_JOBS_RESUME_CMD[@]}"})"
+        return 0
+    fi
+    info "== resume OEM backup jobs =="
+    run_jobs_cmd resume ${OEM_JOBS_RESUME_CMD[@]+"${OEM_JOBS_RESUME_CMD[@]}"} \
+        || warn "Resuming OEM jobs failed. Resume them with: $(jobs_cmd_text ${OEM_JOBS_RESUME_CMD[@]+"${OEM_JOBS_RESUME_CMD[@]}"})"
 }
 
 step_blackout_stop() {
@@ -236,7 +297,10 @@ main() {
     if [[ -n "$WATCH_RUN_ID" ]]; then
         RUN_ID="$WATCH_RUN_ID"
         STAGE="patch"
-        (( DRY_RUN )) || BLACKOUT_ACTIVE=1
+        if (( ! DRY_RUN )); then
+            BLACKOUT_ACTIVE=1
+            (( ${#OEM_JOBS_SUSPEND_CMD[@]} == 0 )) || JOBS_SUSPENDED=1
+        fi
     else
         step_preflight
         if [[ -n "$RESUME_RUN_ID" ]]; then
@@ -249,17 +313,19 @@ main() {
         status="$(watch_until_done)" || die "Precheck failed in run $RUN_ID ($status). Nothing was changed and no blackout was created."
         step_approve "$status"
         step_blackout_start
+        step_jobs_suspend
         step_patch
     fi
 
     if watch_until_done >/dev/null; then
         info "Run $RUN_ID completed on $NODE."
+        step_jobs_resume
         step_blackout_stop
         info "Done. Report on $NODE: $REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID"
     else
-        err "Run $RUN_ID failed on $NODE. The blackout is left on while you investigate."
-        err "Details:      ssh ${SSH_USER}@${NODE} $REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID"
-        err "End blackout: ${SCRIPT_DIR}/oem_blackout.sh stop -z $ZDLRA -x"
+        err "Run $RUN_ID failed on $NODE. OEM jobs and the blackout are left as they are while you investigate."
+        err "Details:         ssh ${SSH_USER}@${NODE} $REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID"
+        print_undo
         exit 1
     fi
 }

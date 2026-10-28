@@ -116,9 +116,10 @@ cp jump/zdlra_jump.conf.example jump/zdlra_jump.conf   # then edit it
 2. **Precheck:** starts on the node detached from your session, because it can take a long time. It keeps running if your connection to the jump server drops. The script checks its status every `POLL_SECONDS`.
 3. **Approve:** when the precheck finishes, the review screen opens in your terminal and you type `APPROVE`. If the precheck failed, or you don't approve, nothing has changed and no blackout exists.
 4. **Blackout:** created after you approve, before anything changes. By default it ends by itself after `BLACKOUT_HOURS` (12), as a safety net.
-5. **Patch:** the remaining phases start on the node in the background.
-6. **Watch:** the script prints each phase as the node reports it.
-7. **End of the blackout:** the blackout ends when the run completes, unless you pass `--keep-blackout`. If the run fails, the blackout stays on while you investigate.
+5. **OEM backup jobs:** your own script, set in `OEM_JOBS_SUSPEND_CMD`, suspends them. If it fails, patching does not start.
+6. **Patch:** the remaining phases start on the node in the background.
+7. **Watch:** the script prints each phase as the node reports it.
+8. **Finish:** when the run completes, `OEM_JOBS_RESUME_CMD` resumes the jobs and then the blackout ends. Pass `--keep-blackout` to leave both as they are. If the run fails, both stay as they are while you investigate, and the script prints the commands to undo them.
 
 Ctrl-C only stops watching; the work on the node carries on. To pick up again:
 
