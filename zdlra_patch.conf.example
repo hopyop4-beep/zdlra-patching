@@ -19,13 +19,17 @@ REQUIRED_USER="root"
 #   FAILURE SUMMARY
 #   ***********************************
 #   <date> [FAIL] <failure name>
+#   <date> [WARN] <warning name>
 # The phase fails on any failure that is not waived, on a timeout, or on a
-# non-zero exit code.
+# non-zero exit code with no summary. Warnings are logged but do not stop the
+# run unless PRECHECK_FAIL_ON_WARN=1.
 PRECHECK_SCRIPT="/root/zdlra/precheck/<precheck-script>"
 PRECHECK_ARGS=()                     # e.g. PRECHECK_ARGS=(--option value)
 PRECHECK_TIMEOUT=3600
 PRECHECK_SUMMARY_HEADER="FAILURE SUMMARY"
 PRECHECK_FAIL_PATTERN='\[FAIL\]'
+PRECHECK_WARN_PATTERN='\[WARN\]'
+PRECHECK_FAIL_ON_WARN=0              # 1 = warnings stop the run too (waivers apply)
 # Known, accepted failures. Each entry matches part of a failure name.
 # Waived failures are logged as warnings and do not stop the run.
 PRECHECK_WAIVERS=(

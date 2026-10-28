@@ -54,17 +54,18 @@ The script reads failures from the summary at the end of the precheck output:
 FAILURE SUMMARY
 ***********************************
 <date> [FAIL] <failure name>
+<date> [WARN] <warning name>
 ```
 
-Each failure is listed in the run log. The phase fails if:
+Each failure and warning is listed in the run log. The phase fails if:
 
 - there is any failure that is not in `PRECHECK_WAIVERS`
 - the script runs past `PRECHECK_TIMEOUT`
-- the script exits with a non-zero code
+- the script exits with a non-zero code and prints no summary
 
-Waived failures are logged as warnings. If your version of the script uses a different header or tag, change `PRECHECK_SUMMARY_HEADER` or `PRECHECK_FAIL_PATTERN`.
+Warnings and waived failures are logged but do not stop the run. To make warnings stop the run as well, set `PRECHECK_FAIL_ON_WARN=1`; waivers then apply to warnings too. If your version of the script uses a different header or tags, change `PRECHECK_SUMMARY_HEADER`, `PRECHECK_FAIL_PATTERN` or `PRECHECK_WARN_PATTERN`.
 
-Results are saved to `<run id>/precheck_before/`: the full output, the failure lines and a sorted list of failure names. By default `postcheck` runs the script again and saves the results to `precheck_after/`. It then logs which failures are new since patching and which were resolved.
+Results are saved to `<run id>/precheck_before/`: the full output, plus the failure and warning lines and sorted lists of their names. By default `postcheck` runs the script again and saves the results to `precheck_after/`. It then logs which failures and warnings are new since patching and which were resolved.
 
 The script runs in dry-run mode too, because it only reads. **Do not commit the script or its output to this repo.** Get it from Oracle and keep it on the appliance.
 

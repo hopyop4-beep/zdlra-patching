@@ -54,7 +54,9 @@ PRECHECK_ARGS=()                # arguments passed to the script
 PRECHECK_TIMEOUT=3600           # seconds before the precheck is killed
 PRECHECK_SUMMARY_HEADER="FAILURE SUMMARY"   # failures are read from after this line
 PRECHECK_FAIL_PATTERN='\[FAIL\]'            # extended regex for a failure line
+PRECHECK_WARN_PATTERN='\[WARN\]'            # extended regex for a warning line
 PRECHECK_WAIVERS=()             # failure names (substrings) accepted as known; logged, not fatal
+PRECHECK_FAIL_ON_WARN=0         # 1 = treat warnings like failures (waivers apply)
 PRECHECK_REQUIRED=1             # 1 = stop if PRECHECK_SCRIPT is not set
 POSTCHECK_RERUN_PRECHECK=1      # 1 = run the same script again after patching
 
@@ -155,15 +157,36 @@ init_run() {
 }
 
 # Run the external precheck script. It is read-only, so it runs in dry-run mode too.
-# Failures are the PRECHECK_FAIL_PATTERN lines after PRECHECK_SUMMARY_HEADER, e.g.
+# Write the summary lines matching a pattern to <lines_file>, and the names alone
+# (everything up to the tag removed) sorted to <names_file>.
+# $1 = summary text, $2 = pattern, $3 = lines_file, $4 = names_file
+extract_summary_items() {
+    grep -E "$2" <<<"$1" > "$3" || true
+    sed -E "s/.*${2}[[:space:]]*//; s/[[:space:]]+$//" "$3" | LC_ALL=C sort -u > "$4"
+}
+
+# Log what changed between the before and after name lists.
+# $1 = before names file, $2 = after names file, $3 = "failure" or "warning"
+log_item_changes() {
+    [[ -f "$1" ]] || return 0
+    local name
+    LC_ALL=C comm -13 "$1" "$2" | while IFS= read -r name; do warn "  new $3 since before patching: $name"; done
+    LC_ALL=C comm -23 "$1" "$2" | while IFS= read -r name; do info "  $3 resolved by patching: $name"; done
+}
+
+# Failures and warnings are read from the lines after PRECHECK_SUMMARY_HEADER, e.g.
 #   FAILURE SUMMARY
 #   ***********************************
 #   <date> [FAIL] <failure name>
-# The phase fails on any failure not listed in PRECHECK_WAIVERS, a timeout, or a
-# non-zero exit code. Files written to precheck_<label>/:
+#   <date> [WARN] <warning name>
+# The phase fails on any failure not listed in PRECHECK_WAIVERS (and on warnings too
+# when PRECHECK_FAIL_ON_WARN=1), a timeout, or a non-zero exit code with no summary.
+# Files written to precheck_<label>/:
 #   output.txt          full output
 #   failures.txt        failure lines from the summary
 #   failure_names.txt   failure names only (date and tag removed), sorted
+#   warnings.txt        warning lines from the summary
+#   warning_names.txt   warning names only, sorted
 # $1 = label for the output folder (before/after)
 run_external_precheck() {
     local label="$1"
@@ -185,45 +208,50 @@ run_external_precheck() {
     info "Precheck output: $out_file (exit code $rc)"
     (( rc == 124 )) && die "Precheck timed out after ${PRECHECK_TIMEOUT}s."
 
-    # Read failures from the last summary section (colour codes removed). If the
-    # header is missing, fall back to searching the whole output.
-    local plain fail_file="${out_dir}/failures.txt" names_file="${out_dir}/failure_names.txt" have_summary=0
+    # Use the last summary section (colour codes removed). If the header is
+    # missing, fall back to searching the whole output.
+    local plain summary have_summary=0
     plain="$(sed 's/\x1b\[[0-9;]*m//g' "$out_file")"
     if grep -qF "$PRECHECK_SUMMARY_HEADER" <<<"$plain"; then
         have_summary=1
-        awk -v h="$PRECHECK_SUMMARY_HEADER" 'index($0, h) { buf = ""; next } { buf = buf $0 "\n" } END { printf "%s", buf }' <<<"$plain" \
-            | grep -E "$PRECHECK_FAIL_PATTERN" > "$fail_file" || true
+        summary="$(awk -v h="$PRECHECK_SUMMARY_HEADER" 'index($0, h) { buf = ""; next } { buf = buf $0 "\n" } END { printf "%s", buf }' <<<"$plain")"
     else
-        warn "No '$PRECHECK_SUMMARY_HEADER' section found; searching the whole output for failures."
-        grep -E "$PRECHECK_FAIL_PATTERN" <<<"$plain" > "$fail_file" || true
+        warn "No '$PRECHECK_SUMMARY_HEADER' section found; searching the whole output."
+        summary="$plain"
     fi
-    sed -E "s/.*${PRECHECK_FAIL_PATTERN}[[:space:]]*//; s/[[:space:]]+$//" "$fail_file" | LC_ALL=C sort -u > "$names_file"
+    extract_summary_items "$summary" "$PRECHECK_FAIL_PATTERN" "${out_dir}/failures.txt" "${out_dir}/failure_names.txt"
+    extract_summary_items "$summary" "$PRECHECK_WARN_PATTERN" "${out_dir}/warnings.txt" "${out_dir}/warning_names.txt"
 
-    local name waiver blocking=0 waived=0
-    while IFS= read -r name; do
+    # Each entry is "<tag> <name>"; a warning blocks only when PRECHECK_FAIL_ON_WARN=1.
+    local tag name waiver blocking=0 waived=0 warnings=0
+    while read -r tag name; do
+        if [[ "$tag" == WARN ]] && (( ! PRECHECK_FAIL_ON_WARN )); then
+            warn "  [WARN] $name"
+            warnings=$((warnings + 1))
+            continue
+        fi
         for waiver in ${PRECHECK_WAIVERS[@]+"${PRECHECK_WAIVERS[@]}"}; do
             if [[ "$name" == *"$waiver"* ]]; then
-                warn "  [waived] $name"
+                warn "  [waived $tag] $name"
                 waived=$((waived + 1))
                 continue 2
             fi
         done
-        err "  [FAIL] $name"
+        err "  [$tag] $name"
         blocking=$((blocking + 1))
-    done < "$names_file"
-    info "Precheck ($label): $blocking failure(s), $waived waived. List: $fail_file"
+    done < <(sed 's/^/FAIL /' "${out_dir}/failure_names.txt"; sed 's/^/WARN /' "${out_dir}/warning_names.txt")
+    info "Precheck ($label): $blocking blocking, $waived waived, $warnings warning(s). Lists: $out_dir"
 
-    if [[ "$label" == after && -f "${RUN_DIR}/precheck_before/failure_names.txt" ]]; then
-        local before="${RUN_DIR}/precheck_before/failure_names.txt"
-        LC_ALL=C comm -13 "$before" "$names_file" | while IFS= read -r name; do warn "  new since before patching: $name"; done
-        LC_ALL=C comm -23 "$before" "$names_file" | while IFS= read -r name; do info "  resolved by patching: $name"; done
+    if [[ "$label" == after ]]; then
+        log_item_changes "${RUN_DIR}/precheck_before/failure_names.txt" "${out_dir}/failure_names.txt" failure
+        log_item_changes "${RUN_DIR}/precheck_before/warning_names.txt" "${out_dir}/warning_names.txt" warning
     fi
 
-    (( blocking == 0 )) || die "Precheck ($label) found $blocking failure(s) that are not waived."
-    # With a summary, the summary decides: the script may exit non-zero for waived failures.
+    (( blocking == 0 )) || die "Precheck ($label) found $blocking blocking item(s) that are not waived."
+    # With a summary, the summary decides: the script may exit non-zero for warnings or waived failures.
     if (( rc != 0 )); then
         (( have_summary )) || die "Precheck exited with code $rc and printed no summary. See $out_file"
-        warn "Precheck exited with code $rc; every failure in its summary is waived."
+        warn "Precheck exited with code $rc; nothing in its summary is blocking."
     fi
     info "Precheck ($label) passed."
 }
