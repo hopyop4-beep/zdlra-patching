@@ -36,4 +36,10 @@ PRECHECK_WAIVERS=(
 #   "failure name you have reviewed and accepted"
 )
 PRECHECK_REQUIRED=1
+
+# After the precheck, the operator must type APPROVE. --yes does not skip this.
+# patch1/patch2 refuse to run without an approval for the same run that is
+# younger than PRECHECK_APPROVAL_MAX_AGE_HOURS and matches the results reviewed.
+PRECHECK_REQUIRE_APPROVAL=1
+PRECHECK_APPROVAL_MAX_AGE_HOURS=24
 POSTCHECK_RERUN_PRECHECK=1

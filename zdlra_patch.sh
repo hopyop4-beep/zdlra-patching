@@ -9,27 +9,33 @@
 # Usage:
 #   ./zdlra_patch.sh [options] <phase> [<phase> ...]
 #   ./zdlra_patch.sh [options] all
+#   ./zdlra_patch.sh --status [--run-id ID]
 #
-# Phases (run in this order by "all"):
-#   precheck    appliance health, versions, free space, running jobs
+# Phases (run in this order by "all"; phases you list must keep this order):
+#   precheck    appliance health and the external precheck script, then operator approval
 #   snapshot    save configuration and state so you can compare after patching
 #   stage       verify and unpack the patch bundle on the staging filesystem
-#   patch1      racli <action> appliance --step=1
-#   patch2      racli <action> appliance --step=2
+#   patch1      racli <action> appliance --step=1   (needs an approved precheck)
+#   patch2      racli <action> appliance --step=2   (needs an approved precheck)
 #   postcheck   rerun health checks and compare with the snapshot
 #   report      write a summary of this run
 #
 # Options:
 #   -c, --config FILE   config file (default: ./zdlra_patch.conf)
 #   -x, --execute       run commands for real (default is dry run)
-#   -y, --yes           do not prompt before disruptive phases
+#   -y, --yes           do not prompt before patch steps (precheck approval is still asked)
+#   -b, --background    after precheck approval, run the remaining phases detached
+#                       from the terminal, with no further prompts
+#   -r, --run-id ID     continue an existing run (reuses its folder and approval)
+#   -s, --status        show the state of the latest run, or of --run-id ID
 #   -h, --help          show this help
 
 set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="0.1.0"
+SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
+VERSION="0.2.0"
 
 ALL_PHASES=(precheck snapshot stage patch1 patch2 postcheck report)
 
@@ -39,6 +45,9 @@ ALL_PHASES=(precheck snapshot stage patch1 patch2 postcheck report)
 CONFIG_FILE="${SCRIPT_DIR}/zdlra_patch.conf"
 DRY_RUN=1
 ASSUME_YES=0
+BACKGROUND=0
+BG_CHILD=0                      # set internally on the detached process
+STATUS_MODE=0
 
 RACLI="/opt/oracle.RecoveryAppliance/bin/racli"
 PATCH_ACTION="patch"            # "patch" for a bundle patch, "upgrade" for a release upgrade
@@ -58,12 +67,18 @@ PRECHECK_WARN_PATTERN='\[WARN\]'            # extended regex for a warning line
 PRECHECK_WAIVERS=()             # failure names (substrings) accepted as known; logged, not fatal
 PRECHECK_FAIL_ON_WARN=0         # 1 = treat warnings like failures (waivers apply)
 PRECHECK_REQUIRED=1             # 1 = stop if PRECHECK_SCRIPT is not set
+PRECHECK_REQUIRE_APPROVAL=1     # 1 = operator must type APPROVE after the precheck
+PRECHECK_APPROVAL_MAX_AGE_HOURS=24   # patch steps refuse an approval older than this
 POSTCHECK_RERUN_PRECHECK=1      # 1 = run the same script again after patching
 
-RUN_ID="$(date +%Y%m%d_%H%M%S)"
+RUN_ID=""
 RUN_DIR=""
 LOG_FILE=""
 LOCK_FILE="/tmp/zdlra_patch.lock"
+LOCK_HELD=0
+LOCK_HANDED_OFF=0
+CURRENT_PHASE="setup"
+BG_PHASES=()
 
 # ---------------------------------------------------------------------------
 # Logging and helpers
@@ -74,7 +89,8 @@ warn() { log WARN "$@"; }
 err()  { log ERROR "$@"; }
 die()  { err "$@"; exit 1; }
 
-usage() { sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//'; }
+# Print the comment block at the top of this file.
+usage() { awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"; }
 
 # Run a command, or only log it in dry-run mode. Output goes to the run log.
 run() {
@@ -101,40 +117,79 @@ confirm() {
     [[ "$reply" == "YES" ]] || die "Aborted by operator."
 }
 
+# One-line state of the run in <run dir>/status, read by --status.
+set_status() {
+    [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]] || return 0
+    printf '%s  %s\n' "$(date '+%F %T')" "$*" > "${RUN_DIR}/status"
+}
+
 on_error() {
     err "Failed at line $1 (exit $2). Log: ${LOG_FILE:-none}"
 }
 trap 'on_error $LINENO $?' ERR
 
-cleanup() { rm -f "$LOCK_FILE"; }
+on_exit() {
+    local rc=$?
+    if (( ! STATUS_MODE && ! LOCK_HANDED_OFF )); then
+        if (( rc == 0 )); then set_status "completed"; else set_status "failed in ${CURRENT_PHASE} (exit $rc)"; fi
+    fi
+    if (( LOCK_HELD && ! LOCK_HANDED_OFF )); then rm -f "$LOCK_FILE"; fi
+}
+trap on_exit EXIT
 
+# Take the lock. A detached process takes it over from the process that started it
+# (ZDLRA_LOCK_FROM); a lock whose process is gone is treated as stale.
 acquire_lock() {
     if [[ -e "$LOCK_FILE" ]]; then
-        die "Lock file $LOCK_FILE exists (pid $(cat "$LOCK_FILE" 2>/dev/null)). Is another run active?"
+        local owner
+        owner="$(cat "$LOCK_FILE" 2>/dev/null || true)"
+        if [[ -n "${ZDLRA_LOCK_FROM:-}" && "$owner" == "$ZDLRA_LOCK_FROM" ]]; then
+            info "Taking over the lock from pid $owner."
+        elif [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
+            die "Lock file $LOCK_FILE is held by running pid $owner. Is another run active?"
+        else
+            warn "Removing stale lock file $LOCK_FILE (pid ${owner:-?} is not running)."
+        fi
     fi
     echo $$ > "$LOCK_FILE"
-    trap cleanup EXIT
+    LOCK_HELD=1
 }
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
+phase_index() {
+    local i
+    for i in "${!ALL_PHASES[@]}"; do
+        [[ "${ALL_PHASES[$i]}" == "$1" ]] && { echo "$i"; return 0; }
+    done
+    return 1
+}
+
 parse_args() {
     PHASES=()
     while (( $# )); do
         case "$1" in
-            -c|--config)  CONFIG_FILE="$2"; shift 2 ;;
-            -x|--execute) DRY_RUN=0; shift ;;
-            -y|--yes)     ASSUME_YES=1; shift ;;
-            -h|--help)    usage; exit 0 ;;
-            all)          PHASES+=("${ALL_PHASES[@]}"); shift ;;
-            -*)           die "Unknown option: $1" ;;
-            *)            PHASES+=("$1"); shift ;;
+            -c|--config)     CONFIG_FILE="$2"; shift 2 ;;
+            -x|--execute)    DRY_RUN=0; shift ;;
+            -y|--yes)        ASSUME_YES=1; shift ;;
+            -b|--background) BACKGROUND=1; shift ;;
+            -r|--run-id)     RUN_ID="$2"; shift 2 ;;
+            -s|--status)     STATUS_MODE=1; shift ;;
+            --bg-child)      BG_CHILD=1; ASSUME_YES=1; shift ;;
+            -h|--help)       usage; exit 0 ;;
+            all)             PHASES+=("${ALL_PHASES[@]}"); shift ;;
+            -*)              die "Unknown option: $1" ;;
+            *)               PHASES+=("$1"); shift ;;
         esac
     done
+    (( STATUS_MODE )) && return 0
     (( ${#PHASES[@]} )) || { usage; exit 1; }
+    local p idx last=-1
     for p in "${PHASES[@]}"; do
-        [[ " ${ALL_PHASES[*]} " == *" $p "* ]] || die "Unknown phase: $p"
+        idx="$(phase_index "$p")" || die "Unknown phase: $p"
+        (( idx > last )) || die "Phases must be listed once each, in this order: ${ALL_PHASES[*]}"
+        last=$idx
     done
 }
 
@@ -145,18 +200,54 @@ load_config() {
     else
         warn "Config file $CONFIG_FILE not found; using built-in defaults."
     fi
+    CONFIG_FILE="$(cd "$(dirname "$CONFIG_FILE")" && pwd)/$(basename "$CONFIG_FILE")"
 }
 
 init_run() {
-    RUN_DIR="${WORK_DIR}/${RUN_ID}"
-    mkdir -p "$RUN_DIR"
+    if [[ -n "$RUN_ID" ]]; then
+        RUN_DIR="${WORK_DIR}/${RUN_ID}"
+        [[ -d "$RUN_DIR" ]] || die "No run folder for --run-id $RUN_ID in $WORK_DIR"
+    else
+        RUN_ID="$(date +%Y%m%d_%H%M%S)"
+        RUN_DIR="${WORK_DIR}/${RUN_ID}"
+        mkdir -p "$RUN_DIR"
+    fi
     LOG_FILE="${RUN_DIR}/zdlra_patch.log"
-    info "$SCRIPT_NAME $VERSION  run=$RUN_ID  dry_run=$DRY_RUN  phases=${PHASES[*]}"
+    info "$SCRIPT_NAME $VERSION  run=$RUN_ID  dry_run=$DRY_RUN  background=$BACKGROUND  phases=${PHASES[*]}"
+    (( BG_CHILD )) && info "Running detached as pid $$."
     [[ "$(id -un)" == "$REQUIRED_USER" ]] || die "Run as $REQUIRED_USER (current: $(id -un))."
     [[ -x "$RACLI" ]] || die "racli not found at $RACLI"
 }
 
-# Run the external precheck script. It is read-only, so it runs in dry-run mode too.
+# --status: show the state, background process and recent log of a run.
+show_status() {
+    local dir
+    if [[ -n "$RUN_ID" ]]; then
+        dir="${WORK_DIR}/${RUN_ID}"
+    else
+        dir="$(ls -1d "${WORK_DIR}"/*/ 2>/dev/null | sort | tail -1)"
+        dir="${dir%/}"
+    fi
+    [[ -n "$dir" && -d "$dir" ]] || die "No runs found in $WORK_DIR"
+    echo "Run:     $(basename "$dir")"
+    echo "Folder:  $dir"
+    echo "Status:  $(cat "${dir}/status" 2>/dev/null || echo unknown)"
+    if [[ -f "${dir}/background.pid" ]]; then
+        local pid
+        pid="$(cat "${dir}/background.pid")"
+        if kill -0 "$pid" 2>/dev/null; then echo "Process: pid $pid is running"; else echo "Process: pid $pid has finished"; fi
+    fi
+    if [[ -f "${dir}/precheck_approval.txt" ]]; then
+        echo "Approval:"
+        sed 's/^/  /' "${dir}/precheck_approval.txt"
+    fi
+    echo "Last log lines:"
+    tail -n 15 "${dir}/zdlra_patch.log" 2>/dev/null | sed 's/^/  /'
+}
+
+# ---------------------------------------------------------------------------
+# External precheck
+# ---------------------------------------------------------------------------
 # Write the summary lines matching a pattern to <lines_file>, and the names alone
 # (everything up to the tag removed) sorted to <names_file>.
 # $1 = summary text, $2 = pattern, $3 = lines_file, $4 = names_file
@@ -174,6 +265,7 @@ log_item_changes() {
     LC_ALL=C comm -23 "$1" "$2" | while IFS= read -r name; do info "  $3 resolved by patching: $name"; done
 }
 
+# Run the external precheck script. It is read-only, so it runs in dry-run mode too.
 # Failures and warnings are read from the lines after PRECHECK_SUMMARY_HEADER, e.g.
 #   FAILURE SUMMARY
 #   ***********************************
@@ -257,6 +349,74 @@ run_external_precheck() {
 }
 
 # ---------------------------------------------------------------------------
+# Operator approval of the precheck
+# ---------------------------------------------------------------------------
+# Fingerprint of the before-patching results, so an approval only covers what was reviewed.
+precheck_fingerprint() {
+    cat "${RUN_DIR}/precheck_before/failure_names.txt" "${RUN_DIR}/precheck_before/warning_names.txt" 2>/dev/null \
+        | sha256sum | cut -d' ' -f1
+}
+
+# Ask the operator to accept the precheck results and record who did, and when.
+# --yes does not skip this; it needs a terminal.
+approve_precheck() {
+    (( PRECHECK_REQUIRE_APPROVAL )) || return 0
+    [[ -t 0 ]] || die "Precheck approval needs an interactive terminal."
+    local dir="${RUN_DIR}/precheck_before" fails=0 warns=0 name
+    [[ -f "${dir}/failure_names.txt" ]] && fails=$(wc -l < "${dir}/failure_names.txt")
+    [[ -f "${dir}/warning_names.txt" ]] && warns=$(wc -l < "${dir}/warning_names.txt")
+
+    {
+        echo
+        echo "================ PRECHECK REVIEW ================"
+        echo "Run:          $RUN_ID   (dry run: $DRY_RUN)"
+        echo "Failures:     $fails (all waived, or the precheck would have stopped)"
+        [[ -s "${dir}/failure_names.txt" ]] && while IFS= read -r name; do echo "  [FAIL] $name"; done < "${dir}/failure_names.txt"
+        echo "Warnings:     $warns"
+        [[ -s "${dir}/warning_names.txt" ]] && while IFS= read -r name; do echo "  [WARN] $name"; done < "${dir}/warning_names.txt"
+        echo "Full output:  ${dir}/output.txt"
+        if (( ${#BG_PHASES[@]} )); then
+            echo
+            echo "After approval these phases run in the BACKGROUND with NO further prompts:"
+            echo "  ${BG_PHASES[*]}"
+        fi
+        echo "================================================="
+    } >&2
+
+    local reply
+    read -r -p "Review the precheck output, then type APPROVE to continue: " reply
+    [[ "$reply" == "APPROVE" ]] || die "Precheck not approved."
+
+    local approver="${SUDO_USER:-$(logname 2>/dev/null || id -un)}"
+    {
+        echo "approved_by=$approver"
+        echo "approved_at=$(date '+%F %T %Z')"
+        echo "approved_epoch=$(date +%s)"
+        echo "host=$(hostname)"
+        echo "failures=$fails"
+        echo "warnings=$warns"
+        echo "fingerprint=$(precheck_fingerprint)"
+    } > "${RUN_DIR}/precheck_approval.txt"
+    info "Precheck approved by $approver."
+}
+
+# Patch steps call this: the run must have an approved, recent, unchanged precheck.
+require_approval() {
+    (( PRECHECK_REQUIRE_APPROVAL )) || return 0
+    local f="${RUN_DIR}/precheck_approval.txt"
+    [[ -f "$f" ]] || die "Run $RUN_ID has no approved precheck. Run precheck first, or pass --run-id of an approved run."
+    local by epoch fp age max
+    by="$(sed -n 's/^approved_by=//p' "$f")"
+    epoch="$(sed -n 's/^approved_epoch=//p' "$f")"
+    fp="$(sed -n 's/^fingerprint=//p' "$f")"
+    age=$(( $(date +%s) - epoch ))
+    max=$(( PRECHECK_APPROVAL_MAX_AGE_HOURS * 3600 ))
+    (( age <= max )) || die "Precheck approval is $(( age / 3600 ))h old (limit ${PRECHECK_APPROVAL_MAX_AGE_HOURS}h). Run precheck again."
+    [[ "$fp" == "$(precheck_fingerprint)" ]] || die "Precheck results changed after they were approved. Run precheck again."
+    info "Precheck approved by $by, $(( age / 60 )) minute(s) ago."
+}
+
+# ---------------------------------------------------------------------------
 # Phases
 # ---------------------------------------------------------------------------
 phase_precheck() {
@@ -274,6 +434,8 @@ phase_precheck() {
     # TODO: check for running backup/copy-to-tape/replication jobs and decide whether to wait.
     # TODO: confirm protected databases are not mid-backup (query RASYS views).
     # TODO: confirm the patch is valid for the current version (compare racli version with patch README).
+
+    approve_precheck
 }
 
 phase_snapshot() {
@@ -299,6 +461,7 @@ phase_stage() {
 
 phase_patch1() {
     info "== patch step 1 =="
+    require_approval
     confirm "Run '$RACLI $PATCH_ACTION appliance --step=1'?"
     run "$RACLI" "$PATCH_ACTION" appliance --step=1
     # TODO: parse output/log for success markers; stop if step 1 did not complete cleanly.
@@ -306,6 +469,7 @@ phase_patch1() {
 
 phase_patch2() {
     info "== patch step 2 =="
+    require_approval
     confirm "Run '$RACLI $PATCH_ACTION appliance --step=2'? This stops services."
     run "$RACLI" "$PATCH_ACTION" appliance --step=2
     # TODO: wait for services to return, with a timeout.
@@ -329,7 +493,7 @@ phase_postcheck() {
 
 phase_report() {
     info "== report =="
-    local report="${RUN_DIR}/report.txt"
+    local report="${RUN_DIR}/report.txt" approval="${RUN_DIR}/precheck_approval.txt"
     {
         echo "ZDLRA patch run $RUN_ID"
         echo "Host:      $(hostname)"
@@ -337,21 +501,74 @@ phase_report() {
         echo "Bundle:    ${PATCH_ZIP:-<not set>}"
         echo "Dry run:   $DRY_RUN"
         echo "Phases:    ${PHASES[*]}"
+        if [[ -f "$approval" ]]; then
+            echo "Approved:  $(sed -n 's/^approved_by=//p' "$approval") at $(sed -n 's/^approved_at=//p' "$approval")"
+        fi
         echo "Log:       $LOG_FILE"
     } > "$report"
-    # TODO: optional email/webhook notification.
+    # TODO: optional email/webhook notification (useful when the run is in the background).
     info "Report written to $report"
 }
 
 # ---------------------------------------------------------------------------
+# Start the remaining phases as a detached process that survives logout. It continues
+# this run (same folder and approval), takes over the lock, and never prompts.
+start_background() {
+    local args=(-c "$CONFIG_FILE" --run-id "$RUN_ID" --bg-child)
+    (( DRY_RUN )) || args+=(--execute)
+    args+=("${BG_PHASES[@]}")
+
+    local launcher=(nohup)
+    command -v setsid >/dev/null 2>&1 && launcher=(setsid nohup)
+    ZDLRA_LOCK_FROM=$$ "${launcher[@]}" "$SCRIPT_PATH" "${args[@]}" \
+        > "${RUN_DIR}/background.out" 2>&1 < /dev/null &
+    local pid=$!
+    echo "$pid" > "${RUN_DIR}/background.pid"
+    LOCK_HANDED_OFF=1
+    set_status "running in background (pid $pid): ${BG_PHASES[*]}"
+    info "Remaining phases started in the background as pid $pid: ${BG_PHASES[*]}"
+    info "Follow it with:  tail -f $LOG_FILE"
+    info "Check it with:   $SCRIPT_PATH -c $CONFIG_FILE --status --run-id $RUN_ID"
+}
+
 main() {
     parse_args "$@"
     load_config
+    if (( STATUS_MODE )); then
+        show_status
+        exit 0
+    fi
     init_run
     acquire_lock
-    for p in "${PHASES[@]}"; do
+
+    # With --background, phases up to and including precheck run here, the rest detached.
+    local fg_phases=("${PHASES[@]}") p
+    if (( BACKGROUND && ! BG_CHILD )); then
+        fg_phases=()
+        BG_PHASES=()
+        local split=0
+        [[ " ${PHASES[*]} " == *" precheck "* ]] || split=1
+        for p in "${PHASES[@]}"; do
+            if (( split )); then BG_PHASES+=("$p"); else fg_phases+=("$p"); fi
+            [[ "$p" == precheck ]] && split=1
+        done
+        # Without precheck in this run, check the existing approval now, not after detaching.
+        if (( ! ${#fg_phases[@]} )) && [[ " ${BG_PHASES[*]} " == *" patch"* ]]; then
+            require_approval
+        fi
+    fi
+
+    for p in ${fg_phases[@]+"${fg_phases[@]}"}; do
+        CURRENT_PHASE="$p"
+        set_status "running $p"
         "phase_${p}"
     done
+
+    if (( ${#BG_PHASES[@]} )); then
+        start_background
+        return 0
+    fi
+    CURRENT_PHASE="done"
     info "Done. Run directory: $RUN_DIR"
 }
 

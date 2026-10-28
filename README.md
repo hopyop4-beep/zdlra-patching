@@ -10,13 +10,15 @@ The script breaks a patch into phases. You can run them one at a time or all tog
 
 | Phase | What it does |
 |-------|--------------|
-| `precheck` | Checks appliance status and free space, then runs your external precheck script |
+| `precheck` | Checks appliance status and free space, runs your external precheck script, then asks you to approve the results |
 | `snapshot` | Saves configuration and state before patching |
 | `stage` | Unpacks the patch bundle into the staging directory |
 | `patch1` | Runs `racli <patch\|upgrade> appliance --step=1` |
 | `patch2` | Runs `racli <patch\|upgrade> appliance --step=2` |
 | `postcheck` | Runs the checks again and compares the result with the snapshot |
 | `report` | Writes a summary of the run |
+
+You must list phases in this order. You can leave phases out, but you can't reorder them.
 
 **Dry run is the default.** The script only logs commands that change something. Read-only commands such as `racli status` still run. To run every command, pass `--execute`.
 
@@ -34,9 +36,38 @@ vi zdlra_patch.conf
 
 # Real run of step 1 (prompts before it starts)
 ./zdlra_patch.sh --execute precheck snapshot stage patch1
+
+# Later: continue the same run for step 2
+./zdlra_patch.sh --execute --run-id 20261028_140211 patch2 postcheck report
 ```
 
 Each run writes its log, snapshots and report to `$WORK_DIR/<run id>/`.
+
+## Precheck approval and background runs
+
+After the precheck, the script shows the failures and warnings, then waits for you to type `APPROVE`. `--yes` does not skip this. The approval is saved in `<run id>/precheck_approval.txt` with who approved it, when, and a fingerprint of the results.
+
+`patch1` and `patch2` refuse to run unless the run has an approval that:
+
+- belongs to the same run, either the current one or the one named with `--run-id`
+- is no older than `PRECHECK_APPROVAL_MAX_AGE_HOURS` (24 by default)
+- matches the precheck results that were reviewed
+
+With `--background`, the precheck runs in your terminal. After you approve it, the remaining phases continue in a detached process. That process keeps running if your SSH session drops. **It does not prompt again**, because nobody is there to answer; your approval covers the patch steps, and the review screen says so.
+
+```bash
+# Precheck in the terminal; after approval, everything else in the background
+./zdlra_patch.sh --execute --background all
+
+# Follow it
+tail -f /radump/zdlra_patch_runs/<run id>/zdlra_patch.log
+
+# Check its state: phase, process, approval, recent log lines
+./zdlra_patch.sh --status
+./zdlra_patch.sh --status --run-id <run id>
+```
+
+If you leave `precheck` out, for example to continue an approved run with `--run-id`, the approval is checked before the script detaches. A problem then shows up right away in your terminal.
 
 ## External precheck script
 
@@ -83,7 +114,8 @@ The script runs in dry-run mode too, because it only reads. **Do not commit the 
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
-- [ ] Email or webhook notification
+- [x] Operator approval of the precheck, and background runs
+- [ ] Email or webhook notification (most useful for background runs)
 - [ ] Optional Exadata infrastructure (`patchmgr`) phases
 
 ## Disclaimer
