@@ -1,3 +1,7 @@
 zdlra_patch.conf
 *.log
 runs/
+
+# Real per-appliance manifests stay local
+staging/manifests/*.txt
+!staging/manifests/example.txt

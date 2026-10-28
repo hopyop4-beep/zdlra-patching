@@ -100,6 +100,27 @@ Results are saved to `<run id>/precheck_before/`: the full output, plus the fail
 
 The script runs in dry-run mode too, because it only reads. **Do not commit the script or its output to this repo.** Get it from Oracle and keep it on the appliance.
 
+## Staging the patches (Windows PC)
+
+The firewall stops patches from moving between hosts directly, so they go through a Windows PC. `staging/Copy-ZdlraPatches.ps1` does the first hop, from a ZDLRA to the PC. It uses the OpenSSH client built into Windows.
+
+```powershell
+.\staging\Copy-ZdlraPatches.ps1 -ZdlraName zdlra01 -RemotePath /radump/patches
+```
+
+The script:
+
+1. Connects to the ZDLRA and checks that the folder exists, holds at least one `.zip`, and holds every file in the manifest (for example the precheck script). If anything is missing, it stops before zipping.
+2. Checks free space on the ZDLRA and on the PC.
+3. Zips the whole folder on the ZDLRA in `-RemoteWorkDir` (default `/radump`). It uses `zip -0` (stored, because patch zips are already compressed), or `tar` if zip is not installed.
+4. Downloads the archive with `scp` to `C:\ZDLRA\staging\<ZdlraName>\`.
+5. Checks that the size and SHA-256 match the values from the ZDLRA and that the archive opens. It writes `<archive>.sha256` in `sha256sum` format.
+6. Deletes the archive on the ZDLRA. Pass `-KeepRemoteArchive` to leave it.
+
+**Manifest (optional):** `staging/manifests/<ZdlraName>.txt` lists one path per line, relative to the remote folder. See `staging/manifests/example.txt`. Real manifests are in `.gitignore`.
+
+Each step opens its own SSH connection, so set up key authentication (`-SshKey`). Otherwise you type the password several times. For other options, run `Get-Help .\staging\Copy-ZdlraPatches.ps1 -Full`.
+
 ## Before you use it
 
 - Read the README that comes with your patch bundle, and the current Oracle note on ZDLRA patching and upgrades on My Oracle Support. Check every `racli` command in the script against them, because the steps can change between releases.
