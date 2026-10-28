@@ -121,6 +121,28 @@ The script:
 
 Each step opens its own SSH connection, so set up key authentication (`-SshKey`). Otherwise you type the password several times. For other options, run `Get-Help .\staging\Copy-ZdlraPatches.ps1 -Full`.
 
+### Unpacking on the compute nodes
+
+Copy the archive and its `.sha256` file to one compute node. Then run `staging/zdlra_stage.sh` there as root:
+
+```bash
+# Dry run: verifies and checks, but copies and unpacks nothing
+./staging/zdlra_stage.sh -a /radump/zdlra01_patches_20261028_174710.zip
+
+# Real run, with the node list given explicitly
+./staging/zdlra_stage.sh -a /radump/zdlra01_patches_20261028_174710.zip -n node1,node2 --execute
+```
+
+| Step | What it does |
+|------|--------------|
+| verify | Checks the archive's SHA-256 against the `.sha256` file |
+| distribute | Copies the archive to the other compute nodes with `scp`, to the same path |
+| check | On every node: verifies the SHA-256 and free space, and makes sure the target folder doesn't exist yet |
+| extract | Unpacks the archive on every node into `/radump/zdlra_stage/<archive name>/` |
+| post | Per-node steps after unpacking: `TODO` hooks, to be filled in |
+
+The node list comes from `olsnodes` unless you pass `--nodes`. Root SSH equivalence between the nodes is required.
+
 ## Before you use it
 
 - Read the README that comes with your patch bundle, and the current Oracle note on ZDLRA patching and upgrades on My Oracle Support. Check every `racli` command in the script against them, because the steps can change between releases.
