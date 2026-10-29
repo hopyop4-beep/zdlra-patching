@@ -97,6 +97,8 @@ PRECHECK_ARGS=()
 PRECHECK_WAIVERS=("a failure you have reviewed and accepted")
 ```
 
+The precheck is run as `./precheck -srnumber=<SR>` from its own folder (`PRECHECK_SCRIPT`, default `/radump/patches/bin/precheck`). The SR number is `SR_NUMBER=` from the conf file staging set up, and staging checks it is there. On the actual patching event (a run with `--execute`) `-recheck_all` is added (`PRECHECK_EVENT_ARGS`). A dry run, such as a rehearsal ahead of time, runs without it.
+
 The script reads failures from the summary at the end of the precheck output:
 
 ```

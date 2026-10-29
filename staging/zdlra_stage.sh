@@ -180,6 +180,7 @@ UNPACK_INTO=""                  # where unzip runs, e.g. /radump
 ZIP_PREFIX=""                   # top folder inside the zip, e.g. "patches/"
 CONF_NAME=""                    # e.g. patch.conf_4-003351830
 CONF_TEXT=""                    # its contents, read from the zip
+SR_NUMBER_VALUE=""              # SR_NUMBER= in it
 PATCH_FILES=()                  # files named by the FILES_* settings
 declare -A FILES_BY_VAR=()      # setting -> its file names, space-separated
 EXPECTED_SHA=""
@@ -380,6 +381,15 @@ verify_local() {
     [[ "$CONF_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "Conf file name has unsupported characters: $CONF_NAME"
     CONF_TEXT="$(zip_cat "$confs" | tr -d '\r')" || die "Cannot read $confs from the archive."
     info "Conf file:    ${CONF_SUBDIR}/${CONF_NAME} (SR ${CONF_NAME#*_})"
+    # zdlra_patch.sh passes SR_NUMBER to the precheck (./precheck -srnumber=...).
+    SR_NUMBER_VALUE="$(conf_value "$CONF_TEXT" SR_NUMBER)"
+    [[ -n "$SR_NUMBER_VALUE" ]] || die "The conf file has no SR_NUMBER= (the precheck needs it)."
+    [[ "$SR_NUMBER_VALUE" =~ ^[A-Za-z0-9-]+$ ]] || die "Unexpected SR_NUMBER in the conf file: $SR_NUMBER_VALUE"
+    if [[ "$SR_NUMBER_VALUE" != "${CONF_NAME#*_}" ]]; then
+        warn "SR_NUMBER=$SR_NUMBER_VALUE in the conf file differs from the number in its name (${CONF_NAME#*_}); the precheck will use $SR_NUMBER_VALUE."
+    else
+        info "SR_NUMBER:    $SR_NUMBER_VALUE"
+    fi
 
     # Patch files named by the FILES_* settings must be in patches/.
     local key value f missing=()
@@ -970,7 +980,8 @@ sha256=$EXPECTED_SHA
 staged_at=$(date '+%F %T %Z')
 staged_from=$(hostname)
 patch_conf=${STAGE_DIR}/${CONF_SUBDIR}/${CONF_NAME}
-sr=${CONF_NAME#*_}"
+sr=${CONF_NAME#*_}
+sr_number=$SR_NUMBER_VALUE"
     for key in "${COMPONENT_VARS[@]}"; do content+=$'\n'"component_${key}=${COMP[$key]:-}"; done
     for f in "${PATCH_FILES[@]}"; do content+=$'\n'"file=$f"; done
     for var in "${!FILE_UNZIP_DIR[@]}"; do

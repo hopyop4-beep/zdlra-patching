@@ -70,8 +70,14 @@ MIN_FREE_GB=50                  # free space needed in WORK_DIR's filesystem
 REQUIRED_USER="root"
 
 # External precheck script (e.g. the Oracle-supplied precheck). Not shipped in this repo.
-PRECHECK_SCRIPT=""              # full path; empty = skip with a warning
-PRECHECK_ARGS=()                # arguments passed to the script
+# Oracle's precheck, run as ./precheck from its own folder. In PRECHECK_ARGS,
+# {sr_number} is SR_NUMBER= from the conf file staging set up, and {patch_conf} is
+# that conf file's path (both via the staged record).
+PRECHECK_SCRIPT="/radump/patches/bin/precheck"   # full path; empty = skip with a warning
+PRECHECK_ARGS=(-srnumber={sr_number})
+PRECHECK_CWD=""                 # folder to run it from; empty = the script's own folder
+# Added for the actual patching event (a run with --execute), not for dry runs.
+PRECHECK_EVENT_ARGS=(-recheck_all)
 PRECHECK_TIMEOUT=3600           # seconds before the precheck is killed
 PRECHECK_SUMMARY_HEADER="FAILURE SUMMARY"   # failures are read from after this line
 PRECHECK_FAIL_PATTERN='\[FAIL\]'            # extended regex for a failure line
@@ -340,20 +346,35 @@ run_external_precheck() {
     local out_dir="${RUN_DIR}/precheck_${label}"
     local out_file="${out_dir}/output.txt"
     mkdir -p "$out_dir"
-    # {patch_conf} -> the conf file staging set up for this appliance.
-    local args=() a conf
+    # {patch_conf} -> the conf file staging set up for this appliance;
+    # {sr_number} -> SR_NUMBER= in that conf file.
+    local args=() a conf sr=""
     conf="$(staged_value patch_conf)"
+    if [[ " ${PRECHECK_ARGS[*]-} " == *"{sr_number}"* ]]; then
+        [[ -n "$conf" ]] || die "PRECHECK_ARGS uses {sr_number}, but the staged record names no patch_conf."
+        [[ -f "$conf" ]] || die "Conf file from the staged record not found: $conf"
+        sr="$(sed -n 's/^SR_NUMBER=//p' "$conf" | head -1 | tr -d '\r' | sed -E "s/^[\"']//; s/[\"']$//; s/[[:space:]]+$//")"
+        [[ -n "$sr" ]] || die "No SR_NUMBER= in $conf."
+        [[ "$sr" =~ ^[A-Za-z0-9-]+$ ]] || die "Unexpected SR_NUMBER in $conf: $sr"
+    fi
     for a in ${PRECHECK_ARGS[@]+"${PRECHECK_ARGS[@]}"}; do
         if [[ "$a" == *"{patch_conf}"* ]]; then
             [[ -n "$conf" ]] || die "PRECHECK_ARGS uses {patch_conf}, but the staged record names no patch_conf."
             a="${a//\{patch_conf\}/$conf}"
         fi
+        a="${a//\{sr_number\}/$sr}"
         args+=("$a")
     done
-    info "Running precheck ($label): $PRECHECK_SCRIPT ${args[*]-} (timeout ${PRECHECK_TIMEOUT}s)"
+    # The actual patching event (--execute) checks everything again.
+    if (( ! DRY_RUN )); then
+        args+=(${PRECHECK_EVENT_ARGS[@]+"${PRECHECK_EVENT_ARGS[@]}"})
+    fi
+    local cwd="${PRECHECK_CWD:-$(dirname "$PRECHECK_SCRIPT")}" cmd="./$(basename "$PRECHECK_SCRIPT")"
+    [[ -n "$PRECHECK_CWD" ]] && cmd="$PRECHECK_SCRIPT"
+    info "Running precheck ($label): cd $cwd && $cmd ${args[*]-} (timeout ${PRECHECK_TIMEOUT}s)"
 
     local rc=0
-    ( cd "$out_dir" && timeout "$PRECHECK_TIMEOUT" "$PRECHECK_SCRIPT" ${args[@]+"${args[@]}"} ) \
+    ( cd "$cwd" && timeout "$PRECHECK_TIMEOUT" "$cmd" ${args[@]+"${args[@]}"} ) \
         > "$out_file" 2>&1 || rc=$?
     info "Precheck output: $out_file (exit code $rc)"
     (( rc == 124 )) && die "Precheck timed out after ${PRECHECK_TIMEOUT}s."

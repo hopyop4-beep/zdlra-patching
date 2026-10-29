@@ -24,11 +24,14 @@ REQUIRED_USER="root"
 # The phase fails on any failure that is not waived, on a timeout, or on a
 # non-zero exit code with no summary. Warnings are logged but do not stop the
 # run unless PRECHECK_FAIL_ON_WARN=1.
-# TODO(site): the precheck's real path and arguments (in /radump/patches/bin?).
-# {patch_conf} in PRECHECK_ARGS is replaced with the conf file staging set up for
-# this appliance (/radump/patches/conf/patch.conf_<SR>, from the staged record).
-PRECHECK_SCRIPT="/radump/patches/bin/<precheck-script>"
-PRECHECK_ARGS=()                     # e.g. PRECHECK_ARGS=(-c {patch_conf})
+# Oracle's precheck, run as ./precheck -srnumber=<SR> from its own folder.
+# In PRECHECK_ARGS, {sr_number} is SR_NUMBER= from the conf file staging set up
+# (/radump/patches/conf/patch.conf_<SR>), and {patch_conf} is that file's path.
+PRECHECK_SCRIPT="/radump/patches/bin/precheck"
+PRECHECK_ARGS=(-srnumber={sr_number})
+PRECHECK_CWD=""                      # empty = run from the script's own folder
+# Added for the actual patching event (a run with --execute), not for dry runs:
+PRECHECK_EVENT_ARGS=(-recheck_all)
 PRECHECK_TIMEOUT=3600
 PRECHECK_SUMMARY_HEADER="FAILURE SUMMARY"
 PRECHECK_FAIL_PATTERN='\[FAIL\]'
