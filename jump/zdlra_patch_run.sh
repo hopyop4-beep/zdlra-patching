@@ -68,6 +68,8 @@ declare -A PATCH_NODE=()
 declare -A BLACKOUT_TARGETS=()   # not used here; lets the shared config load
 OEM_JOBS_SUSPEND_CMD=()
 OEM_JOBS_RESUME_CMD=()
+OEM_JOBS_DIR=""                  # folder the OEM job commands run in (empty = current folder)
+declare -A OEM_JOBS_DB=()        # per appliance: the name the OEM jobs script uses ({jobs_db})
 SSH_OPTS=(-n -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30)   # -n: never read this terminal
 
 # Compute nodes (the "compute" phase, run from here). Paths are on the compute nodes.
@@ -169,24 +171,38 @@ run_status() { on_node "$REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_
 
 xflag() { (( DRY_RUN )) || echo " -x"; }
 
-# Run one of the OEM job commands from the config, with {zdlra} filled in.
-# $1 = label for messages, rest = the command and its arguments.
+# The name the OEM jobs script uses for this appliance ({jobs_db}): OEM_JOBS_DB, or
+# the appliance name itself when it is not listed.
+jobs_db() { echo "${OEM_JOBS_DB[$ZDLRA]:-$ZDLRA}"; }
+
+# Fill in {zdlra} and {jobs_db} in a command; prints one argument per line.
+jobs_cmd_fill() {
+    local a db; db="$(jobs_db)"
+    for a in "$@"; do a="${a//\{zdlra\}/$ZDLRA}"; printf '%s\n' "${a//\{jobs_db\}/$db}"; done
+}
+
+# Run one of the OEM job commands from the config, in OEM_JOBS_DIR, with {zdlra} and
+# {jobs_db} filled in. $1 = label for messages, rest = the command and its arguments.
 run_jobs_cmd() {
     local label="$1"; shift
     if (( $# == 0 )); then
         warn "No OEM job command set for '$label' in $CONFIG_FILE; skipping."
         return 0
     fi
-    local cmd=("${@//\{zdlra\}/$ZDLRA}")
+    local cmd=()
+    mapfile -t cmd < <(jobs_cmd_fill "$@")
     if (( DRY_RUN )); then
-        info "[dry-run] $label OEM jobs: ${cmd[*]}"
+        info "[dry-run] $label OEM jobs: ${OEM_JOBS_DIR:+cd $OEM_JOBS_DIR && }${cmd[*]}"
         return 0
     fi
-    info "[exec] $label OEM jobs: ${cmd[*]}"
-    "${cmd[@]}"
+    info "[exec] $label OEM jobs: ${OEM_JOBS_DIR:+cd $OEM_JOBS_DIR && }${cmd[*]}"
+    ( if [[ -n "$OEM_JOBS_DIR" ]]; then cd "$OEM_JOBS_DIR" || exit 1; fi; "${cmd[@]}" )
 }
 
-jobs_cmd_text() { local c=("${@//\{zdlra\}/$ZDLRA}"); echo "${c[*]}"; }
+jobs_cmd_text() {
+    local c=(); mapfile -t c < <(jobs_cmd_fill "$@")
+    echo "${OEM_JOBS_DIR:+cd $OEM_JOBS_DIR && }${c[*]}"
+}
 
 # What to undo by hand after a failure or interruption, once the work has started.
 print_undo() {
@@ -471,9 +487,15 @@ step_preflight() {
     DRY_RUN=1; blackout start || { DRY_RUN=$saved; die "Blackout settings are not ready (see above)."; }
     DRY_RUN=$saved
     local c
+    [[ -z "$OEM_JOBS_DIR" || -d "$OEM_JOBS_DIR" ]] || die "OEM_JOBS_DIR not found: $OEM_JOBS_DIR"
     for c in ${OEM_JOBS_SUSPEND_CMD[0]-} ${OEM_JOBS_RESUME_CMD[0]-}; do
-        [[ -x "$c" ]] || command -v "$c" >/dev/null 2>&1 || die "OEM job command not found or not executable: $c"
+        ( if [[ -n "$OEM_JOBS_DIR" ]]; then cd "$OEM_JOBS_DIR" || exit 1; fi
+          [[ -x "$c" ]] || command -v "$c" >/dev/null 2>&1 )             || die "OEM job command not found or not executable${OEM_JOBS_DIR:+ in $OEM_JOBS_DIR}: $c"
     done
+    if [[ "${OEM_JOBS_SUSPEND_CMD[*]-} ${OEM_JOBS_RESUME_CMD[*]-}" == *"{jobs_db}"* ]]; then
+        [[ -n "${OEM_JOBS_DB[$ZDLRA]:-}" ]]             || die "OEM_JOBS_DB[$ZDLRA] is not set in $CONFIG_FILE: the name the OEM jobs script uses for $ZDLRA (for example RA1GF2)."
+        info "OEM jobs name for $ZDLRA: $(jobs_db)"
+    fi
     (( ${#OEM_JOBS_SUSPEND_CMD[@]} )) || warn "OEM_JOBS_SUSPEND_CMD is not set; OEM backup jobs will not be suspended."
 }
 

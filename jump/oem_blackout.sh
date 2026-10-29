@@ -37,6 +37,7 @@ BLACKOUT_HOURS=12
 BLACKOUT_PROPAGATE=1
 declare -A BLACKOUT_TARGETS=()
 declare -A PATCH_NODE=()         # not used here; lets the shared config load
+declare -A OEM_JOBS_DB=()        # not used here; lets the shared config load
 
 log()  { local lvl="$1"; shift; printf '%s [%-5s] %s\n' "$(date '+%F %T')" "$lvl" "$*" >&2; }
 info() { log INFO "$@"; }

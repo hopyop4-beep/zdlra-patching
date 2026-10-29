@@ -19,11 +19,21 @@ BLACKOUT_PROPAGATE=1
 BLACKOUT_TARGETS[zdlra01]="<target name>:<target type>;<host name>:host"
 
 # --- OEM backup jobs ----------------------------------------------------------
-# Your own script(s) that suspend and resume the OEM backup jobs, as a command and
-# its arguments. {zdlra} is replaced with the appliance name. The command must exit
-# 0 on success. Leave a command empty to skip that step (a warning is logged).
-OEM_JOBS_SUSPEND_CMD=(/path/to/your_oem_jobs_script.sh suspend {zdlra})
-OEM_JOBS_RESUME_CMD=(/path/to/your_oem_jobs_script.sh resume {zdlra})
+# sr_jobs_new.ksh suspends (-a s) and resumes (-a r) the OEM backup jobs of one
+# appliance: sr_jobs_new.ksh -z <zdlra db> -a <s|r> [ -t <I1|ARC> ]
+# The commands run in OEM_JOBS_DIR. In the commands, {jobs_db} is replaced with the
+# appliance's name for that script (OEM_JOBS_DB below) and {zdlra} with the appliance
+# name. A command must exit 0 on success. Leave a command empty to skip that step (a
+# warning is logged).
+OEM_JOBS_DIR="/odb/oem01/swlib/softwarelibrary/automation/ZDLRA_Automation/ZDLRA_Suspend_Resume_Jobs"
+OEM_JOBS_SUSPEND_CMD=(./sr_jobs_new.ksh -z {jobs_db} -a s)
+OEM_JOBS_RESUME_CMD=(./sr_jobs_new.ksh -z {jobs_db} -a r)
+
+# Per appliance: its zdlra db value for sr_jobs_new.ksh, one of GF1 GF2 CPGF0NP QAMBL
+# CPGF1 CPGF2 CP2GF0NP CP2GF1 CP2GF2 CP3GF1 CP3GF2, or the new values RAGF1 RAGF2
+# RA1GF0NP RAGF1NP RA1GF1 RA1GF2 RA2GF0NP RA2GF1 RA2GF2 RA3GF1 RA3GF2.
+# A run stops before it starts if its appliance is not listed here.
+OEM_JOBS_DB[zdlra01]="RA1GF2"
 
 # --- Appliances -------------------------------------------------------------
 # Compute node that runs zdlra_patch.sh, per appliance. If an appliance is not
