@@ -13,7 +13,7 @@
 #
 # Phases (run in this order by "all"; phases you list must keep this order):
 #   precheck    appliance health and the external precheck script, then operator approval
-#   quiesce     pause replication, wait for in-flight replication and incoming backups
+#   quiesce     pause replication, wait for incoming backups
 #               to finish (needs an approved precheck)
 #   snapshot    save configuration and state so you can compare after patching
 #   ra_preinstall  racli run preinstall with the ZDLRA software from the staged
@@ -166,7 +166,6 @@ REPLICATION_STATUS_SQL="select remote_ra_dbname || '  state=' || replication_ser
 # Pause/resume each one by its remote_ra_dbname.
 REPLICATION_PAUSE_SQL="begin dbms_ra.pause_replication_server(replication_server_name => '{server}'); end;"
 REPLICATION_RESUME_SQL="begin dbms_ra.resume_replication_server(replication_server_name => '{server}'); end;"
-ACTIVE_REPLICATION_SQL=""       # count of replication still in flight
 # Incoming backups: active RMAN sessions on the appliance database, on all instances
 # (idle sessions that are only connected are not counted).
 ACTIVE_BACKUPS_SQL="select count(*) from gv\$session s where s.status = 'ACTIVE' and (lower(s.program) like '%rman%' or lower(s.module) like '%rman%');"
@@ -661,7 +660,7 @@ sql_exec() {
 missing_sql_settings() {
     local v missing=()
     for v in RA_SQL_CONNECT REPLICATION_SERVERS_SQL REPLICATION_PAUSE_SQL REPLICATION_RESUME_SQL \
-             ACTIVE_REPLICATION_SQL ACTIVE_BACKUPS_SQL; do
+             ACTIVE_BACKUPS_SQL; do
         [[ -n "${!v}" ]] || missing+=("$v")
     done
     # The example's placeholder password counts as not filled in.
@@ -685,8 +684,6 @@ report_activity() {
     fi
     servers="$(sql_rows "$REPLICATION_SERVERS_SQL")" || die "Could not list replication servers."
     info "Replication servers to pause (running, upstream or paired): $(tr '\n' ' ' <<<"${servers:-none}")"
-    n="$(sql_count "$ACTIVE_REPLICATION_SQL")" || die "Could not count active replication."
-    info "Replication in flight now: $n"
     n="$(sql_count "$ACTIVE_BACKUPS_SQL")" || die "Could not count incoming backups."
     info "Incoming backups running now: $n"
     (( n == 0 )) || show_rows "Incoming backup sessions:" "${ACTIVE_BACKUPS_LIST_SQL:-}"
@@ -767,8 +764,8 @@ phase_precheck() {
 }
 
 # Pauses the running upstream/paired replication (REPLICATION_SERVERS_SQL), then waits
-# for in-flight replication and incoming backups (RMAN sessions). TODO(site): the in-flight
-# replication count (ACTIVE_REPLICATION_SQL) is still to be filled in.
+# for incoming backups (active RMAN sessions). It does not wait for replication already
+# in progress: pausing is enough (decided by the site).
 phase_quiesce() {
     info "== quiesce =="
     local missing
@@ -797,8 +794,6 @@ phase_quiesce() {
         (( DRY_RUN )) || echo "$server" >> "$paused"
         info "Paused replication server $server"
     done <<<"$servers"
-
-    wait_for_zero "replication tasks" "$ACTIVE_REPLICATION_SQL"
 
     if (( SKIP_BACKUP_WAIT || ! QUIESCE_WAIT_FOR_BACKUPS )); then
         local n

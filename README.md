@@ -11,7 +11,7 @@ The script breaks a patch into phases. You can run them one at a time or all tog
 | Phase | What it does |
 |-------|--------------|
 | `precheck` | Checks that the patches were staged (the record left by `zdlra_stage.sh`), appliance status and free space. Runs Oracle's precheck script, which confirms the staged files are in place, and shows the replication and incoming-backup activity. Then asks you to approve the results, including which archive was staged |
-| `quiesce` | Pauses replication and records which servers it paused. Then waits, up to a time limit, for replication in progress and incoming backups to finish. `--skip-backup-wait` skips the backup wait |
+| `quiesce` | Pauses replication and records which servers it paused. Then waits, up to a time limit, for incoming backups to finish (it doesn't wait for replication already in progress). `--skip-backup-wait` skips the backup wait |
 | `snapshot` | Saves configuration and state before patching |
 | `ra_preinstall` | Runs `racli run preinstall --zdlra_release_file=<ZDLRA software zip>`, with the zip staging recorded as `ra_release=`. Success: the log reaches `End: ra_preinstall post cleanup`, no `CHECK:`/`HOST:` line says `FAIL`, and `/root/.ra_preinstall.install` is written. It must come after the precheck, which rolls back the RPM it installs |
 | `ra_alter` | Checks that both gold images (named in `ra_gold_images=`) are in `/radump`, where the precheck moves them. Then runs `racli alter appliance --online_updates --gold_images_path=/radump/`, which installs the new grid and DB homes. Success: `End: Alter Appliance` |
@@ -63,14 +63,13 @@ An interrupted `patchmgr` session or `racli` upgrade step can cause major proble
 
 ## Replication and incoming backups
 
-The `precheck`, `quiesce` and `resume` phases run SQL with `sqlplus` as the raAutomation account. `RA_SQL_CONNECT` sets the connection: `raAutomation/<password>` for now, in `zdlra_patch.conf` (not in git). The script warns unless that file is `chmod 600`, and passes the connection to `sqlplus` on stdin, so the password never shows in the process list or the log. A wallet alias (`/@raAutomation`) can replace it later. The queries and statements are settings in `zdlra_patch.conf`. The replication and incoming-backup ones have defaults; the in-flight replication count is still a `TODO` placeholder:
+The `precheck`, `quiesce` and `resume` phases run SQL with `sqlplus` as the raAutomation account. `RA_SQL_CONNECT` sets the connection: `raAutomation/<password>` for now, in `zdlra_patch.conf` (not in git). The script warns unless that file is `chmod 600`, and passes the connection to `sqlplus` on stdin, so the password never shows in the process list or the log. A wallet alias (`/@raAutomation`) can replace it later. The queries and statements are settings in `zdlra_patch.conf`. All of them have defaults. There is no wait for replication already in progress: pausing it is enough. The settings:
 
 | Setting | What it must do |
 |---|---|
 | `REPLICATION_SERVERS_SQL` | Print the replication to pause, one `remote_ra_dbname` per line. Default: from `ra_replication_pair`, every server whose state is running and whose role is upstream or paired |
 | `REPLICATION_STATUS_SQL` | Shown in the precheck review: every pair with its state and role (read only) |
 | `REPLICATION_PAUSE_SQL` / `REPLICATION_RESUME_SQL` | Statement to run for each one; `{server}` is the `remote_ra_dbname`. Default: `dbms_ra.pause_replication_server` / `resume_replication_server` |
-| `ACTIVE_REPLICATION_SQL` | Print one number: replication still in progress |
 | `ACTIVE_BACKUPS_SQL` | Print one number: incoming backups still running. Default: active RMAN sessions in `gv$session` (status `ACTIVE`, program or module like `rman`, any case), on all instances |
 | `ACTIVE_BACKUPS_LIST_SQL` | Optional: those sessions one per line (instance, sid, program, machine, event, wait), shown in the precheck review and when the wait gives up |
 
@@ -283,7 +282,7 @@ Running the same archive again is safe, because nodes that are already staged ar
 ## Roadmap
 
 - [x] Call an external precheck script and fail on errors
-- [ ] Fill in the replication and incoming-backup SQL (placeholders in place)
+- [x] Replication and incoming-backup SQL (no wait for replication already in progress, by choice)
 - [ ] Verify the bundle checksum
 - [x] Staging unzips `patches.zip` in `/radump` and rewrites `patch.conf_<SR>` for the appliance; the patch script relies on the staged record (the `stage` phase is gone)
 - [x] Unzip the compute, cell and switch patches into `tmp/`, and move the RA patches to `/raacfs/raadmin/tmp`

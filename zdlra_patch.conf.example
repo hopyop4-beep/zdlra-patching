@@ -112,7 +112,6 @@ RA_SQL_CONNECT="raAutomation/<password>"
 #                            with its state and role
 #   REPLICATION_PAUSE_SQL    statement run for each of them; {server} is the name
 #   REPLICATION_RESUME_SQL   statement run for each one this run paused
-#   ACTIVE_REPLICATION_SQL   prints one number: replication still in flight
 #   ACTIVE_BACKUPS_SQL       prints one number: incoming backups still running
 #                            (active RMAN sessions in gv$session, by program or module)
 #   ACTIVE_BACKUPS_LIST_SQL  optional: those sessions, one per line, shown in the
@@ -122,8 +121,7 @@ REPLICATION_STATUS_SQL="select remote_ra_dbname || '  state=' || replication_ser
 # Pause/resume each one by its remote_ra_dbname.
 REPLICATION_PAUSE_SQL="begin dbms_ra.pause_replication_server(replication_server_name => '{server}'); end;"
 REPLICATION_RESUME_SQL="begin dbms_ra.resume_replication_server(replication_server_name => '{server}'); end;"
-# TODO(site): the in-flight replication count.
-ACTIVE_REPLICATION_SQL=""
+# There is no wait for replication already in progress: pausing is enough.
 ACTIVE_BACKUPS_SQL="select count(*) from gv\$session s where s.status = 'ACTIVE' and (lower(s.program) like '%rman%' or lower(s.module) like '%rman%');"
 ACTIVE_BACKUPS_LIST_SQL="select 'inst=' || s.inst_id || ' sid=' || s.sid || ',' || s.serial# || '  ' || s.program || '  machine=' || s.machine || '  event=' || s.event || '  wait=' || s.seconds_in_wait || 's' from gv\$session s where s.status = 'ACTIVE' and (lower(s.program) like '%rman%' or lower(s.module) like '%rman%') order by s.inst_id, s.sid;"
 
