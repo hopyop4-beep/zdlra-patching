@@ -239,7 +239,12 @@ Running the same archive again is safe, because nodes that are already staged ar
   - [ ] Step 1, pre-install: `racli run preinstall --zdlra_release_file=/raacfs/raadmin/tmp/<zip>`, as root on node 1. Still to check:
     - whether the precheck already covers it
     - which `FILES_RA` file is the release zip (probably the first)
-  - [ ] Steps 2 and 3: to be described
+  - [ ] Step 2, update: `racli update appliance [--ignore_incidents]`, as root on node 1. This replaces the current `patch1`/`patch2` phases, because one run does Alter Appliance (new grid and DB homes), Patch Appliance step 1 (prechecks) and step 2 (the patch).
+    - Success: the output reaches `End: Patch Recovery Appliance - Step [Patch]`.
+    - On an error it stops. Running it again carries on from where it failed, so the script can offer a rerun.
+    - It takes about 2h10m (one sample).
+    - Still to check: when to use `--ignore_incidents`, and whether the "Please run 'racli update appliance' to finish patch process" message ever means a second run is needed.
+  - [ ] Step 3: to be described
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
