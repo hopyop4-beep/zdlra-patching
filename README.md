@@ -270,7 +270,11 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [ ] Email or webhook notification (most useful for background runs)
 - [ ] Exadata infrastructure patching with `patchmgr`. The order in the window is: RA upgrade, compute, cells, switches. The `cells` phase sits after `patch2` for now and moves into place as the others are built:
   - [x] Storage cells (`cells` phase; rolling is handled by `patchmgr` itself)
-  - [ ] Compute nodes
+  - [ ] Compute nodes. Both passes are run from the jump server, with each `patchmgr` detached on the node so nothing can cut it short:
+    - Pass 1: on node 1, `patchmgr -dbnodes` (the other nodes) `-precheck ... -nomodify_at_prereq`, then `-upgrade`. Node 2 reboots.
+    - Pass 2: on node 2, the same against node 1. Node 1 reboots.
+    - Both run from the db_server_patch folder after `unzip -q dbnodeupdate.zip`, with `-log_dir auto`, `-target_version` set to `TARGET_COMPUTE_VERSION`, and `-iso_repo` set to the full path of the computepatch (1st `FILES_YUM` file). Afterwards `dcli ... imageinfo -ver` must show the target.
+    - Open questions: the order (after the cells?), `/root/db_nodes` (existing, or written per pass), whether `SUCCESS WITH WARNING(S)` should pause for review, and checks after node 1 is back
   - [ ] Switches (RoCE or InfiniBand, depending on the rack)
 
 ## Disclaimer
