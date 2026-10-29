@@ -108,9 +108,9 @@ CELL_PATCH_WARN_MINUTES=360     # per patchmgr command (about 2 hours for 17 cel
 # TODO(site): check whether -patch should always use -ignore_alerts.
 DCLI="dcli"
 
-# SQL on the appliance, as the raadmin account (see the config example).
+# SQL on the appliance, as the raAutomation account (see the config example).
 SQLPLUS="sqlplus"
-RA_SQL_CONNECT=""               # e.g. /@raadmin (wallet alias); empty = SQL steps not set up
+RA_SQL_CONNECT=""               # e.g. raAutomation/<password>; empty = SQL steps not set up
 # Each query prints one value per line; the count queries print a single number.
 # {server} in the statements is a remote_ra_dbname from REPLICATION_SERVERS_SQL.
 # Replication to pause: every running upstream or paired replication server.
@@ -282,10 +282,22 @@ load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         # shellcheck source=/dev/null
         source "$CONFIG_FILE"
+        config_password_check
     else
         warn "Config file $CONFIG_FILE not found; using built-in defaults."
     fi
     CONFIG_FILE="$(cd "$(dirname "$CONFIG_FILE")" && pwd)/$(basename "$CONFIG_FILE")"
+}
+
+# RA_SQL_CONNECT may hold a password (user/password): then only root should be able
+# to read the config. Warn if group or others can read it.
+config_password_check() {
+    [[ "$RA_SQL_CONNECT" == [!/]*/?* ]] || return 0
+    local mode
+    mode="$(stat -c %a "$CONFIG_FILE" 2>/dev/null)" || return 0
+    if (( (8#$mode & 8#077) != 0 )); then
+        warn "$CONFIG_FILE holds a password (RA_SQL_CONNECT) but has mode $mode; run: chmod 600 $CONFIG_FILE"
+    fi
 }
 
 init_run() {
@@ -543,11 +555,11 @@ require_approval() {
 }
 
 # ---------------------------------------------------------------------------
-# SQL on the appliance (raadmin)
+# SQL on the appliance (raAutomation)
 # ---------------------------------------------------------------------------
-sql_ready() { [[ -n "$RA_SQL_CONNECT" ]]; }
+sql_ready() { [[ -n "$RA_SQL_CONNECT" && "$RA_SQL_CONNECT" != *"<password>"* ]]; }
 
-# Run SQL as raadmin and print the result rows, trimmed. Fails on ORA-/SP2- errors.
+# Run SQL as raAutomation and print the result rows, trimmed. Fails on ORA-/SP2- errors.
 # The connect string is passed on stdin, so it never shows in the process list.
 sql_rows() {
     local out
@@ -590,6 +602,8 @@ missing_sql_settings() {
              ACTIVE_REPLICATION_SQL ACTIVE_BACKUPS_SQL; do
         [[ -n "${!v}" ]] || missing+=("$v")
     done
+    # The example's placeholder password counts as not filled in.
+    [[ "$RA_SQL_CONNECT" != *"<password>"* ]] || missing+=("RA_SQL_CONNECT(password)")
     echo "${missing[*]-}"
 }
 
@@ -686,8 +700,8 @@ phase_precheck() {
 }
 
 # Pauses the running upstream/paired replication (REPLICATION_SERVERS_SQL), then waits
-# for in-flight replication and incoming backups (RMAN sessions). TODO(site): RA_SQL_CONNECT
-# and the in-flight replication count (ACTIVE_REPLICATION_SQL) are still to be filled in.
+# for in-flight replication and incoming backups (RMAN sessions). TODO(site): the in-flight
+# replication count (ACTIVE_REPLICATION_SQL) is still to be filled in.
 phase_quiesce() {
     info "== quiesce =="
     local missing

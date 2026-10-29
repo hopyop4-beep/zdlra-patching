@@ -63,10 +63,13 @@ CELL_PATCH_EXTRA_ARGS=()             # e.g. (-ignore_alerts); TODO(site): check 
 CELL_PATCH_WARN_MINUTES=360          # per patchmgr command; about 2 hours for 17 cells
 
 # --- Replication and incoming backups (quiesce / resume phases) -------------
-# SQL runs with sqlplus as the raadmin account. Use a connect string that needs no
-# password in this file, such as an Oracle wallet alias.
+# SQL runs with sqlplus as the raAutomation account. For now the password is in this
+# file: zdlra_patch.conf is not in git, and the script warns unless it is chmod 600.
+# The connect string goes to sqlplus on stdin, so it never shows in the process list
+# or the log. If the password has special characters, quote it: raAutomation/"p@ss".
+# Later this can be a wallet alias instead, such as "/@raAutomation".
 SQLPLUS="sqlplus"
-RA_SQL_CONNECT=""                    # TODO(site): e.g. "/@raadmin"
+RA_SQL_CONNECT="raAutomation/<password>"
 
 # While any of these is empty, quiesce is skipped in a dry run and a real run stops
 # before patching (unless QUIESCE_ALLOW_UNCONFIGURED=1).

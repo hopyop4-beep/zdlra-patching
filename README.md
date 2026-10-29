@@ -57,7 +57,7 @@ An interrupted `patchmgr` session (and, later, an interrupted `racli` upgrade st
 
 ## Replication and incoming backups
 
-The `precheck`, `quiesce` and `resume` phases run SQL with `sqlplus` as the raadmin account. `RA_SQL_CONNECT` sets the connection; use a wallet alias, so no password goes in the config. The queries and statements are settings in `zdlra_patch.conf`. The replication and incoming-backup ones have defaults; the connection and the in-flight replication count are still `TODO` placeholders:
+The `precheck`, `quiesce` and `resume` phases run SQL with `sqlplus` as the raAutomation account. `RA_SQL_CONNECT` sets the connection: `raAutomation/<password>` for now, in `zdlra_patch.conf` (not in git). The script warns unless that file is `chmod 600`, and passes the connection to `sqlplus` on stdin, so the password never shows in the process list or the log. A wallet alias (`/@raAutomation`) can replace it later. The queries and statements are settings in `zdlra_patch.conf`. The replication and incoming-backup ones have defaults; the in-flight replication count is still a `TODO` placeholder:
 
 | Setting | What it must do |
 |---|---|
