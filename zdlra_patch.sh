@@ -27,6 +27,10 @@
 #   cells       patch the storage cells with patchmgr from the cell patch folder,
 #               then check every cell is on TARGET_CELL_VERSION (needs an approved
 #               precheck)
+#   switches    upgrade the RoCE switches with patchmgr from the switch patch folder
+#               (--roceswitch-precheck, then --upgrade); InfiniBand racks are skipped
+#               with a warning (needs an approved precheck). The jump server upgrades
+#               the compute nodes between cells and switches
 #   postcheck   rerun health checks and compare with the snapshot
 #   resume      resume the replication that quiesce paused
 #   report      write a summary of this run
@@ -56,7 +60,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
 VERSION="0.6.0"
 
-ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells postcheck resume report)
+ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells switches postcheck resume report)
 
 # ---------------------------------------------------------------------------
 # Defaults (override in the config file)
@@ -135,6 +139,16 @@ CELL_PATCH_EXTRA_ARGS=()
 CELL_PATCH_WARN_MINUTES=360     # per patchmgr command (about 2 hours for 17 cells)
 # -ignore_alerts is not needed (checked by the site), so nothing is added by default.
 DCLI="dcli"
+
+# RoCE switches (switches phase). Runs from the first compute node, in the folder the
+# switch patch (FILES_SWITCH) unzipped to under /radump/patches/tmp, e.g.
+# patch_switch_24.1.14.0.0.250706; the folder's name is read from the zip.
+SWITCH_GROUP_FILE="/root/switch_group"         # the RoCE switches, one per line
+SWITCH_PATCH_TMP_DIR="/radump/patches/tmp"
+SWITCH_PATCH_FILES_DIR="/radump/patches/patches"
+SWITCH_PRECHECK_ARGS=(--upgrade --roceswitch-precheck)   # about 12 minutes in one sample
+SWITCH_UPGRADE_ARGS=(--upgrade)
+SWITCH_PATCH_WARN_MINUTES=180   # per patchmgr command; a warning only, never stopped
 
 # SQL on the appliance, as the raAutomation account (see the config example).
 SQLPLUS="sqlplus"
@@ -739,6 +753,7 @@ phase_precheck() {
     report_activity
     report_ra_plan
     report_cell_plan
+    report_switch_plan
 
     # TODO: confirm the patch is valid for the current version (compare racli version with patch README).
 
@@ -952,19 +967,23 @@ phase_ra_update() {
 # ---------------------------------------------------------------------------
 # Storage cells
 # ---------------------------------------------------------------------------
-# The cell patch zip (from the staged record) and the folder it unzipped to.
-# Prints "<zip> <folder>"; fails with a message if either cannot be found.
-cell_patch_location() {
-    local zip top
-    zip="$(sed -n 's/^unpacked=FILES_CELL:\([^:]*\):.*/\1/p' "$STAGED_RECORD" 2>/dev/null | head -1)"
-    [[ -n "$zip" ]] || { echo "the staged record names no unpacked FILES_CELL file"; return 1; }
-    zip="${CELL_PATCH_FILES_DIR}/${zip}"
-    [[ -f "$zip" ]] || { echo "cell patch zip not found: $zip"; return 1; }
+# A patch zip that staging unpacked (from the staged record) and the folder it
+# unzipped to. Prints "<zip> <folder>"; fails with a message if either cannot be found.
+# $1 = FILES_ setting (FILES_CELL, FILES_SWITCH), $2 = folder with the zips, $3 = tmp folder
+patch_location() {
+    local var="$1" files_dir="$2" tmp_dir="$3" zip top
+    zip="$(sed -n "s/^unpacked=${var}:\([^:]*\):.*/\1/p" "$STAGED_RECORD" 2>/dev/null | head -1)"
+    [[ -n "$zip" ]] || { echo "the staged record names no unpacked $var file"; return 1; }
+    zip="${files_dir}/${zip}"
+    [[ -f "$zip" ]] || { echo "patch zip not found: $zip"; return 1; }
     top="$(unzip -Z1 "$zip" 2>/dev/null | sed 's#^\./##; s#/.*##' | grep -v '^$' | sort -u)"
     [[ -n "$top" && "$(wc -l <<<"$top")" -eq 1 ]] || { echo "cannot tell the patch folder from $zip (top entries: $(tr '\n' ' ' <<<"$top"))"; return 1; }
-    [[ -x "${CELL_PATCH_TMP_DIR}/${top}/patchmgr" ]] || { echo "no patchmgr in ${CELL_PATCH_TMP_DIR}/${top}"; return 1; }
-    echo "$zip ${CELL_PATCH_TMP_DIR}/${top}"
+    [[ -x "${tmp_dir}/${top}/patchmgr" ]] || { echo "no patchmgr in ${tmp_dir}/${top}"; return 1; }
+    echo "$zip ${tmp_dir}/${top}"
 }
+
+cell_patch_location()   { patch_location FILES_CELL "$CELL_PATCH_FILES_DIR" "$CELL_PATCH_TMP_DIR"; }
+switch_patch_location() { patch_location FILES_SWITCH "$SWITCH_PATCH_FILES_DIR" "$SWITCH_PATCH_TMP_DIR"; }
 
 # TARGET_CELL_VERSION from the conf file staging set up.
 target_cell_version() {
@@ -1101,13 +1120,13 @@ run_detached() {
     (( DETACHED_RC != 97 )) || die "$what: cannot enter $dir. Log: $log"
 }
 
-# A command this run started, or any "patchmgr -cells" or racli upgrade step on this
+# A command this run started, or any "patchmgr -cells", "patchmgr --roceswitches" or racli upgrade step on this
 # node, still running: prints "pid N (command)".
 long_command_running() {
     local line
     detached_running && return 0
     if ps -eo pid=,args= >/dev/null 2>&1; then
-        line="$(ps -eo pid=,args= | awk '($2 ~ /patchmgr$/ && / -cells /) || / racli (run preinstall|alter appliance|update appliance)/ { print; exit }')"
+        line="$(ps -eo pid=,args= | awk '($2 ~ /patchmgr$/ && (/ -cells / || / --roceswitches /)) || / racli (run preinstall|alter appliance|update appliance)/ { print; exit }')"
         [[ -n "$line" ]] && { echo "pid ${line# }"; return 0; }
     fi
     return 1
@@ -1125,11 +1144,13 @@ refuse_if_running() {
 
 # Run one patchmgr command from the patch folder, never cut short (run_detached).
 # Success: exit 0, "SUCCESS: Completed run of command", "Exit status:0", and no
-# FAILED lines. $1 = folder, $2 = log name, rest = patchmgr arguments.
+# FAILED lines. $1 = cells | switches (log <prefix>_<name>.log), $2 = folder,
+# $3 = log name, rest = patchmgr arguments.
 run_patchmgr() {
-    local dir="$1" name="$2"; shift 2
-    local log="${RUN_DIR}/cells_${name}.log" rc step="-$name"
-    run_detached "cells patchmgr $step" "$dir" "$log" "$CELL_PATCH_WARN_MINUTES" ./patchmgr "$@"
+    local prefix="$1" dir="$2" name="$3"; shift 3
+    local log="${RUN_DIR}/${prefix}_${name}.log" rc step="-$name" warn_min="$CELL_PATCH_WARN_MINUTES"
+    [[ "$prefix" == switches ]] && warn_min="$SWITCH_PATCH_WARN_MINUTES"
+    run_detached "$prefix patchmgr $step" "$dir" "$log" "$warn_min" ./patchmgr "$@"
     rc="$DETACHED_RC"
     local failed
     failed="$(grep -E 'FAILED' "$log" | head -10 || true)"
@@ -1178,16 +1199,65 @@ phase_cells() {
     fi
 
     for step in "${CELL_PREP_STEPS[@]}"; do
-        run_patchmgr "$dir" "${step#-}" -cells "$CELL_GROUP_FILE" "$step"
+        run_patchmgr cells "$dir" "${step#-}" -cells "$CELL_GROUP_FILE" "$step"
     done
     confirm "Patch the storage cells now (patchmgr -patch; the cells reboot)?"
-    run_patchmgr "$dir" patch -cells "$CELL_GROUP_FILE" -patch ${CELL_PATCH_EXTRA_ARGS[@]+"${CELL_PATCH_EXTRA_ARGS[@]}"}
+    run_patchmgr cells "$dir" patch -cells "$CELL_GROUP_FILE" -patch ${CELL_PATCH_EXTRA_ARGS[@]+"${CELL_PATCH_EXTRA_ARGS[@]}"}
 
     info "Image version reported by patchmgr:"
     check_cell_versions "$(sed -n '/Current image version on cell(s) is:/,/For details/p' "${RUN_DIR}/cells_patch.log" | sed -E 's/^.*:INFO *: *//')" "$target"
     info "Image version from imageinfo:"
     check_cell_versions "$(cell_versions)" "$target"
     info "All cells are on $target."
+}
+
+# ---------------------------------------------------------------------------
+# RoCE switches
+# ---------------------------------------------------------------------------
+# SWITCH_TYPE from the conf file staging set up: roce, or IB on older racks.
+switch_type() { conf_value SWITCH_TYPE | tr '[:upper:]' '[:lower:]'; }
+
+# For the precheck review: what the switches phase will use. Read only; never fatal.
+report_switch_plan() {
+    local type loc
+    type="$(switch_type || true)"
+    if [[ "$type" != roce ]]; then
+        warn "Switches:     SWITCH_TYPE is '${type:-not set}': only RoCE switches are patched here; the switches phase will skip them"
+        return 0
+    fi
+    if loc="$(switch_patch_location)"; then
+        info "Switch patch: ${loc#* } (from $(basename "${loc%% *}"))"
+    else
+        warn "Switch patch: not ready ($loc)"
+    fi
+    if [[ -s "$SWITCH_GROUP_FILE" ]]; then
+        info "Switches:     $(paste -sd' ' "$SWITCH_GROUP_FILE") (from $SWITCH_GROUP_FILE)"
+    else
+        warn "Switches:     $SWITCH_GROUP_FILE is missing or empty"
+    fi
+}
+
+phase_switches() {
+    info "== switches (RoCE) =="
+    local type loc dir
+    type="$(switch_type || true)"
+    if [[ "$type" != roce ]]; then
+        warn "SWITCH_TYPE is '${type:-not set}', not roce: only RoCE switches are patched by this script. Switches NOT patched."
+        return 0
+    fi
+    loc="$(switch_patch_location)" || die "Switch patch: $loc"
+    dir="${loc#* }"
+    [[ -s "$SWITCH_GROUP_FILE" ]] || die "$SWITCH_GROUP_FILE is missing or empty."
+    info "Switch patch folder: $dir; switches: $(paste -sd' ' "$SWITCH_GROUP_FILE")"
+    if (( DRY_RUN )); then
+        info "[dry-run] cd $dir && ./patchmgr --roceswitches $SWITCH_GROUP_FILE ${SWITCH_PRECHECK_ARGS[*]}"
+        info "[dry-run] cd $dir && ./patchmgr --roceswitches $SWITCH_GROUP_FILE ${SWITCH_UPGRADE_ARGS[*]}"
+        return 0
+    fi
+    run_patchmgr switches "$dir" precheck --roceswitches "$SWITCH_GROUP_FILE" "${SWITCH_PRECHECK_ARGS[@]}"
+    confirm "Upgrade the RoCE switches now (patchmgr --upgrade)?"
+    run_patchmgr switches "$dir" upgrade --roceswitches "$SWITCH_GROUP_FILE" "${SWITCH_UPGRADE_ARGS[@]}"
+    info "RoCE switches upgraded."
 }
 
 phase_postcheck() {
@@ -1307,7 +1377,7 @@ main() {
             [[ "$p" == precheck ]] && split=1
         done
         # Without precheck in this run, check the existing approval now, not after detaching.
-        if (( ! ${#fg_phases[@]} )) && [[ " ${BG_PHASES[*]} " == *" ra_"* || " ${BG_PHASES[*]} " == *" quiesce "* || " ${BG_PHASES[*]} " == *" cells "* ]]; then
+        if (( ! ${#fg_phases[@]} )) && [[ " ${BG_PHASES[*]} " == *" ra_"* || " ${BG_PHASES[*]} " == *" quiesce "* || " ${BG_PHASES[*]} " == *" cells "* || " ${BG_PHASES[*]} " == *" switches "* ]]; then
             require_approval
         fi
     fi
@@ -1315,8 +1385,8 @@ main() {
     for p in ${fg_phases[@]+"${fg_phases[@]}"}; do
         # Check approval before marking a changing step as running, so a refusal leaves
         # the run's status as it was.
-        [[ "$p" == ra_* || "$p" == quiesce || "$p" == cells ]] && require_approval
-        [[ "$p" == ra_* || "$p" == cells ]] && refuse_if_running "$p"
+        [[ "$p" == ra_* || "$p" == quiesce || "$p" == cells || "$p" == switches ]] && require_approval
+        [[ "$p" == ra_* || "$p" == cells || "$p" == switches ]] && refuse_if_running "$p"
         CURRENT_PHASE="$p"
         set_status "running $p"
         "phase_${p}"

@@ -79,6 +79,18 @@ CELL_PATCH_EXTRA_ARGS=()             # none needed (-ignore_alerts is not used);
 # only logs a warning and keeps waiting.
 CELL_PATCH_WARN_MINUTES=360          # per patchmgr command; about 2 hours for 17 cells
 
+# --- RoCE switches (switches phase) -----------------------------------------
+# Runs on the first compute node, in the folder the switch patch (FILES_SWITCH)
+# unzipped to under /radump/patches/tmp (e.g. patch_switch_24.1.14.0.0.250706). Only
+# RoCE switches: if SWITCH_TYPE in the conf file is not roce, the phase warns and skips.
+SWITCH_GROUP_FILE="/root/switch_group"          # the RoCE switches, one per line
+SWITCH_PATCH_TMP_DIR="/radump/patches/tmp"
+SWITCH_PATCH_FILES_DIR="/radump/patches/patches"
+SWITCH_PRECHECK_ARGS=(--upgrade --roceswitch-precheck)   # about 12 minutes in one sample
+SWITCH_UPGRADE_ARGS=(--upgrade)
+# patchmgr is never stopped by this script; past this long a warning is logged.
+SWITCH_PATCH_WARN_MINUTES=180
+
 # --- Replication and incoming backups (quiesce / resume phases) -------------
 # SQL runs with sqlplus as the raAutomation account. For now the password is in this
 # file: zdlra_patch.conf is not in git, and the script warns unless it is chmod 600.
