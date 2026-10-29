@@ -39,3 +39,13 @@ REMOTE_CONFIG="/root/zdlra-patching/zdlra_patch.conf"
 
 # Seconds between status checks while the patch runs in the background.
 POLL_SECONDS=60
+
+# --- Compute nodes ("compute" in the phase list, run from here) --------------
+# Paths are on the compute nodes; each node has its own staged copy.
+NODE_STAGED_RECORD="/radump/patches/ZDLRA_STAGED.txt"
+COMPUTE_TMP_DIR="/radump/patches/tmp"          # the unzipped db_server_patch
+COMPUTE_FILES_DIR="/radump/patches/patches"    # the computepatch (iso repo)
+COMPUTE_WORK_DIR="/radump/zdlra_compute"       # per run: db_nodes files, logs, exit status
+COMPUTE_WARN_MINUTES=240                       # warning only; patchmgr is never stopped
+COMPUTE_POLL_SECONDS=60
+COMPUTE_PAUSE_ON_WARNINGS=0                    # TODO(site): pause on SUCCESS WITH WARNING(S)?

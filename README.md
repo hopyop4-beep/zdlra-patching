@@ -147,9 +147,10 @@ cp jump/zdlra_jump.conf.example jump/zdlra_jump.conf   # then edit it
 3. **Approve:** when the precheck finishes, the review screen opens in your terminal and you type `APPROVE`. If the precheck failed, or you don't approve, nothing has changed and no blackout exists.
 4. **Blackout:** created after you approve, before anything changes. By default it ends by itself after `BLACKOUT_HOURS` (12), as a safety net.
 5. **OEM backup jobs:** your own script, set in `OEM_JOBS_SUSPEND_CMD`, suspends them. If it fails, patching does not start.
-6. **Patch:** the remaining phases start on the node in the background.
-7. **Watch:** the script prints each phase as the node reports it.
-8. **Finish:** when the run completes, `OEM_JOBS_RESUME_CMD` resumes the jobs and then the blackout ends. Pass `--keep-blackout` to leave both as they are. If the run fails, both stay as they are while you investigate, and the script prints the commands to undo them.
+6. **Patch:** the phases before `compute` start on the node in the background, and the script prints each phase as the node reports it.
+7. **Compute:** the compute nodes are upgraded from the jump server (see below).
+8. **Patch again:** the phases after `compute` (`postcheck`, `resume`, `report`) run on the node.
+9. **Finish:** when the run completes, `OEM_JOBS_RESUME_CMD` resumes the jobs and then the blackout ends. Pass `--keep-blackout` to leave both as they are. If the run fails, both stay as they are while you investigate, and the script prints the commands to undo them.
 
 Ctrl-C only stops watching; the work on the node carries on. To pick up again:
 
@@ -157,6 +158,26 @@ Ctrl-C only stops watching; the work on the node carries on. To pick up again:
 - `--watch <run id>`: the patch phases are already running.
 
 On the node itself, the same split is available as `zdlra_patch.sh --detach precheck`, followed by `zdlra_patch.sh --approve --run-id <run id>`.
+
+### Compute nodes
+
+The order in the window is: RA upgrade, cells, compute, switches. `compute` in the phase list marks where the compute nodes are upgraded. It runs from the jump server, because the first node reboots during its own upgrade:
+
+| Pass | `patchmgr` runs on | `db_nodes` file (written for this run) | Reboots |
+|---|---|---|---|
+| 1 | node 1 | only node 2 (then each further node, one pass each) | node 2 |
+| 2 | node 2 | only node 1 | node 1 |
+
+Each pass works like this:
+
+1. In the db_server_patch folder (the 2nd `FILES_YUM` file, unzipped by staging on every node), run `unzip -q dbnodeupdate.zip`.
+2. Run `patchmgr -dbnodes <file> -precheck -log_dir auto -target_version <TARGET_COMPUTE_VERSION> -iso_repo <full path of the 1st FILES_YUM file> -nomodify_at_prereq`.
+3. Run the same with `-upgrade` (without `-nomodify_at_prereq`).
+4. `dcli ... imageinfo -ver` must show the target on the patched node.
+
+- **Success:** `SUCCESS: Completed run of command`, `Exit status:0`, and every node in state `SUCCESS`. `SUCCESS WITH WARNING(S)` is accepted, and the warnings are listed. `COMPUTE_PAUSE_ON_WARNINGS` is a `TODO`.
+- **Nothing can cut it short:** each `patchmgr` runs detached on its node, with its own log and exit-status file there. The jump server only starts it and checks on it over SSH, through the reboots.
+- **Picking up:** if the jump-server script stops (Ctrl-C, a dropped session), `--watch <run id>` continues the pass where it was. It skips finished passes, waits for a `patchmgr` that's still running rather than starting another, and starts a failed step again once you've fixed the problem.
 
 `jump/oem_blackout.sh start|status|stop -z <appliance>` also works on its own. The jump server needs root SSH access to the node without a password. The OS user running the scripts needs `emcli` access, either logged in already or through `EM_USER`. `jump/zdlra_jump.conf` is in `.gitignore`.
 
@@ -270,11 +291,12 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [ ] Email or webhook notification (most useful for background runs)
 - [ ] Exadata infrastructure patching with `patchmgr`. The order in the window is: RA upgrade, compute, cells, switches. The `cells` phase sits after `patch2` for now and moves into place as the others are built:
   - [x] Storage cells (`cells` phase; rolling is handled by `patchmgr` itself)
-  - [ ] Compute nodes. Both passes are run from the jump server, with each `patchmgr` detached on the node so nothing can cut it short:
+  - [x] Compute nodes (`compute`, from the jump server; see "Compute nodes" above). Both passes are run from the jump server, with each `patchmgr` detached on the node so nothing can cut it short:
     - Pass 1: on node 1, `patchmgr -dbnodes` (the other nodes) `-precheck ... -nomodify_at_prereq`, then `-upgrade`. Node 2 reboots.
     - Pass 2: on node 2, the same against node 1. Node 1 reboots.
     - Both run from the db_server_patch folder after `unzip -q dbnodeupdate.zip`, with `-log_dir auto`, `-target_version` set to `TARGET_COMPUTE_VERSION`, and `-iso_repo` set to the full path of the computepatch (1st `FILES_YUM` file). Afterwards `dcli ... imageinfo -ver` must show the target.
-    - Open questions: the order (after the cells?), `/root/db_nodes` (existing, or written per pass), whether `SUCCESS WITH WARNING(S)` should pause for review, and checks after node 1 is back
+    - Order: after the cells. `db_nodes`: a per-run file with only the node being patched. After node 1 is back, only the image version is checked.
+    - Still to decide: whether `SUCCESS WITH WARNING(S)` should pause for review (`COMPUTE_PAUSE_ON_WARNINGS`)
   - [ ] Switches (RoCE or InfiniBand, depending on the rack)
 
 ## Disclaimer
