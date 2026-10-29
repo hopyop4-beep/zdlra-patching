@@ -175,19 +175,19 @@ Copy the archive and its `.sha256` file to a Linux jump server that can reach th
 
 ```bash
 # Dry run for two appliances
-./staging/zdlra_stage.sh -a ~/zdlra01_patches_20261028_174710.zip -z zdlra01 -z zdlra02
+./staging/zdlra_stage.sh -a ~/patches.zip -z zdlra01 -z zdlra02
 
 # Real run; carry on to the next appliance if one fails
-./staging/zdlra_stage.sh -a ~/zdlra01_patches_20261028_174710.zip -z zdlra01 -z zdlra02 --keep-going --execute
+./staging/zdlra_stage.sh -a ~/patches.zip -z zdlra01 -z zdlra02 --keep-going --execute
 ```
 
 | Step | What it does, for each appliance |
 |------|--------------|
 | verify | Checks the archive's SHA-256 against the `.sha256` file, once, on the jump server |
 | nodes | Finds the compute nodes: from `staging/appliances.conf`, or from `olsnodes` on the appliance |
-| distribute | Copies the archive to `/radump` on every node, skipping nodes that already have an identical copy. With `--relay`, it copies to the first node only, and that node copies on to the others |
+| distribute | Copies the archive to `/radump/patches.zip` on every node, skipping nodes that already have an identical copy. An older `patches.zip` there is backed up as `patches.zip.<date>.bak`, or overwritten if `OLD_VERSION_ACTION=overwrite`. With `--relay`, it copies to the first node only, and that node copies on to the others |
 | check | On every node: verifies the SHA-256 and free space. Nodes already staged with this archive are skipped from here on; a node where an earlier staging stopped partway is refused |
-| extract | Unpacks the archive on every node into `/radump/zdlra_stage/<archive name>/` |
+| extract | Unzips it in `/radump` on every node. The zip holds one top folder, so this gives `/radump/patches/`; an older `/radump/patches/` is backed up or replaced first. A zip without a single top folder is unzipped into `/radump/patches_zip/` instead |
 | place | On every node: moves the patch files to `PATCH_TARGET_DIR` and the precheck folder to `PRECHECK_TARGET_DIR`, then sets the values in `PRECHECK_CONF_SETTINGS` in the precheck's config file (the original is kept as `.orig`, and the change is logged). It checks the result and writes a staged record. Everything is checked before anything moves, and an existing file is never overwritten with a different one |
 
 The place step reads `staging/zdlra_stage.conf` (see `zdlra_stage.conf.example`). **Its directories are placeholders for now.** Set `STAGED_RECORD` in `zdlra_patch.conf` to the record path, so the patch script finds it.

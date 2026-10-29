@@ -7,10 +7,15 @@
 # ssh. For each appliance given with -z, it:
 #
 #   nodes       finds the compute nodes (inventory file, or olsnodes on the appliance)
-#   distribute  copies the archive to every node (skips nodes that already have it)
+#   distribute  copies the archive to every node as <remote dir>/patches.zip (skips
+#               nodes that already have it); an older patches.zip there is backed up
+#               or overwritten (OLD_VERSION_ACTION)
 #   check       verifies the SHA-256 and free space on every node; nodes already
 #               staged with this archive are skipped from here on
-#   extract     unpacks the archive on every node into <extract root>/<archive name>/
+#   extract     unzips it on every node in <extract root> (default /radump). The zip
+#               holds one top folder (patches/), so this gives /radump/patches/; an
+#               older folder there is backed up or removed (OLD_VERSION_ACTION). A zip
+#               without a single top folder is unzipped into <extract root>/patches_zip/.
 #   place       on every node: moves the patch files to PATCH_TARGET_DIR and the
 #               precheck folder to PRECHECK_TARGET_DIR, updates the precheck's config
 #               file, checks the result, and writes a "staged" record
@@ -33,7 +38,7 @@
 #                           this script); appliances not listed use olsnodes
 #   -u, --user USER         ssh user on the nodes (default: root)
 #   -r, --remote-dir DIR    where the archive is copied on each node (default: /radump)
-#   -d, --extract-root DIR  where it is unpacked on each node (default: /radump/zdlra_stage)
+#   -d, --extract-root DIR  where it is unzipped on each node (default: /radump)
 #       --relay             copy to the first node only; it copies to the other nodes
 #       --keep-going        continue with the next appliance after a failure
 #   -x, --execute           run commands for real (default is dry run)
@@ -46,7 +51,7 @@ set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 ARCHIVE=""
 SHA_FILE=""
@@ -55,7 +60,12 @@ CONFIG_FILE="${SCRIPT_DIR}/zdlra_stage.conf"
 INVENTORY="${SCRIPT_DIR}/appliances.conf"
 SSH_USER="root"
 REMOTE_DIR="/radump"
-EXTRACT_ROOT="/radump/zdlra_stage"
+REMOTE_ARCHIVE_NAME="patches.zip"   # name of the archive on the nodes, whatever it is called here
+EXTRACT_ROOT="/radump"
+# What to do with an older patches.zip, or an older unpacked folder, on a node:
+#   backup     rename it to <name>.<date>.bak (default)
+#   overwrite  replace it
+OLD_VERSION_ACTION="backup"
 RELAY=0
 KEEP_GOING=0
 DRY_RUN=1
@@ -78,6 +88,7 @@ STAGED_RECORD_NAME="ZDLRA_STAGED.txt"          # written in PATCH_TARGET_DIR on 
 
 ARCHIVE_NAME=""
 REMOTE_ARCHIVE=""
+RUN_STAMP="$(date +%Y%m%d_%H%M%S)"   # suffix for backups made by this run
 STAGE_DIR=""
 EXPECTED_SHA=""
 NODES=()
@@ -183,8 +194,12 @@ validate() {
     esac
     ARCHIVE_NAME="$(basename "$ARCHIVE")"
     [[ "$ARCHIVE_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "Archive name has unsupported characters: $ARCHIVE_NAME"
-    REMOTE_ARCHIVE="${REMOTE_DIR}/${ARCHIVE_NAME}"
-    STAGE_DIR="${EXTRACT_ROOT}/${ARCHIVE_NAME%.*}"
+    [[ "$REMOTE_ARCHIVE_NAME" =~ ^[A-Za-z0-9._-]+\.(zip|tar)$ ]] || die "Bad REMOTE_ARCHIVE_NAME: $REMOTE_ARCHIVE_NAME"
+    [[ "${ARCHIVE##*.}" == "${REMOTE_ARCHIVE_NAME##*.}" ]] \
+        || die "$ARCHIVE_NAME is a .${ARCHIVE##*.} but the nodes expect $REMOTE_ARCHIVE_NAME; set REMOTE_ARCHIVE_NAME to match."
+    case "$OLD_VERSION_ACTION" in backup|overwrite) ;; *) die "OLD_VERSION_ACTION must be backup or overwrite: $OLD_VERSION_ACTION" ;; esac
+    REMOTE_ARCHIVE="${REMOTE_DIR}/${REMOTE_ARCHIVE_NAME}"
+    # STAGE_DIR (the folder the archive unpacks to) is set by find_archive_top.
 }
 
 init_log() {
@@ -193,7 +208,7 @@ init_log() {
     info "$SCRIPT_NAME $VERSION  dry_run=$DRY_RUN  relay=$RELAY"
     info "Archive:      $ARCHIVE"
     info "Appliances:   ${ZDLRAS[*]}"
-    info "On nodes:     copy to $REMOTE_ARCHIVE, unpack to $STAGE_DIR"
+    info "On nodes:     copy to $REMOTE_ARCHIVE, unzip in $EXTRACT_ROOT (older versions: $OLD_VERSION_ACTION)"
     info "Place:        $PATCH_FILES_GLOB -> $PATCH_TARGET_DIR, $PRECHECK_SRC_SUBDIR/ -> $PRECHECK_TARGET_DIR"
     [[ -f "$CONFIG_FILE" ]] || warn "No $CONFIG_FILE; using the built-in placeholder directories (TODO)."
 }
@@ -209,6 +224,36 @@ verify_local() {
     actual="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
     [[ "$actual" == "$EXPECTED_SHA" ]] || die "SHA-256 mismatch on the jump server: $actual, expected $EXPECTED_SHA"
     info "SHA-256 OK ($(du -h "$ARCHIVE" | cut -f1))"
+    find_archive_top
+}
+
+# Read the archive's file list. One top folder (e.g. patches/) -> unzip straight into
+# EXTRACT_ROOT, giving EXTRACT_ROOT/<top>. Anything else -> unzip into a folder of
+# its own, EXTRACT_ROOT/<archive name>_zip, so files are not scattered in EXTRACT_ROOT.
+UNPACK_INTO=""
+find_archive_top() {
+    local list tops
+    case "$ARCHIVE" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                list="$(unzip -Z1 "$ARCHIVE")" || die "Cannot read the file list of $ARCHIVE"
+            else
+                list="$(python3 -c 'import sys, zipfile; print("\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))' "$ARCHIVE")" \
+                    || die "Cannot read the file list of $ARCHIVE (no unzip or python3 here)"
+            fi ;;
+        *.tar)  list="$(tar -tf "$ARCHIVE")" || die "Cannot read the file list of $ARCHIVE" ;;
+    esac
+    tops="$(sed -E 's#^\./##; s#/.*##' <<<"$list" | grep -v '^$' | sort -u)"
+    if [[ "$(grep -c . <<<"$tops")" == 1 ]] && grep -q "^${tops}/" <<<"$(sed -E 's#^\./##' <<<"$list")"; then
+        [[ "$tops" =~ ^[A-Za-z0-9._-]+$ ]] || die "Top folder in the archive has unsupported characters: $tops"
+        UNPACK_INTO="$EXTRACT_ROOT"
+        STAGE_DIR="${EXTRACT_ROOT}/${tops}"
+        info "Archive holds one top folder, $tops/; unzips to $STAGE_DIR on each node"
+    else
+        UNPACK_INTO="${EXTRACT_ROOT}/${REMOTE_ARCHIVE_NAME%.*}_zip"
+        STAGE_DIR="$UNPACK_INTO"
+        warn "Archive has no single top folder; unzipping into $STAGE_DIR on each node"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -239,6 +284,19 @@ step_nodes() {
     done
 }
 
+# Deal with an older file or folder at $2 on node $1, per OLD_VERSION_ACTION:
+# rename it to <path>.<RUN_STAMP>.bak, or remove it. $3 = what it is, for messages.
+set_aside_old() {
+    local node="$1" path="$2" what="$3"
+    if [[ "$OLD_VERSION_ACTION" == backup ]]; then
+        change_on_node "$node" "mv '$path' '$path.$RUN_STAMP.bak'" || die "${node}: could not back up the old $what."
+        (( DRY_RUN )) || info "${node}: old $what kept as $path.$RUN_STAMP.bak"
+    else
+        change_on_node "$node" "rm -rf -- '$path'" || die "${node}: could not remove the old $what."
+        (( DRY_RUN )) || info "${node}: old $what removed"
+    fi
+}
+
 # Copy the archive to one node: from the jump server, or with --relay from the first node.
 copy_to_node() {
     local node="$1" first="$2"
@@ -259,9 +317,15 @@ step_distribute() {
             info "${z}/${node}: already staged with this archive; not copying"
             continue
         fi
-        if [[ "$(remote_sha "$node")" == "$EXPECTED_SHA" ]]; then
+        local sha
+        sha="$(remote_sha "$node")"
+        if [[ "$sha" == "$EXPECTED_SHA" ]]; then
             info "${z}/${node}: already has the archive (SHA-256 matches); not copying"
             continue
+        fi
+        if [[ -n "$sha" ]]; then
+            info "${z}/${node}: $REMOTE_ARCHIVE is an older version (SHA-256 ${sha:0:12}...)"
+            set_aside_old "$node" "$REMOTE_ARCHIVE" "$REMOTE_ARCHIVE_NAME"
         fi
         change_on_node "$node" "mkdir -p '$REMOTE_DIR'"
         copy_to_node "$node" "$first" || die "${z}/${node}: copy failed."
@@ -269,7 +333,7 @@ step_distribute() {
 }
 
 # Decides which nodes still need staging (TODO_NODES). A node whose staged record
-# names this archive is done; a node with a half-finished staging is refused.
+# names this archive is done.
 step_check() {
     local z="$1" node sha free_kb
     # Unpacked size is about the archive size, because the archive is stored (not compressed).
@@ -281,8 +345,8 @@ step_check() {
             continue
         fi
         sha="$(remote_sha "$node")"
-        if [[ -z "$sha" ]] && (( DRY_RUN )); then
-            info "[dry-run] ${z}/${node}: archive not copied yet; skipping SHA-256 check"
+        if [[ "$sha" != "$EXPECTED_SHA" ]] && (( DRY_RUN )); then
+            info "[dry-run] ${z}/${node}: new archive not copied yet; skipping SHA-256 check"
         else
             [[ "$sha" == "$EXPECTED_SHA" ]] || die "${z}/${node}: SHA-256 mismatch or archive missing (${sha:-none})"
             info "${z}/${node}: SHA-256 OK"
@@ -291,9 +355,6 @@ step_check() {
         [[ "$free_kb" =~ ^[0-9]+$ ]] || die "${z}/${node}: cannot read free space for $EXTRACT_ROOT"
         info "${z}/${node}: $(( free_kb / 1024 / 1024 ))G free for $EXTRACT_ROOT (need $(( need_kb / 1024 / 1024 ))G)"
         (( free_kb >= need_kb )) || die "${z}/${node}: not enough free space in $EXTRACT_ROOT"
-        if on_node "$node" "[ -e '$STAGE_DIR' ]"; then
-            die "${z}/${node}: $STAGE_DIR exists but the node has no staged record for this archive (an earlier staging stopped partway?). Check it and remove it, or use another --extract-root."
-        fi
         TODO_NODES+=("$node")
     done
 }
@@ -301,11 +362,16 @@ step_check() {
 step_extract() {
     local z="$1" node unpack
     case "$ARCHIVE" in
-        *.zip) unpack="unzip -q '$REMOTE_ARCHIVE' -d '$STAGE_DIR'" ;;
-        *.tar) unpack="tar -xf '$REMOTE_ARCHIVE' -C '$STAGE_DIR'" ;;
+        *.zip) unpack="unzip -q '$REMOTE_ARCHIVE' -d '$UNPACK_INTO'" ;;
+        *.tar) unpack="tar -xf '$REMOTE_ARCHIVE' -C '$UNPACK_INTO'" ;;
     esac
     for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
-        change_on_node "$node" "mkdir -p '$STAGE_DIR' && $unpack" || die "${z}/${node}: unpack failed."
+        # An older (or half-finished) unpacked folder from an earlier staging.
+        if on_node "$node" "[ -e '$STAGE_DIR' ]"; then
+            info "${z}/${node}: $STAGE_DIR is from an earlier staging"
+            set_aside_old "$node" "$STAGE_DIR" "unpacked folder"
+        fi
+        change_on_node "$node" "mkdir -p '$UNPACK_INTO' && $unpack" || die "${z}/${node}: unpack failed."
         if (( ! DRY_RUN )); then
             info "${z}/${node}: $(on_node "$node" "find '$STAGE_DIR' -type f | wc -l") file(s) in $STAGE_DIR"
         fi
@@ -315,19 +381,20 @@ step_extract() {
 # ---------------------------------------------------------------------------
 # Place step: runs on the node as one bash script (fed on stdin). Arguments:
 #   <dry> <stage dir> <patch target> <precheck src subdir> <precheck target>
-#   <files glob> <conf file> <record name> <archive> <sha256> <from host> [KEY=VALUE ...]
+#   <files glob> <conf file> <record name> <archive> <sha256> <from host>
+#   <archive path on the node> [KEY=VALUE ...]
 # Paths are passed as arguments, never written into the script itself.
 # ---------------------------------------------------------------------------
 PLACE_SCRIPT=$(cat <<'REMOTE'
 set -uo pipefail
-dry=$1 stage=$2 ptarget=$3 csub=$4 ctarget=$5 glob=$6 conf=$7 record=$8 archive=$9 sha=${10} from=${11}
-shift 11
+dry=$1 stage=$2 ptarget=$3 csub=$4 ctarget=$5 glob=$6 conf=$7 record=$8 archive=$9 sha=${10} from=${11} remote=${12}
+shift 12
 fail() { echo "ERROR $*"; exit 1; }
 do_or_say() { if [ "$dry" = 1 ]; then echo "[dry-run] $*"; else "$@" || fail "command failed: $*"; fi; }
 
 if [ "$dry" = 1 ]; then
-    echo "[dry-run] would move $glob from $stage/<top folder>/ to $ptarget/"
-    echo "[dry-run] would move $stage/<top folder>/$csub/ to $ctarget/"
+    echo "[dry-run] would move $glob from $stage/ to $ptarget/"
+    echo "[dry-run] would move $stage/$csub/ to $ctarget/"
     for kv in "$@"; do
         k=${kv%%=*}
         cur=$(grep -m1 "^$k=" "$ctarget/$conf" 2>/dev/null || true)
@@ -337,10 +404,9 @@ if [ "$dry" = 1 ]; then
     exit 0
 fi
 
-# The archive holds one top folder (the patch folder that was zipped).
-tops=$(find "$stage" -mindepth 1 -maxdepth 1 -type d)
-[ "$(printf '%s\n' "$tops" | grep -c .)" = 1 ] || fail "expected one top folder in $stage, found: $(echo $tops)"
-src=$tops
+# The unpacked folder (e.g. /radump/patches) holds the patch files and the precheck folder.
+[ -d "$stage" ] || fail "unpacked folder not found: $stage"
+src=$stage
 
 # Check everything before moving anything, so a problem never leaves a node half-staged.
 shopt -s nullglob
@@ -402,6 +468,7 @@ echo "OK checked: ${#placed[@]} patch file(s) in $ptarget, precheck config updat
 # 5. Staged record, read by zdlra_patch.sh.
 {
     echo "archive=$archive"
+    echo "node_archive=$remote"
     echo "sha256=$sha"
     echo "staged_at=$(date '+%F %T %Z')"
     echo "staged_from=$from"
@@ -421,7 +488,7 @@ step_place() {
         settings+=("'${kv//\{precheck_dir\}/$PRECHECK_TARGET_DIR}'")
     done
     local args="'$DRY_RUN' '$STAGE_DIR' '$PATCH_TARGET_DIR' '$PRECHECK_SRC_SUBDIR' '$PRECHECK_TARGET_DIR'"
-    args+=" '$PATCH_FILES_GLOB' '$PRECHECK_CONF_FILE' '$STAGED_RECORD_NAME' '$ARCHIVE_NAME' '$EXPECTED_SHA' '$(hostname)'"
+    args+=" '$PATCH_FILES_GLOB' '$PRECHECK_CONF_FILE' '$STAGED_RECORD_NAME' '$ARCHIVE_NAME' '$EXPECTED_SHA' '$(hostname)' '$REMOTE_ARCHIVE'"
     args+=" ${settings[*]-}"
     for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
         rc=0

@@ -1,7 +1,17 @@
 # Settings for the place step of zdlra_stage.sh. Copy to zdlra_stage.conf (not
 # committed) and edit. This file is sourced by bash.
 #
-# TODO(site): every value below is a placeholder until the real directories and
+# On each node the archive is copied to /radump/patches.zip and unzipped in /radump
+# (a zip with a patches/ top folder gives /radump/patches/). Change with -r/-d or
+# REMOTE_ARCHIVE_NAME if that ever differs.
+REMOTE_ARCHIVE_NAME="patches.zip"
+
+# What to do when a node already has an older patches.zip or unzipped folder:
+#   backup     rename it to <name>.<date>.bak (default)
+#   overwrite  replace it
+OLD_VERSION_ACTION="backup"
+
+# TODO(site): the values below are placeholders until the real directories and
 # precheck settings are confirmed.
 
 # Where the patch files go on each compute node, and which files in the archive
