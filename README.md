@@ -17,7 +17,7 @@ The script breaks a patch into phases. You can run them one at a time or all tog
 | `ra_alter` | Checks that both gold images (named in `ra_gold_images=`) are in `/radump`, where the precheck moves them. Then runs `racli alter appliance --online_updates --gold_images_path=/radump/`, which installs the new grid and DB homes. Success: `End: Alter Appliance` |
 | `ra_update` | Runs `racli update appliance --ignore_incidents`, which patches the appliance (about 2 hours). Success: `End: Patch Recovery Appliance - Step [Patch]`. Afterwards `racli version` should show `TARGET_RA_VERSION` from the conf file (a warning if not) |
 | `cells` | Patches the storage cells from the first compute node. Each `patchmgr` runs in a session of its own and is never stopped by the script (see below). In the cell patch folder (worked out from the `FILES_CELL` zip, because its name changes per release), it runs `patchmgr -cells /root/cell_group` with `-patch_check_prereq`, `-reset_force`, `-cleanup` and then `-patch` (plus `CELL_PATCH_EXTRA_ARGS`). Each step must report a completed run with exit status 0 and no `FAILED` lines. Afterwards every cell must be on `TARGET_CELL_VERSION` from the conf file, according to both `patchmgr` and `dcli ... imageinfo -ver` |
-| `switches` | Upgrades the RoCE switches from the first compute node, in the switch patch folder (worked out from the `FILES_SWITCH` zip, e.g. `patch_switch_24.1.14.0.0.250706`): `patchmgr --roceswitches /root/switch_group --upgrade --roceswitch-precheck` (about 12 minutes in one sample), then `--upgrade`. Each runs in a session of its own and is never stopped by the script, and must report a completed run with exit status 0 and no `FAILED` lines. On an InfiniBand rack (`SWITCH_TYPE` not `roce`) the phase only warns that the switches were not patched. From the jump server it runs after `compute` |
+| `switches` | Upgrades the RoCE switches from the first compute node, in the switch patch folder (worked out from the `FILES_SWITCH` zip, e.g. `patch_switch_24.1.14.0.0.250706`): `patchmgr --roceswitches /root/switch_group --upgrade --roceswitch-precheck` (about 12 minutes in one sample), then `--upgrade`. Each runs in a session of its own and is never stopped by the script, and must report a completed run with exit status 0 and no `FAILED` lines. Afterwards each switch's version (`SWITCH_VERSION_CMD`, by default `ssh admin@<switch> show version`) must show `TARGET_SWITCH_VERSION` from the conf file; a switch that can't be read only gives a warning. On an InfiniBand rack (`SWITCH_TYPE` not `roce`) the phase only warns that the switches were not patched. From the jump server it runs after `compute` |
 | `postcheck` | Runs the checks again and compares the result with the snapshot |
 | `resume` | Resumes only the replication servers that this run paused |
 | `report` | Writes a summary of the run |
@@ -324,7 +324,7 @@ Running the same archive again is safe, because nodes that are already staged ar
     - To revisit: `SUCCESS WITH WARNING(S)` carries on for now (`COMPUTE_PAUSE_ON_WARNINGS=0`), since the prechecks were already reviewed
   - [x] RoCE switches (`switches` phase): `--roceswitch-precheck`, then `--upgrade`, with `/root/switch_group`
   - [ ] InfiniBand switches (X8 and below): not automated; the `switches` phase skips them with a warning
-  - [ ] Check the switch firmware version after the upgrade (what to compare against is still to decide)
+  - [x] Check each switch is on `TARGET_SWITCH_VERSION` after the upgrade
 
 ## Disclaimer
 

@@ -90,6 +90,10 @@ SWITCH_PRECHECK_ARGS=(--upgrade --roceswitch-precheck)   # about 12 minutes in o
 SWITCH_UPGRADE_ARGS=(--upgrade)
 # patchmgr is never stopped by this script; past this long a warning is logged.
 SWITCH_PATCH_WARN_MINUTES=180
+# After the upgrade, each switch's version must contain TARGET_SWITCH_VERSION from the
+# patch conf file (patch.conf_<SR>). This prints a switch's version; {switch} is its
+# name. A switch that cannot be read gives a warning; one on another version fails.
+SWITCH_VERSION_CMD=(ssh -o BatchMode=yes -o ConnectTimeout=15 admin@{switch} "show version")
 
 # --- Replication and incoming backups (quiesce / resume phases) -------------
 # SQL runs with sqlplus as the raAutomation account. For now the password is in this

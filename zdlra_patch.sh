@@ -149,6 +149,10 @@ SWITCH_PATCH_FILES_DIR="/radump/patches/patches"
 SWITCH_PRECHECK_ARGS=(--upgrade --roceswitch-precheck)   # about 12 minutes in one sample
 SWITCH_UPGRADE_ARGS=(--upgrade)
 SWITCH_PATCH_WARN_MINUTES=180   # per patchmgr command; a warning only, never stopped
+# After the upgrade, each switch's version must contain TARGET_SWITCH_VERSION from the
+# conf file. This command prints a switch's version; {switch} is its name. A switch
+# that cannot be read gives a warning; one that is read but not on the target fails.
+SWITCH_VERSION_CMD=(ssh -o BatchMode=yes -o ConnectTimeout=15 admin@{switch} "show version")
 
 # SQL on the appliance, as the raAutomation account (see the config example).
 SQLPLUS="sqlplus"
@@ -1232,9 +1236,53 @@ report_switch_plan() {
     fi
     if [[ -s "$SWITCH_GROUP_FILE" ]]; then
         info "Switches:     $(paste -sd' ' "$SWITCH_GROUP_FILE") (from $SWITCH_GROUP_FILE)"
+        info "Switch target: $(conf_value TARGET_SWITCH_VERSION || true)"
+        local sw out
+        while IFS= read -r sw; do
+            [[ -n "$sw" ]] || continue
+            if out="$(switch_version "$sw")"; then
+                info "    now $sw: $(switch_version_line "$out")"
+            else
+                warn "    now $sw: could not read its version"
+            fi
+        done < "$SWITCH_GROUP_FILE"
     else
         warn "Switches:     $SWITCH_GROUP_FILE is missing or empty"
     fi
+}
+
+# Run SWITCH_VERSION_CMD for one switch; prints its output.
+switch_version() {
+    local a cmd=()
+    for a in "${SWITCH_VERSION_CMD[@]}"; do cmd+=("${a//\{switch\}/$1}"); done
+    "${cmd[@]}" 2>&1 < /dev/null
+}
+
+# The line worth showing from a version output: the NXOS/version line, else the first.
+switch_version_line() {
+    local line
+    line="$(grep -iE 'nxos|version' <<<"$1" | head -1)"
+    [[ -n "$line" ]] || line="$(head -1 <<<"$1")"
+    sed -E 's/^[[:space:]]+//' <<<"$line"
+}
+
+# Every switch in SWITCH_GROUP_FILE must report TARGET_SWITCH_VERSION.
+check_switch_versions() {
+    local target="$1" sw out bad=0 unread=0
+    while IFS= read -r sw; do
+        [[ -n "$sw" ]] || continue
+        if ! out="$(switch_version "$sw")"; then
+            warn "    $sw: could not read its version: $(head -1 <<<"$out")"
+            unread=$((unread + 1))
+        elif grep -qF "$target" <<<"$out"; then
+            info "    $sw: $target"
+        else
+            err "    $sw: $(switch_version_line "$out") (expected $target)"
+            bad=$((bad + 1))
+        fi
+    done < "$SWITCH_GROUP_FILE"
+    (( bad == 0 )) || die "$bad switch(es) not on $target."
+    (( unread == 0 )) || warn "$unread switch(es) could not be checked; check them by hand (patchmgr reported success)."
 }
 
 phase_switches() {
@@ -1248,16 +1296,22 @@ phase_switches() {
     loc="$(switch_patch_location)" || die "Switch patch: $loc"
     dir="${loc#* }"
     [[ -s "$SWITCH_GROUP_FILE" ]] || die "$SWITCH_GROUP_FILE is missing or empty."
-    info "Switch patch folder: $dir; switches: $(paste -sd' ' "$SWITCH_GROUP_FILE")"
+    local target
+    target="$(conf_value TARGET_SWITCH_VERSION || true)"
+    [[ -n "$target" ]] || die "TARGET_SWITCH_VERSION is not set in $(staged_value patch_conf)."
+    info "Switch patch folder: $dir; switches: $(paste -sd' ' "$SWITCH_GROUP_FILE"); target: $target"
     if (( DRY_RUN )); then
         info "[dry-run] cd $dir && ./patchmgr --roceswitches $SWITCH_GROUP_FILE ${SWITCH_PRECHECK_ARGS[*]}"
         info "[dry-run] cd $dir && ./patchmgr --roceswitches $SWITCH_GROUP_FILE ${SWITCH_UPGRADE_ARGS[*]}"
+        info "[dry-run] ${SWITCH_VERSION_CMD[*]}  (on each switch; must show $target)"
         return 0
     fi
     run_patchmgr switches "$dir" precheck --roceswitches "$SWITCH_GROUP_FILE" "${SWITCH_PRECHECK_ARGS[@]}"
     confirm "Upgrade the RoCE switches now (patchmgr --upgrade)?"
     run_patchmgr switches "$dir" upgrade --roceswitches "$SWITCH_GROUP_FILE" "${SWITCH_UPGRADE_ARGS[@]}"
-    info "RoCE switches upgraded."
+    info "Switch versions:"
+    check_switch_versions "$target"
+    info "RoCE switches upgraded to $target."
 }
 
 phase_postcheck() {
