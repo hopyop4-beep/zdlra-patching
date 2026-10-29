@@ -20,8 +20,18 @@
 #   extract     unzips it in /radump, giving /radump/patches/; an older
 #               /radump/patches/ is backed up or replaced first
 #   configure   on every node: checks the patch files are there, rewrites the
-#               component settings in patch.conf_<SR> (original kept as .orig), checks
-#               the result, and writes /radump/patches/ZDLRA_STAGED.txt
+#               component settings in patch.conf_<SR> (original kept as .orig) and
+#               checks the result
+#   unzip       unpacks patch files into /radump/patches/tmp (FILE_UNZIP_*): the
+#               db_server_patch (2nd file of FILES_YUM) on every node, the cell
+#               patch (FILES_CELL) and the switch patch (FILES_SWITCH) on the first
+#               node. The computepatch (1st file of FILES_YUM) stays in patches/.
+#   move        moves the files of each FILE_MOVE_DIR setting to its destination:
+#               FILES_RA (3 files) -> /raacfs/raadmin/tmp. That is ACFS, shared by the
+#               compute nodes, so the move runs once on the first node and the other
+#               nodes only check the files are there
+#   record      writes /radump/patches/ZDLRA_STAGED.txt on every node, last, so a
+#               node only counts as staged once everything above has worked
 #
 # Component values, per appliance, come from the appliance itself: the jump server
 # reads /root/dbs_group (COMPUTE_NODE; its first line is COMPUTE_NODE_01 and
@@ -64,7 +74,7 @@ set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="0.5.0"
+VERSION="0.6.0"
 
 ARCHIVE=""
 SHA_FILE=""
@@ -136,6 +146,32 @@ default_component_cmds() {
 FILE_VARS_RE='^(FILES_[A-Z0-9_]+|STAGE_FILE|FRAMEWORK_FILE)$'
 STAGED_RECORD_NAME="ZDLRA_STAGED.txt"   # written in the unzipped folder on each node
 
+# Where the files named by a FILES_* setting are moved after staging.
+#   FILE_MOVE_DIR     destination (must already exist; it is not created)
+#   FILE_MOVE_SHARED  1 = the destination is shared by the compute nodes (ACFS): move
+#                     once on the first node, only check on the others; 0 = every node
+# A file already at the destination is left alone if identical; if it differs it
+# is handled by OLD_VERSION_ACTION (keep the oldest backup, or overwrite).
+declare -A FILE_MOVE_DIR=([FILES_RA]="/raacfs/raadmin/tmp")
+declare -A FILE_MOVE_SHARED=([FILES_RA]=1)
+
+# How many files a FILES_* setting must name (checked on the jump server).
+declare -A FILE_COUNT=([FILES_RA]=3 [FILES_YUM]=2)
+
+# Patch files unpacked inside the unzipped folder:
+#   FILE_UNZIP_DIR    destination, relative to /radump/patches
+#   FILE_UNZIP_WHICH  which file of the setting's list: a position (1 = first) or "all"
+#   FILE_UNZIP_NODES  "all" compute nodes, or "first" (the first compute node)
+# .zip files are unpacked with unzip, .tar/.tar.gz/.tgz with tar. Each setting's
+# archives are tested before any of them is unpacked; a failure stops staging before
+# the record is written, so the next run starts over with a fresh /radump/patches.
+# FILES_YUM is "computepatch,db_server_patch": the db_server_patch is unpacked on every
+# node; the computepatch stays in patches/ (it is checked to be there).
+declare -A FILE_UNZIP_DIR=([FILES_YUM]="tmp" [FILES_CELL]="tmp" [FILES_SWITCH]="tmp")
+declare -A FILE_UNZIP_WHICH=([FILES_YUM]=2 [FILES_CELL]=all [FILES_SWITCH]=all)
+# The cell and switch patches are only needed on the first node.
+declare -A FILE_UNZIP_NODES=([FILES_YUM]=all [FILES_CELL]=first [FILES_SWITCH]=first)
+
 ARCHIVE_NAME=""
 REMOTE_ARCHIVE=""
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"   # suffix for backups made by this run
@@ -145,6 +181,7 @@ ZIP_PREFIX=""                   # top folder inside the zip, e.g. "patches/"
 CONF_NAME=""                    # e.g. patch.conf_4-003351830
 CONF_TEXT=""                    # its contents, read from the zip
 PATCH_FILES=()                  # files named by the FILES_* settings
+declare -A FILES_BY_VAR=()      # setting -> its file names, space-separated
 EXPECTED_SHA=""
 NODES=()
 TODO_NODES=()                   # nodes of the current appliance that still need staging
@@ -248,6 +285,20 @@ validate() {
     for v in "${COMPONENT_VARS[@]}"; do
         [[ "$v" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "Bad name in COMPONENT_VARS: $v"
     done
+    for v in "${!FILE_MOVE_DIR[@]}"; do
+        [[ "$v" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "Bad setting name in FILE_MOVE_DIR: $v"
+        safe_path "${FILE_MOVE_DIR[$v]}" || die "FILE_MOVE_DIR[$v] has unsupported characters: ${FILE_MOVE_DIR[$v]}"
+    done
+    for v in "${!FILE_COUNT[@]}"; do
+        [[ "${FILE_COUNT[$v]}" =~ ^[0-9]+$ ]] || die "FILE_COUNT[$v] must be a number"
+    done
+    for v in "${!FILE_UNZIP_DIR[@]}"; do
+        [[ "$v" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "Bad setting name in FILE_UNZIP_DIR: $v"
+        [[ "${FILE_UNZIP_DIR[$v]}" =~ ^[A-Za-z0-9._/-]+$ && "${FILE_UNZIP_DIR[$v]}" != *..* && "${FILE_UNZIP_DIR[$v]}" != /* ]] \
+            || die "FILE_UNZIP_DIR[$v] must be a folder inside the unzipped folder, e.g. tmp"
+        [[ "${FILE_UNZIP_WHICH[$v]:-all}" =~ ^(all|[1-9][0-9]*)$ ]] || die "FILE_UNZIP_WHICH[$v] must be all or a position"
+        [[ "${FILE_UNZIP_NODES[$v]:-all}" =~ ^(all|first)$ ]] || die "FILE_UNZIP_NODES[$v] must be all or first"
+    done
     case "$ARCHIVE" in
         *.zip|*.tar) ;;
         *) die "Archive must be .zip or .tar: $ARCHIVE" ;;
@@ -344,6 +395,7 @@ verify_local() {
             f="$(basename "$f")"
             [[ "$f" =~ ^[A-Za-z0-9._+-]+$ ]] || die "Unexpected file name in $key: $f"
             PATCH_FILES+=("$f")
+            FILES_BY_VAR[$key]+="${FILES_BY_VAR[$key]:+ }$f"
             if grep -qxF "${ZIP_PREFIX}${PATCHES_SUBDIR}/${f}" <<<"$list"; then
                 info "  $key: $f"
             else
@@ -356,6 +408,38 @@ verify_local() {
     # A file named by several settings is checked once.
     mapfile -t PATCH_FILES < <(printf '%s\n' "${PATCH_FILES[@]}" | sort -u)
     info "All ${#PATCH_FILES[@]} patch file(s) named in the conf file are in ${PATCHES_SUBDIR}/."
+
+    # Each setting with a count must name exactly that many files.
+    local var n
+    for var in "${!FILE_COUNT[@]}"; do
+        read -r -a parts <<<"${FILES_BY_VAR[$var]:-}"
+        n=${#parts[@]}
+        (( n == FILE_COUNT[$var] )) || die "$var names $n file(s); expected ${FILE_COUNT[$var]}: ${FILES_BY_VAR[$var]:-none}"
+    done
+
+    # Files to unpack.
+    local which list
+    for var in "${!FILE_UNZIP_DIR[@]}"; do
+        list="$(unzip_files "$var")" || die "$(cat <<<"$list")"
+        [[ -n "$list" ]] || die "The conf file names no files in $var, but FILE_UNZIP_DIR has a destination for it."
+        for f in $list; do
+            case "$f" in *.zip|*.tar|*.tar.gz|*.tgz) ;; *) die "$var: $f is not a .zip or .tar file; cannot unpack it." ;; esac
+        done
+        which="${FILE_UNZIP_WHICH[$var]:-all}"
+        info "Unzip:        $var ($( [[ $which == all ]] && echo "all files" || echo "file $which"): $list) -> ${STAGE_DIR}/${FILE_UNZIP_DIR[$var]}, on $( [[ ${FILE_UNZIP_NODES[$var]:-all} == all ]] && echo 'every node' || echo 'the first node')"
+    done
+    if [[ -n "${FILES_BY_VAR[FILES_YUM]:-}" && "${FILE_UNZIP_WHICH[FILES_YUM]:-}" == 2 ]]; then
+        read -r -a parts <<<"${FILES_BY_VAR[FILES_YUM]}"
+        info "Check:        computepatch ${parts[0]} stays in ${STAGE_DIR}/${PATCHES_SUBDIR}"
+    fi
+
+    # Files to move: the setting must be there.
+    for var in "${!FILE_MOVE_DIR[@]}"; do
+        read -r -a parts <<<"${FILES_BY_VAR[$var]:-}"
+        n=${#parts[@]}
+        (( n > 0 )) || die "The conf file names no files in $var, but FILE_MOVE_DIR has a destination for it."
+        info "Move:         $var ($n file(s)) -> ${FILE_MOVE_DIR[$var]}$( (( ${FILE_MOVE_SHARED[$var]:-0} )) && echo ' (shared, once on the first node)')"
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -612,15 +696,13 @@ step_extract() {
 
 # ---------------------------------------------------------------------------
 # Configure step: runs on the node as one bash script (fed on stdin). Arguments:
-#   <dry> <stage dir> <patches subdir> <conf subdir> <conf name> <record name>
-#   <archive> <sha256> <from host> <archive path on the node>
-#   KEY=VALUE ... -- FILE ...
+#   <dry> <stage dir> <patches subdir> <conf subdir> <conf name> KEY=VALUE ... -- FILE ...
 # Paths are passed as arguments, never written into the script itself.
 # ---------------------------------------------------------------------------
 CONFIGURE_SCRIPT=$(cat <<'REMOTE'
 set -uo pipefail
-dry=$1 stage=$2 psub=$3 csub=$4 confname=$5 record=$6 archive=$7 sha=$8 from=$9 remote=${10}
-shift 10
+dry=$1 stage=$2 psub=$3 csub=$4 confname=$5
+shift 5
 settings=(); files=()
 while [ $# -gt 0 ] && [ "$1" != "--" ]; do settings+=("$1"); shift; done
 [ $# -gt 0 ] && shift
@@ -631,7 +713,6 @@ c="$stage/$csub/$confname"
 if [ "$dry" = 1 ]; then
     echo "[dry-run] would check ${#files[@]} patch file(s) in $stage/$psub/"
     echo "[dry-run] would update ${#settings[@]} component setting(s) in $c (original kept as .orig)"
-    echo "[dry-run] would write $stage/$record"
     exit 0
 fi
 
@@ -671,27 +752,89 @@ for kv in "${settings[@]}"; do
     [ "$got" = "$v" ] || fail "check: $k is '$got' in $c, expected '$v'"
 done
 echo "OK checked: component settings in $c"
+REMOTE
+)
 
-# Staged record, read by zdlra_patch.sh.
-{
-    echo "archive=$archive"
-    echo "node_archive=$remote"
-    echo "sha256=$sha"
-    echo "staged_at=$(date '+%F %T %Z')"
-    echo "staged_from=$from"
-    echo "patch_conf=$c"
-    echo "sr=${confname#*_}"
-    for kv in "${settings[@]}"; do echo "component_$kv"; done
-    for f in "${files[@]}"; do echo "file=$f"; done
-} > "$stage/$record" || fail "cannot write $stage/$record"
-echo "OK wrote $stage/$record"
+# ---------------------------------------------------------------------------
+# Move step: runs on the node as one bash script (fed on stdin). Arguments:
+#   <mode: move|check> <dry> <source dir> <destination> <old-version action> <stamp> FILE ...
+# move:  checks everything first (destination exists, sources there, free space),
+#        then moves each file; an identical file already there is left alone, a
+#        different one is backed up (only the oldest backup is kept) or replaced.
+# check: the destination is shared and was filled from another node; each file must
+#        be there and identical to this node's copy.
+# ---------------------------------------------------------------------------
+MOVE_SCRIPT=$(cat <<'REMOTE'
+set -uo pipefail
+mode=$1 dry=$2 src=$3 dest=$4 action=$5 stamp=$6
+shift 6
+fail() { echo "ERROR $*"; exit 1; }
+d='[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]' t='[0-9][0-9][0-9][0-9][0-9][0-9]'
+
+[ -d "$dest" ] || fail "destination $dest does not exist (is the file system mounted?)"
+
+if [ "$mode" = check ]; then
+    for f in "$@"; do
+        if [ "$dry" = 1 ]; then
+            if [ -e "$dest/$f" ]; then echo "[dry-run] $dest/$f is there now"; else echo "[dry-run] $dest/$f will be put there from the first node"; fi
+            continue
+        fi
+        [ -e "$dest/$f" ] || fail "check: $dest/$f is missing (should have been moved there from the first node)"
+        cmp -s "$src/$f" "$dest/$f" || fail "check: $dest/$f differs from this node's $src/$f"
+    done
+    [ "$dry" = 1 ] || echo "OK all $# file(s) present in $dest (shared)"
+    exit 0
+fi
+
+if [ "$dry" = 1 ]; then
+    for f in "$@"; do
+        if [ -e "$dest/$f" ]; then
+            echo "[dry-run] $dest/$f exists now; would be left alone if identical, else handled as an older version ($action)"
+        else
+            echo "[dry-run] would move $f to $dest/"
+        fi
+    done
+    exit 0
+fi
+
+# Check everything before moving anything.
+need=0
+for f in "$@"; do
+    [ -s "$src/$f" ] || fail "missing or empty: $src/$f"
+    need=$(( need + $(stat -c %s "$src/$f") ))
+done
+free=$(( $(df -Pk "$dest" | awk 'NR == 2 { print $4 }') * 1024 ))
+[ "$free" -gt "$need" ] || fail "not enough free space in $dest: need $need bytes, $free free"
+[ -w "$dest" ] || fail "cannot write to $dest"
+
+for f in "$@"; do
+    if [ -e "$dest/$f" ]; then
+        if cmp -s "$src/$f" "$dest/$f"; then
+            echo "OK already in place (identical): $dest/$f"
+            continue
+        fi
+        baks=$(ls -1d "$dest/$f".${d}_${t}.bak 2>/dev/null | sort)
+        if [ "$action" = backup ] && [ -z "$baks" ]; then
+            mv "$dest/$f" "$dest/$f.$stamp.bak" || fail "cannot back up $dest/$f"
+            echo "OK older $f kept as $dest/$f.$stamp.bak"
+        else
+            [ -n "$baks" ] && printf '%s\n' "$baks" | tail -n +2 | while IFS= read -r b; do rm -f -- "$b"; done
+            rm -f -- "$dest/$f" || fail "cannot replace $dest/$f"
+            if [ -n "$baks" ]; then echo "OK older $f replaced (keeping the oldest backup, $(printf '%s\n' "$baks" | head -1))"
+            else echo "OK older $f replaced"; fi
+        fi
+    fi
+    size=$(stat -c %s "$src/$f")
+    mv "$src/$f" "$dest/$f" || fail "cannot move $f to $dest"
+    [ "$(stat -c %s "$dest/$f")" = "$size" ] || fail "check: $dest/$f has the wrong size after the move"
+    echo "OK moved $f -> $dest/"
+done
 REMOTE
 )
 
 step_configure() {
     local z="$1" node key out rc
-    local args="'$DRY_RUN' '$STAGE_DIR' '$PATCHES_SUBDIR' '$CONF_SUBDIR' '$CONF_NAME' '$STAGED_RECORD_NAME'"
-    args+=" '$ARCHIVE_NAME' '$EXPECTED_SHA' '$(hostname)' '$REMOTE_ARCHIVE'"
+    local args="'$DRY_RUN' '$STAGE_DIR' '$PATCHES_SUBDIR' '$CONF_SUBDIR' '$CONF_NAME'"
     for key in "${COMPONENT_VARS[@]}"; do args+=" '$key=${COMP[$key]:-}'"; done
     args+=" --"
     local f
@@ -703,6 +846,151 @@ step_configure() {
         (( rc == 0 )) || die "${z}/${node}: configure step failed (see above)."
     done
 }
+
+# The files of setting $1 that FILE_UNZIP_WHICH selects, space-separated.
+unzip_files() {
+    local var="$1" which="${FILE_UNZIP_WHICH[$1]:-all}" parts=()
+    read -r -a parts <<<"${FILES_BY_VAR[$var]:-}"
+    if [[ "$which" == all ]]; then
+        echo "${parts[*]-}"
+    elif (( which <= ${#parts[@]} )); then
+        echo "${parts[which-1]}"
+    else
+        echo "FILE_UNZIP_WHICH[$var]=$which, but $var names only ${#parts[@]} file(s)"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Unzip step: runs on the node as one bash script (fed on stdin). Arguments:
+#   <dry> <source dir> <destination dir> FILE ...
+# Tests every archive before unpacking any of them.
+# ---------------------------------------------------------------------------
+UNZIP_SCRIPT=$(cat <<'REMOTE'
+set -uo pipefail
+dry=$1 src=$2 dest=$3
+shift 3
+fail() { echo "ERROR $*"; exit 1; }
+if [ "$dry" = 1 ]; then
+    for f in "$@"; do echo "[dry-run] would unpack $f into $dest/"; done
+    exit 0
+fi
+for f in "$@"; do
+    [ -s "$src/$f" ] || fail "missing or empty: $src/$f"
+    case "$f" in
+        *.zip)           unzip -tq "$src/$f" >/dev/null 2>&1 || fail "$f is not a readable zip (unzip -t failed)" ;;
+        *.tar)           tar -tf  "$src/$f" >/dev/null 2>&1 || fail "$f is not a readable tar" ;;
+        *.tar.gz|*.tgz)  tar -tzf "$src/$f" >/dev/null 2>&1 || fail "$f is not a readable tar.gz" ;;
+        *)               fail "$f: cannot unpack this kind of file" ;;
+    esac
+done
+mkdir -p "$dest" || fail "cannot create $dest"
+for f in "$@"; do
+    before=$(find "$dest" | wc -l)
+    case "$f" in
+        *.zip)           unzip -q -o "$src/$f" -d "$dest" ;;
+        *.tar)           tar -xf  "$src/$f" -C "$dest" ;;
+        *.tar.gz|*.tgz)  tar -xzf "$src/$f" -C "$dest" ;;
+    esac || fail "unpacking $f into $dest failed"
+    echo "OK unpacked $f into $dest/ ($(( $(find "$dest" | wc -l) - before )) new entries)"
+done
+REMOTE
+)
+
+# Unpack the files of each FILE_UNZIP_DIR setting, on every node or the first only.
+# The computepatch (first file of FILES_YUM) must stay in patches/; check it there.
+step_unzip() {
+    local z="$1" var node f list nodes=() out rc args first="${NODES[0]}"
+    for var in "${!FILE_UNZIP_DIR[@]}"; do
+        list="$(unzip_files "$var")"
+        if [[ "${FILE_UNZIP_NODES[$var]:-all}" == first ]]; then
+            [[ " ${TODO_NODES[*]} " == *" $first "* ]] && nodes=("$first") || nodes=()
+        else
+            nodes=(${TODO_NODES[@]+"${TODO_NODES[@]}"})
+        fi
+        args="'$DRY_RUN' '${STAGE_DIR}/${PATCHES_SUBDIR}' '${STAGE_DIR}/${FILE_UNZIP_DIR[$var]}'"
+        for f in $list; do args+=" '$f'"; done
+        for node in ${nodes[@]+"${nodes[@]}"}; do
+            rc=0
+            out="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" "bash -s -- $args" <<<"$UNZIP_SCRIPT" 2>&1)" || rc=$?
+            printf '%s\n' "$out" | sed "s|^|  ${z}/${node}: [$var] |" | tee -a "$LOG_FILE" >&2
+            (( rc == 0 )) || die "${z}/${node}: unpacking the $var files failed (see above)."
+        done
+    done
+    if [[ -n "${FILES_BY_VAR[FILES_YUM]:-}" ]] && (( ! DRY_RUN )); then
+        local parts=()
+        read -r -a parts <<<"${FILES_BY_VAR[FILES_YUM]}"
+        for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
+            on_node "$node" "[ -s '${STAGE_DIR}/${PATCHES_SUBDIR}/${parts[0]}' ]" \
+                || die "${z}/${node}: computepatch ${parts[0]} is not in ${STAGE_DIR}/${PATCHES_SUBDIR}"
+            info "${z}/${node}: computepatch ${parts[0]} is in ${STAGE_DIR}/${PATCHES_SUBDIR}"
+        done
+    fi
+}
+
+# Run MOVE_SCRIPT on a node. $1 = node, $2 = mode, $3 = setting; prints its output.
+run_move() {
+    local node="$1" mode="$2" var="$3" out rc=0 f args
+    args="'$mode' '$DRY_RUN' '${STAGE_DIR}/${PATCHES_SUBDIR}' '${FILE_MOVE_DIR[$var]}' '$OLD_VERSION_ACTION' '$RUN_STAMP'"
+    for f in ${FILES_BY_VAR[$var]}; do args+=" '$f'"; done
+    out="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" "bash -s -- $args" <<<"$MOVE_SCRIPT" 2>&1)" || rc=$?
+    printf '%s\n' "$out" | sed "s|^|  ${Z_CUR}/${node}: [$var] |" | tee -a "$LOG_FILE" >&2
+    return "$rc"
+}
+
+# Move the files of each FILE_MOVE_DIR setting. A shared destination is filled once,
+# from the first node (if that node is being staged now), and checked on the others.
+step_move() {
+    local z="$1" var node first="${NODES[0]}" first_todo=0
+    Z_CUR="$z"
+    [[ " ${TODO_NODES[*]} " == *" $first "* ]] && first_todo=1
+    for var in "${!FILE_MOVE_DIR[@]}"; do
+        if (( ${FILE_MOVE_SHARED[$var]:-0} )); then
+            if (( first_todo )); then
+                run_move "$first" move "$var" || die "${z}/${first}: moving the $var files failed (see above)."
+            fi
+            for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
+                [[ "$node" == "$first" ]] && continue
+                run_move "$node" check "$var" || die "${z}/${node}: the $var files are not right in ${FILE_MOVE_DIR[$var]} (see above)."
+            done
+        else
+            for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
+                run_move "$node" move "$var" || die "${z}/${node}: moving the $var files failed (see above)."
+            done
+        fi
+    done
+}
+
+# Write the staged record on each node, last of all.
+step_record() {
+    local z="$1" node key var f content
+    content="archive=$ARCHIVE_NAME
+node_archive=$REMOTE_ARCHIVE
+sha256=$EXPECTED_SHA
+staged_at=$(date '+%F %T %Z')
+staged_from=$(hostname)
+patch_conf=${STAGE_DIR}/${CONF_SUBDIR}/${CONF_NAME}
+sr=${CONF_NAME#*_}"
+    for key in "${COMPONENT_VARS[@]}"; do content+=$'\n'"component_${key}=${COMP[$key]:-}"; done
+    for f in "${PATCH_FILES[@]}"; do content+=$'\n'"file=$f"; done
+    for var in "${!FILE_UNZIP_DIR[@]}"; do
+        for f in $(unzip_files "$var"); do content+=$'\n'"unpacked=${var}:${f}:${STAGE_DIR}/${FILE_UNZIP_DIR[$var]}:${FILE_UNZIP_NODES[$var]:-all}"; done
+    done
+    for var in "${!FILE_MOVE_DIR[@]}"; do
+        for f in ${FILES_BY_VAR[$var]}; do content+=$'\n'"moved=${var}:${f}:${FILE_MOVE_DIR[$var]}"; done
+    done
+    for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
+        if (( DRY_RUN )); then
+            info "[dry-run] ${node}: would write ${STAGE_DIR}/${STAGED_RECORD_NAME}"
+            continue
+        fi
+        on_node "$node" "cat > '${STAGE_DIR}/${STAGED_RECORD_NAME}'" <<<"$content" \
+            || die "${z}/${node}: cannot write ${STAGE_DIR}/${STAGED_RECORD_NAME}"
+        info "${z}/${node}: wrote ${STAGE_DIR}/${STAGED_RECORD_NAME}"
+    done
+}
+
+Z_CUR=""
 
 stage_appliance() {
     local z="$1"
@@ -716,6 +1004,9 @@ stage_appliance() {
     fi
     info "== extract ==";    step_extract "$z"
     info "== configure ==";  step_configure "$z"
+    info "== unzip ==";      step_unzip "$z"
+    info "== move ==";       step_move "$z"
+    info "== record ==";     step_record "$z"
     if (( DRY_RUN )); then
         info "${z}: dry run passed; would stage on ${TODO_NODES[*]}"
     else

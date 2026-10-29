@@ -43,5 +43,23 @@ COMPONENTS_DIR="$(dirname "${BASH_SOURCE[0]}")/components"
 # FILES_PATCHBASE, FILES_SWITCH, FILES_YUM, FILES_CELL, FILES_RA, STAGE_FILE, FRAMEWORK_FILE.
 FILE_VARS_RE='^(FILES_[A-Z0-9_]+|STAGE_FILE|FRAMEWORK_FILE)$'
 
+# How many files a setting must name (checked before touching any node).
+#   FILE_COUNT[FILES_RA]=3
+#   FILE_COUNT[FILES_YUM]=2
+
+# Patch files unpacked inside /radump/patches (defaults shown):
+#   FILE_UNZIP_DIR    destination, relative to /radump/patches
+#   FILE_UNZIP_WHICH  which file of the setting: a position (1 = first) or all
+#   FILE_UNZIP_NODES  all compute nodes, or first (the first compute node)
+# FILES_YUM is computepatch,db_server_patch: the db_server_patch is unpacked on every
+# node, and the computepatch stays in patches/ (checked).
+#   FILE_UNZIP_DIR[FILES_YUM]=tmp     FILE_UNZIP_WHICH[FILES_YUM]=2     FILE_UNZIP_NODES[FILES_YUM]=all
+#   FILE_UNZIP_DIR[FILES_CELL]=tmp    FILE_UNZIP_WHICH[FILES_CELL]=all  FILE_UNZIP_NODES[FILES_CELL]=first
+#   FILE_UNZIP_DIR[FILES_SWITCH]=tmp  FILE_UNZIP_WHICH[FILES_SWITCH]=all FILE_UNZIP_NODES[FILES_SWITCH]=first
+
+# Files moved out of /radump/patches/patches (defaults shown). A shared destination
+# (ACFS) is filled once from the first node and checked on the others.
+#   FILE_MOVE_DIR[FILES_RA]=/raacfs/raadmin/tmp   FILE_MOVE_SHARED[FILES_RA]=1
+
 # Record written in the unzipped folder on each node (read by zdlra_patch.sh).
 STAGED_RECORD_NAME="ZDLRA_STAGED.txt"

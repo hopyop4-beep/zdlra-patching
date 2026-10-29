@@ -188,7 +188,10 @@ Copy the archive and its `.sha256` file to a Linux jump server that can reach th
 | distribute | Copies the archive to `/radump/patches.zip` on every node, skipping nodes that already have an identical copy. An older `patches.zip` there is backed up as `patches.zip.<date>.bak`, or overwritten if `OLD_VERSION_ACTION=overwrite`. With `--relay`, it copies to the first node only, and that node copies on to the others |
 | check | On every node: verifies the SHA-256 and free space. Nodes already staged with this archive are skipped from here on |
 | extract | Unzips it in `/radump` on every node. The zip holds one top folder, so this gives `/radump/patches/`; an older `/radump/patches/` is backed up or replaced first. A zip without a single top folder is unzipped into `/radump/patches_zip/` instead |
-| configure | On every node: checks that every patch file named in the conf file's `FILES_*` settings is in `/radump/patches/patches/`, then rewrites the component settings in `/radump/patches/conf/patch.conf_<SR>` for this appliance. The original is kept as `.orig` and the change is logged. It checks the result and writes `/radump/patches/ZDLRA_STAGED.txt` |
+| configure | On every node: checks that every patch file named in the conf file's `FILES_*` settings is in `/radump/patches/patches/`, then rewrites the component settings in `/radump/patches/conf/patch.conf_<SR>` for this appliance. The original is kept as `.orig` and the change is logged |
+| unzip | Unzips into `/radump/patches/tmp/`: the db_server_patch (2nd file of `FILES_YUM`) on every node, and the cell patch (`FILES_CELL`) and switch patch (`FILES_SWITCH`) on the first node. The computepatch (1st file of `FILES_YUM`) stays in `patches/` and is checked to be there. Each setting's archives are integrity-tested before any is unzipped |
+| move | Moves the 3 `FILES_RA` files to `/raacfs/raadmin/tmp/`. That's ACFS, shared by the nodes, so the move runs once from the first node and the others check the files are there. An identical file already there is left alone; a different one is backed up (oldest backup kept) or replaced |
+| record | Writes `/radump/patches/ZDLRA_STAGED.txt` on every node, last. If any step above fails, the node isn't marked as staged, and the next run starts over |
 
 **Before touching any node**, the jump server reads `patch.conf_<SR>` from the zip and checks that every file its `FILES_*` settings name (plus `STAGE_FILE` and `FRAMEWORK_FILE`) is in `patches/patches/`. It then works out each appliance's component settings and shows them as old → new:
 
@@ -227,7 +230,8 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [ ] Fill in the replication and incoming-backup SQL (placeholders in place)
 - [ ] Verify the bundle checksum
 - [x] Staging unzips `patches.zip` in `/radump` and rewrites `patch.conf_<SR>` for the appliance; the patch script relies on the staged record (the `stage` phase is gone)
-- [ ] What to do with each patch file named by the `FILES_*` settings
+- [x] Unzip the compute, cell and switch patches into `tmp/`, and move the RA patches to `/raacfs/raadmin/tmp`
+- [ ] What to do with the `FILES_PATCHBASE`, `STAGE_FILE` and `FRAMEWORK_FILE` files, if anything
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
