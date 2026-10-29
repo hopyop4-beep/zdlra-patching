@@ -201,7 +201,7 @@ The values come from the appliance itself, read on the first compute node:
 | `CELL_NODE` | `/root/cell_group` |
 | `SWITCHES`, `IB_SWITCHES` | The switch group file. On a RoCE rack, both hold the RoCE switch names |
 | `SWITCH_TYPE` | Network interface names: `re*` means `roce`, `ib*` means `IB` (`TODO(site)`: not confirmed) |
-| `RA_DATABASE` | `srvctl config database` as oracle (`TODO(site)`: not confirmed) |
+| `RA_DATABASE` | The database's pmon process: `ora_pmon_<db><n>` with the instance number cut off. More than one database is refused |
 
 - **Missing group files:** if a group file is missing or empty, the script **pauses**. It names the files to create on that node, waits for you to press Enter, and checks again; type `q` to stop. With no terminal attached, it stops instead.
 - **Mismatch check:** `dbs_group` must list the compute nodes being staged. If it doesn't, the appliance is refused.
@@ -225,7 +225,7 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [ ] Fill in the replication and incoming-backup SQL (placeholders in place)
 - [ ] Verify the bundle checksum
 - [x] Staging unzips `patches.zip` in `/radump` and rewrites `patch.conf_<SR>` for the appliance; the patch script relies on the staged record (the `stage` phase is gone)
-- [ ] Confirm the switch group file name, and how to find `SWITCH_TYPE` and `RA_DATABASE` on the appliance
+- [ ] Confirm the switch group file name, and how to find `SWITCH_TYPE` on the appliance
 - [ ] What to do with each patch file named by the `FILES_*` settings
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout

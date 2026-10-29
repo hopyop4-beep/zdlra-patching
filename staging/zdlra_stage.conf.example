@@ -32,8 +32,9 @@ SWITCH_GROUP_FILE="/root/switch_group"  # -> SWITCHES and IB_SWITCHES (RoCE swit
 # are joined with commas. The defaults read the group files above. To change one,
 # assign that entry (the script declares the list and fills in the rest), e.g.:
 #   COMPONENT_CMDS[RA_DATABASE]='su - oracle -c "srvctl config database" | head -1'
-# TODO(site): the defaults for SWITCH_TYPE (network interface names: re* = roce,
-# ib* = IB) and RA_DATABASE (srvctl as oracle) are still guesses.
+# RA_DATABASE defaults to the database's pmon process (ora_pmon_<db><n>) with the
+# instance number cut off. TODO(site): the default for SWITCH_TYPE (network
+# interface names: re* = roce, ib* = IB) is still a guess.
 # components/<appliance>.conf overrides any value.
 COMPONENTS_DIR="$(dirname "${BASH_SOURCE[0]}")/components"
 

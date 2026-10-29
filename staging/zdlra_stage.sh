@@ -105,7 +105,8 @@ SWITCH_GROUP_FILE="/root/switch_group"  # switches, one per line (RoCE switches 
 # node (as SSH_USER). Its output lines are joined with commas.
 # components/<appliance>.conf, if present, overrides any of them.
 # On a RoCE rack the RoCE switch names go in IB_SWITCHES as well, so both read the
-# switch group file. TODO(site): SWITCH_TYPE and RA_DATABASE are still guesses.
+# switch group file. RA_DATABASE comes from the database's pmon process.
+# TODO(site): SWITCH_TYPE (from the network interface names) is still a guess.
 # The config can set any entry; default_component_cmds fills in the rest after the
 # config is loaded, so it uses the group file paths from the config.
 declare -A COMPONENT_CMDS=()
@@ -120,7 +121,8 @@ default_component_cmds() {
         [SWITCHES]="cat '$SWITCH_GROUP_FILE'"
         [IB_SWITCHES]="cat '$SWITCH_GROUP_FILE'"
         [SWITCH_TYPE]='if ls /sys/class/net | grep -qE "^re[0-9]"; then echo roce; elif ls /sys/class/net | grep -qE "^ib[0-9]"; then echo IB; fi'
-        [RA_DATABASE]='su - oracle -c "srvctl config database" | head -1'
+        # pmon of the RA database instance (ora_pmon_<db><n>), minus the instance number.
+        [RA_DATABASE]="ps -eo args | sed -n 's/^ora_pmon_//p' | sed 's/[0-9]\$//' | sort -u"
     )
     local key
     for key in "${!defaults[@]}"; do
@@ -468,6 +470,7 @@ step_components() {
         [[ -n "${COMP[$key]:-}" || -n "${given[$key]:-}" ]] || missing+=("$key")
     done
     (( ${#missing[@]} == 0 )) || die "${z}: could not find ${missing[*]} on the appliance. Check COMPONENT_CMDS, or set them in $file."
+    [[ "${COMP[RA_DATABASE]}" != *,* ]]         || die "${z}: more than one database found for RA_DATABASE (${COMP[RA_DATABASE]}). Set it in $file."
 
     # dbs_group must list the compute nodes being staged (short names compared), or
     # the conf would point at the wrong nodes.
