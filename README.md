@@ -225,7 +225,7 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [ ] Fill in the replication and incoming-backup SQL (placeholders in place)
 - [ ] Verify the bundle checksum
 - [x] Staging unzips `patches.zip` in `/radump` and rewrites `patch.conf_<SR>` for the appliance; the patch script relies on the staged record (the `stage` phase is gone)
-- [ ] Confirm the switch group file name, and how to find `SWITCH_TYPE` on the appliance
+- [ ] Confirm how to find `SWITCH_TYPE` on the appliance (network interface names for now)
 - [ ] What to do with each patch file named by the `FILES_*` settings
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout

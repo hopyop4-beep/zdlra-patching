@@ -26,7 +26,6 @@ COMPONENT_VARS=(COMPUTE_NODE COMPUTE_NODE_01 CELL_NODE CELL_PATCH_LAUNCH_NODE
 DBS_GROUP_FILE="/root/dbs_group"        # -> COMPUTE_NODE; first line -> COMPUTE_NODE_01, CELL_PATCH_LAUNCH_NODE
 CELL_GROUP_FILE="/root/cell_group"      # -> CELL_NODE
 SWITCH_GROUP_FILE="/root/switch_group"  # -> SWITCHES and IB_SWITCHES (RoCE switches on a RoCE rack)
-                                        # TODO(site): confirm this file name
 
 # How each value is found: a command run on the first compute node; output lines
 # are joined with commas. The defaults read the group files above. To change one,
@@ -38,9 +37,9 @@ SWITCH_GROUP_FILE="/root/switch_group"  # -> SWITCHES and IB_SWITCHES (RoCE swit
 # components/<appliance>.conf overrides any value.
 COMPONENTS_DIR="$(dirname "${BASH_SOURCE[0]}")/components"
 
-# Settings that name patch files (comma-separated); each file must be in patches/.
-# TODO(site): confirm the setting names (FILSE_YUM as written?).
-FILE_VARS_RE='^(FILES?_[A-Z0-9_]+|FILSE_[A-Z0-9_]+|STAGE_FILE|FRAMEWORK_FILE)$'
+# Settings that name patch files (comma-separated); each file must be in patches/:
+# FILES_PATCHBASE, FILES_SWITCH, FILES_YUM, FILES_CELL, FILES_RA, STAGE_FILE, FRAMEWORK_FILE.
+FILE_VARS_RE='^(FILES_[A-Z0-9_]+|STAGE_FILE|FRAMEWORK_FILE)$'
 
 # Record written in the unzipped folder on each node (read by zdlra_patch.sh).
 STAGED_RECORD_NAME="ZDLRA_STAGED.txt"

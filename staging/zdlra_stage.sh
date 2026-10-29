@@ -97,7 +97,6 @@ COMPONENT_VARS=(COMPUTE_NODE COMPUTE_NODE_01 CELL_NODE CELL_PATCH_LAUNCH_NODE
                 SWITCH_TYPE SWITCHES IB_SWITCHES RA_DATABASE)
 # Group files on the appliance's first compute node. They must exist and not be
 # empty; if one is missing the script pauses and asks you to create it.
-# TODO(site): confirm the switch group file name.
 DBS_GROUP_FILE="/root/dbs_group"        # compute nodes, one per line
 CELL_GROUP_FILE="/root/cell_group"      # storage cells, one per line
 SWITCH_GROUP_FILE="/root/switch_group"  # switches, one per line (RoCE switches on a RoCE rack)
@@ -130,9 +129,9 @@ default_component_cmds() {
     done
 }
 # Settings in the conf file that name patch files (checked in PATCHES_SUBDIR).
-# Values are comma-separated file names. TODO(site): confirm the variable names
-# (FILSE_YUM as written?).
-FILE_VARS_RE='^(FILES?_[A-Z0-9_]+|FILSE_[A-Z0-9_]+|STAGE_FILE|FRAMEWORK_FILE)$'
+# Values are comma-separated file names: FILES_PATCHBASE, FILES_SWITCH, FILES_YUM,
+# FILES_CELL, FILES_RA, plus STAGE_FILE and FRAMEWORK_FILE.
+FILE_VARS_RE='^(FILES_[A-Z0-9_]+|STAGE_FILE|FRAMEWORK_FILE)$'
 STAGED_RECORD_NAME="ZDLRA_STAGED.txt"   # written in the unzipped folder on each node
 
 ARCHIVE_NAME=""
