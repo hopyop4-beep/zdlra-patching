@@ -78,14 +78,18 @@ RA_SQL_CONNECT=""                    # TODO(site): e.g. "/@raadmin"
 #   REPLICATION_RESUME_SQL   statement run for each one this run paused
 #   ACTIVE_REPLICATION_SQL   prints one number: replication still in flight
 #   ACTIVE_BACKUPS_SQL       prints one number: incoming backups still running
+#                            (RMAN sessions in gv$session, by program or module)
+#   ACTIVE_BACKUPS_LIST_SQL  optional: those sessions, one per line, shown in the
+#                            precheck review and when the wait gives up
 REPLICATION_SERVERS_SQL="select remote_ra_dbname from ra_replication_pair where upper(replication_server_state) = 'RUNNING' and upper(replication_server_role) in ('UPSTREAM','PAIRED');"
 REPLICATION_STATUS_SQL="select remote_ra_dbname || '  state=' || replication_server_state || '  role=' || replication_server_role from ra_replication_pair;"
 # Pause/resume each one by its remote_ra_dbname.
 REPLICATION_PAUSE_SQL="begin dbms_ra.pause_replication_server(replication_server_name => '{server}'); end;"
 REPLICATION_RESUME_SQL="begin dbms_ra.resume_replication_server(replication_server_name => '{server}'); end;"
-# TODO(site): the two count queries.
+# TODO(site): the in-flight replication count.
 ACTIVE_REPLICATION_SQL=""
-ACTIVE_BACKUPS_SQL=""
+ACTIVE_BACKUPS_SQL="select count(*) from gv\$session s where lower(s.program) like '%rman%' or lower(s.module) like '%rman%';"
+ACTIVE_BACKUPS_LIST_SQL="select 'inst=' || s.inst_id || ' sid=' || s.sid || ',' || s.serial# || '  ' || s.program || '  machine=' || s.machine || '  event=' || s.event || '  wait=' || s.seconds_in_wait || 's' from gv\$session s where lower(s.program) like '%rman%' or lower(s.module) like '%rman%' order by s.inst_id, s.sid;"
 
 QUIESCE_POLL_SECONDS=60
 QUIESCE_TIMEOUT_MINUTES=120          # stop before patching if still busy after this long

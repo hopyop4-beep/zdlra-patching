@@ -121,7 +121,10 @@ REPLICATION_STATUS_SQL="select remote_ra_dbname || '  state=' || replication_ser
 REPLICATION_PAUSE_SQL="begin dbms_ra.pause_replication_server(replication_server_name => '{server}'); end;"
 REPLICATION_RESUME_SQL="begin dbms_ra.resume_replication_server(replication_server_name => '{server}'); end;"
 ACTIVE_REPLICATION_SQL=""       # count of replication still in flight
-ACTIVE_BACKUPS_SQL=""           # count of incoming backups still running
+# Incoming backups: RMAN sessions connected to the appliance database, on all instances.
+ACTIVE_BACKUPS_SQL="select count(*) from gv\$session s where lower(s.program) like '%rman%' or lower(s.module) like '%rman%';"
+# The same sessions, one per line: shown in the precheck review and when the wait gives up.
+ACTIVE_BACKUPS_LIST_SQL="select 'inst=' || s.inst_id || ' sid=' || s.sid || ',' || s.serial# || '  ' || s.program || '  machine=' || s.machine || '  event=' || s.event || '  wait=' || s.seconds_in_wait || 's' from gv\$session s where lower(s.program) like '%rman%' or lower(s.module) like '%rman%' order by s.inst_id, s.sid;"
 QUIESCE_POLL_SECONDS=60
 QUIESCE_TIMEOUT_MINUTES=120     # give up waiting after this long
 QUIESCE_WAIT_FOR_BACKUPS=1      # 0 = do not wait for incoming backups (same as --skip-backup-wait)
@@ -609,19 +612,33 @@ report_activity() {
     info "Replication in flight now: $n"
     n="$(sql_count "$ACTIVE_BACKUPS_SQL")" || die "Could not count incoming backups."
     info "Incoming backups running now: $n"
+    (( n == 0 )) || show_rows "Incoming backup sessions:" "${ACTIVE_BACKUPS_LIST_SQL:-}"
+}
+
+# Print the rows of an optional listing query under a heading (read only; never fails).
+show_rows() {
+    local heading="$1" query="$2" rows line
+    [[ -n "$query" ]] || return 0
+    rows="$(sql_rows "$query")" || { warn "Could not list: $heading"; return 0; }
+    info "$heading"
+    while IFS= read -r line; do [[ -n "$line" ]] && info "    $line"; done <<<"$rows"
+    return 0
 }
 
 # Poll a count query until it reaches 0 or the timeout passes.
-# $1 = label, $2 = count query
+# $1 = label, $2 = count query, $3 = optional listing query shown if the wait gives up
 wait_for_zero() {
-    local label="$1" query="$2" n waited=0 limit=$(( QUIESCE_TIMEOUT_MINUTES * 60 ))
+    local label="$1" query="$2" list="${3:-}" n waited=0 limit=$(( QUIESCE_TIMEOUT_MINUTES * 60 ))
     while :; do
         n="$(sql_count "$query")" || die "Could not count $label."
         if (( n == 0 )); then
             info "No $label running."
             return 0
         fi
-        (( waited < limit )) || die "$n $label still running after ${QUIESCE_TIMEOUT_MINUTES} min. Stopping before patching."
+        if (( waited >= limit )); then
+            show_rows "Still running ($label):" "$list"
+            die "$n $label still running after ${QUIESCE_TIMEOUT_MINUTES} min. Stopping before patching."
+        fi
         info "Waiting: $n $label running (${waited}s of ${limit}s)"
         if (( DRY_RUN )); then
             info "[dry-run] would keep waiting for $label to finish"
@@ -668,8 +685,8 @@ phase_precheck() {
 }
 
 # Pauses the running upstream/paired replication (REPLICATION_SERVERS_SQL), then waits
-# for in-flight replication and incoming backups. TODO(site): RA_SQL_CONNECT and the two
-# count queries (ACTIVE_REPLICATION_SQL, ACTIVE_BACKUPS_SQL) are still to be filled in.
+# for in-flight replication and incoming backups (RMAN sessions). TODO(site): RA_SQL_CONNECT
+# and the in-flight replication count (ACTIVE_REPLICATION_SQL) are still to be filled in.
 phase_quiesce() {
     info "== quiesce =="
     local missing
@@ -706,7 +723,7 @@ phase_quiesce() {
         n="$(sql_count "$ACTIVE_BACKUPS_SQL")" || n="?"
         warn "Not waiting for incoming backups (override); $n running now."
     else
-        wait_for_zero "incoming backups" "$ACTIVE_BACKUPS_SQL"
+        wait_for_zero "incoming backups" "$ACTIVE_BACKUPS_SQL" "${ACTIVE_BACKUPS_LIST_SQL:-}"
     fi
 }
 
