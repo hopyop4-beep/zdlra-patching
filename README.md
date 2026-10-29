@@ -226,7 +226,7 @@ Copy the archive and its `.sha256` file to a Linux jump server that can reach th
 | unzip | Unzips into `/radump/patches/tmp/`: the db_server_patch (2nd file of `FILES_YUM`) on every node, and the cell patch (`FILES_CELL`) and switch patch (`FILES_SWITCH`) on the first node. The computepatch (1st file of `FILES_YUM`) stays in `patches/` and is checked to be there. Each setting's archives are integrity-tested before any is unzipped |
 | move | Moves the 3 `FILES_RA` files to `/raacfs/raadmin/tmp/`. That's ACFS, shared by the nodes, so the move runs once from the first node and the others check the files are there. An identical file already there is left alone; a different one is backed up (oldest backup kept) or replaced |
 | identify | Finds the ZDLRA software among the `FILES_RA` files: the one zip with `ra_automation` `.pl` files. The other two are the GI and DB gold images, in their `FILES_RA` order (normally GI, DB, software; another position only gives a warning). No such zip, or more than one, stops staging |
-| record | Writes `/radump/patches/ZDLRA_STAGED.txt` on every node, last. It includes `ra_release=` (the ZDLRA software) and `ra_gold_images=` (GI, DB) for the RA upgrade. If any step above fails, the node isn't marked as staged, and the next run starts over |
+| record | Writes `/radump/patches/ZDLRA_STAGED.txt` on every node, last. It includes `ra_release=` (the ZDLRA software) and `ra_gold_images=` (GI, DB) for the RA upgrade. These are where staging put them; the precheck later moves the gold images to `/radump`. If any step above fails, the node isn't marked as staged, and the next run starts over |
 
 **Before touching any node**, the jump server reads `patch.conf_<SR>` from the zip and checks that every file its `FILES_*` settings name (plus `STAGE_FILE` and `FRAMEWORK_FILE`) is in `patches/patches/`. It then works out each appliance's component settings and shows them as old → new:
 
@@ -281,7 +281,7 @@ Running the same archive again is safe, because nodes that are already staged ar
     - If step 2 wasn't run first, `update` runs Alter Appliance itself.
   - All three run in the maintenance window. Step 2 doesn't need to run ahead of it.
   - Still to look into:
-    - `FILES_RA` is the GI gold image, the DB gold image and the ZDLRA software, in that order. Staging moves all three to `/raacfs/raadmin/tmp`, but `alter` was given `--gold_images_path=/radump/`: which folder should it point at?
+    - `FILES_RA` is the GI gold image, the DB gold image and the ZDLRA software, in that order. Staging moves all three to `/raacfs/raadmin/tmp`; the precheck then moves the gold images to `/radump`, which is why `alter` uses `--gold_images_path=/radump/`. Before `alter`, check that both gold images (named in `ra_gold_images=`) are in `/radump`.
   - [ ] Continue after a failure (build together with the three steps):
     - The node records each finished phase, and `zdlra_patch.sh --continue --run-id <id>` skips them, reruns the one that failed, and carries on. For `update`, `racli` resumes on its own.
     - `zdlra_patch_run.sh --continue <run id>` does the same from the jump server. It reuses the blackout and the suspended OEM jobs from the first attempt, then watches, resumes jobs and ends the blackout as usual.

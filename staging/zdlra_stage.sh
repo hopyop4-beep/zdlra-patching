@@ -163,7 +163,9 @@ declare -A FILE_COUNT=([FILES_RA]=3 [FILES_YUM]=2)
 # FILES_RA is the GI gold image, the DB gold image and the ZDLRA software, normally in
 # that order. The ZDLRA software (the release zip for racli run preinstall) is found by
 # its contents: the one zip with ra_automation .pl files. The other two are the gold
-# images, in their FILES_RA order. All three are written to the staged record.
+# images, in their FILES_RA order. All three are written to the staged record, at the
+# paths staging leaves them; the precheck later moves the gold images to /radump, where
+# racli alter appliance --gold_images_path=/radump/ expects them.
 RA_RELEASE_MARKER_RE='ra_automation[^[:space:]]*[.]pl$'
 RA_RELEASE_POSITION=3          # where it normally is; elsewhere only gives a warning
 
