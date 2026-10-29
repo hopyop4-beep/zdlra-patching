@@ -269,7 +269,8 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [ ] RA software upgrade (3 steps, as root on node 1; to come back to). These replace the current `patch1`/`patch2` phases (`racli patch appliance --step=1/2`). Each `racli` step must run through `run_detached`, like `patchmgr`, so nothing can cut it short:
   - [ ] Step 1, pre-install: `racli run preinstall --zdlra_release_file=/raacfs/raadmin/tmp/<zip>`.
     - Success: the output reaches `End: ra_preinstall post cleanup`, every `CHECK:`/`HOST:` line says PASS, and it writes `/root/.ra_preinstall.install`.
-    - Still to check: whether the precheck already covers it, and which `FILES_RA` file is the release zip (probably the first).
+    - The precheck rolls back the RPM that pre-install installs. So pre-install must run after the precheck, in the window, never ahead of it. Any later precheck run (for example a recheck before continuing) undoes it again, and pre-install must then run again before `alter`.
+    - Still to check: which `FILES_RA` file is the release zip (probably the first).
   - [ ] Step 2, alter: `racli alter appliance --online_updates --gold_images_path=/radump/`.
     - It validates the gold images and installs the new grid and DB homes (about 13 min in one sample).
     - Success: the output reaches `End: Alter Appliance`, prints the new home paths, and ends with "Please run 'racli update appliance' to finish patch process".
@@ -285,12 +286,13 @@ Running the same archive again is safe, because nodes that are already staged ar
     - `zdlra_patch_run.sh --continue <run id>` does the same from the jump server. It reuses the blackout and the suspended OEM jobs from the first attempt, then watches, resumes jobs and ends the blackout as usual.
     - The approval must still be valid (today 24h), possibly with a separate limit for continuing.
     - All three `racli` steps (`preinstall`, `alter`, `update`) can be run again after a failure, so continuing simply reruns the failed one.
+    - If continuing reruns the precheck, it also marks pre-install as not done, so pre-install runs again (the precheck rolled back its RPM).
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
 - [x] Operator approval of the precheck, and background runs
 - [ ] Email or webhook notification (most useful for background runs)
-- [ ] Exadata infrastructure patching with `patchmgr`. The order in the window is: RA upgrade, compute, cells, switches. The `cells` phase sits after `patch2` for now and moves into place as the others are built:
+- [ ] Exadata infrastructure patching with `patchmgr`. The order in the window is: RA upgrade, cells, compute, switches. The `cells` phase sits after `patch2` for now and moves into place as the others are built:
   - [x] Storage cells (`cells` phase; rolling is handled by `patchmgr` itself)
   - [x] Compute nodes (`compute`, from the jump server; see "Compute nodes" above). Both passes are run from the jump server, with each `patchmgr` detached on the node so nothing can cut it short:
     - Pass 1: on node 1, `patchmgr -dbnodes` (the other nodes) `-precheck ... -nomodify_at_prereq`, then `-upgrade`. Node 2 reboots.
