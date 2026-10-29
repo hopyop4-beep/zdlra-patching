@@ -73,7 +73,7 @@ RA_UPDATE_WARN_MINUTES=240
 # to under /radump/patches/tmp; the folder's name is read from the zip.
 CELL_GROUP_FILE="/root/cell_group"
 CELL_PREP_STEPS=(-patch_check_prereq -reset_force -cleanup)   # before -patch, in order
-CELL_PATCH_EXTRA_ARGS=()             # e.g. (-ignore_alerts); TODO(site): check whether -ignore_alerts is always needed
+CELL_PATCH_EXTRA_ARGS=()             # none needed (-ignore_alerts is not used); e.g. (-smtp_from ...)
 # patchmgr runs in a session of its own and is never stopped by the script (an
 # interrupted patchmgr session can cause major problems). Past this long, the script
 # only logs a warning and keeps waiting.

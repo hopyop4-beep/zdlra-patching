@@ -133,7 +133,7 @@ CELL_PREP_STEPS=(-patch_check_prereq -reset_force -cleanup)
 CELL_PATCH_EXTRA_ARGS=()
 # patchmgr is never stopped by this script; past this long a warning is logged.
 CELL_PATCH_WARN_MINUTES=360     # per patchmgr command (about 2 hours for 17 cells)
-# TODO(site): check whether -patch should always use -ignore_alerts.
+# -ignore_alerts is not needed (checked by the site), so nothing is added by default.
 DCLI="dcli"
 
 # SQL on the appliance, as the raAutomation account (see the config example).
