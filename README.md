@@ -253,7 +253,7 @@ Running the same archive again is safe, because nodes that are already staged ar
     - The node records each finished phase, and `zdlra_patch.sh --continue --run-id <id>` skips them, reruns the one that failed, and carries on. For `update`, `racli` resumes on its own.
     - `zdlra_patch_run.sh --continue <run id>` does the same from the jump server. It reuses the blackout and the suspended OEM jobs from the first attempt, then watches, resumes jobs and ends the blackout as usual.
     - The approval must still be valid (today 24h), possibly with a separate limit for continuing.
-    - To check: whether `racli run preinstall` and `racli alter appliance` can safely be run again after a failure.
+    - All three `racli` steps (`preinstall`, `alter`, `update`) can be run again after a failure, so continuing simply reruns the failed one.
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
