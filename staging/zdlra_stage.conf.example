@@ -19,7 +19,7 @@ CONF_GLOB="patch.conf_*"
 
 # Settings in the conf file that are rewritten for each appliance.
 COMPONENT_VARS=(COMPUTE_NODE COMPUTE_NODE_01 CELL_NODE CELL_PATCH_LAUNCH_NODE
-                SWITCHE_TYPE SWITCHES IB_SWITCHES RA_DATABASE)
+                SWITCH_TYPE SWITCHES IB_SWITCHES RA_DATABASE)
 
 # Group files on the appliance's first compute node, one host name per line. If one
 # is missing or empty, the script pauses and asks you to create it.
@@ -32,7 +32,7 @@ SWITCH_GROUP_FILE="/root/switch_group"  # -> SWITCHES and IB_SWITCHES (RoCE swit
 # are joined with commas. The defaults read the group files above. To change one,
 # assign that entry (the script declares the list and fills in the rest), e.g.:
 #   COMPONENT_CMDS[RA_DATABASE]='su - oracle -c "srvctl config database" | head -1'
-# TODO(site): the defaults for SWITCHE_TYPE (network interface names: re* = roce,
+# TODO(site): the defaults for SWITCH_TYPE (network interface names: re* = roce,
 # ib* = IB) and RA_DATABASE (srvctl as oracle) are still guesses.
 # components/<appliance>.conf overrides any value.
 COMPONENTS_DIR="$(dirname "${BASH_SOURCE[0]}")/components"

@@ -27,7 +27,7 @@
 # reads /root/dbs_group (COMPUTE_NODE; its first line is COMPUTE_NODE_01 and
 # CELL_PATCH_LAUNCH_NODE), /root/cell_group (CELL_NODE) and the switch group file
 # (SWITCHES and IB_SWITCHES; on a RoCE rack both hold the RoCE switches) on the first
-# compute node, and works out SWITCHE_TYPE and RA_DATABASE there (COMPONENT_CMDS).
+# compute node, and works out SWITCH_TYPE and RA_DATABASE there (COMPONENT_CMDS).
 # If a group file is missing, the script pauses and asks you to create it.
 # dbs_group must match the compute nodes being staged. components/<appliance>.conf
 # next to this script can override any value. An appliance with any value missing
@@ -94,7 +94,7 @@ CONF_SUBDIR="conf"
 CONF_GLOB="patch.conf_*"        # exactly one, e.g. patch.conf_4-003351830
 # Settings in the conf file rewritten for each appliance.
 COMPONENT_VARS=(COMPUTE_NODE COMPUTE_NODE_01 CELL_NODE CELL_PATCH_LAUNCH_NODE
-                SWITCHE_TYPE SWITCHES IB_SWITCHES RA_DATABASE)
+                SWITCH_TYPE SWITCHES IB_SWITCHES RA_DATABASE)
 # Group files on the appliance's first compute node. They must exist and not be
 # empty; if one is missing the script pauses and asks you to create it.
 # TODO(site): confirm the switch group file name.
@@ -105,7 +105,7 @@ SWITCH_GROUP_FILE="/root/switch_group"  # switches, one per line (RoCE switches 
 # node (as SSH_USER). Its output lines are joined with commas.
 # components/<appliance>.conf, if present, overrides any of them.
 # On a RoCE rack the RoCE switch names go in IB_SWITCHES as well, so both read the
-# switch group file. TODO(site): SWITCHE_TYPE and RA_DATABASE are still guesses.
+# switch group file. TODO(site): SWITCH_TYPE and RA_DATABASE are still guesses.
 # The config can set any entry; default_component_cmds fills in the rest after the
 # config is loaded, so it uses the group file paths from the config.
 declare -A COMPONENT_CMDS=()
@@ -119,7 +119,7 @@ default_component_cmds() {
         [CELL_NODE]="cat '$CELL_GROUP_FILE'"
         [SWITCHES]="cat '$SWITCH_GROUP_FILE'"
         [IB_SWITCHES]="cat '$SWITCH_GROUP_FILE'"
-        [SWITCHE_TYPE]='if ls /sys/class/net | grep -qE "^re[0-9]"; then echo roce; elif ls /sys/class/net | grep -qE "^ib[0-9]"; then echo IB; fi'
+        [SWITCH_TYPE]='if ls /sys/class/net | grep -qE "^re[0-9]"; then echo roce; elif ls /sys/class/net | grep -qE "^ib[0-9]"; then echo IB; fi'
         [RA_DATABASE]='su - oracle -c "srvctl config database" | head -1'
     )
     local key
@@ -459,9 +459,9 @@ step_components() {
         done < <(grep -E '^[[:space:]]*[A-Z_][A-Z0-9_]*[[:space:]]*=' "$file")
     fi
 
-    case "${COMP[SWITCHE_TYPE]:-}" in
+    case "${COMP[SWITCH_TYPE]:-}" in
         roce|RoCE|ROCE|ib|IB) ;;
-        *) die "${z}: SWITCHE_TYPE must be roce or IB (got '${COMP[SWITCHE_TYPE]:-}'). Check COMPONENT_CMDS[SWITCHE_TYPE] or set it in $file." ;;
+        *) die "${z}: SWITCH_TYPE must be roce or IB (got '${COMP[SWITCH_TYPE]:-}'). Check COMPONENT_CMDS[SWITCH_TYPE] or set it in $file." ;;
     esac
     local missing=()
     for key in "${COMPONENT_VARS[@]}"; do
