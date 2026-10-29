@@ -235,16 +235,21 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [x] Staging unzips `patches.zip` in `/radump` and rewrites `patch.conf_<SR>` for the appliance; the patch script relies on the staged record (the `stage` phase is gone)
 - [x] Unzip the compute, cell and switch patches into `tmp/`, and move the RA patches to `/raacfs/raadmin/tmp`
 - [ ] What to do with the `FILES_PATCHBASE`, `STAGE_FILE` and `FRAMEWORK_FILE` files, if anything
-- [ ] RA software upgrade (3 steps; to come back to):
-  - [ ] Step 1, pre-install: `racli run preinstall --zdlra_release_file=/raacfs/raadmin/tmp/<zip>`, as root on node 1. Still to check:
-    - whether the precheck already covers it
-    - which `FILES_RA` file is the release zip (probably the first)
-  - [ ] Step 2, update: `racli update appliance [--ignore_incidents]`, as root on node 1. This replaces the current `patch1`/`patch2` phases, because one run does Alter Appliance (new grid and DB homes), Patch Appliance step 1 (prechecks) and step 2 (the patch).
+- [ ] RA software upgrade (3 steps, as root on node 1; to come back to). These replace the current `patch1`/`patch2` phases (`racli patch appliance --step=1/2`):
+  - [ ] Step 1, pre-install: `racli run preinstall --zdlra_release_file=/raacfs/raadmin/tmp/<zip>`.
+    - Success: the output reaches `End: ra_preinstall post cleanup`, every `CHECK:`/`HOST:` line says PASS, and it writes `/root/.ra_preinstall.install`.
+    - Still to check: whether the precheck already covers it, and which `FILES_RA` file is the release zip (probably the first).
+  - [ ] Step 2, alter: `racli alter appliance --online_updates --gold_images_path=/radump/`.
+    - It validates the gold images and installs the new grid and DB homes (about 13 min in one sample).
+    - Success: the output reaches `End: Alter Appliance`, prints the new home paths, and ends with "Please run 'racli update appliance' to finish patch process".
+  - [ ] Step 3, update: `racli update appliance [--ignore_incidents]`. It runs Patch Appliance step 1 (prechecks) and step 2 (stops services, switches homes, installs the patch, datapatch, OS/AHF updates, re-enables services).
     - Success: the output reaches `End: Patch Recovery Appliance - Step [Patch]`.
-    - On an error it stops. Running it again carries on from where it failed, so the script can offer a rerun.
-    - It takes about 2h10m (one sample).
-    - Still to check: when to use `--ignore_incidents`, and whether the "Please run 'racli update appliance' to finish patch process" message ever means a second run is needed.
-  - [ ] Step 3: to be described
+    - On an error it stops; running it again carries on from where it failed. About 2h in one sample.
+    - If step 2 wasn't run first, `update` runs Alter Appliance itself.
+  - Still to check:
+    - when to use `--ignore_incidents`
+    - whether step 2 (`--online_updates`) can run ahead of the maintenance window
+    - where the gold images in `/radump/` come from (staged with the patches?)
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
