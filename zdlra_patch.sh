@@ -103,7 +103,9 @@ CELL_PREP_STEPS=(-patch_check_prereq -reset_force -cleanup)
 # Added to "patchmgr -cells <group> -patch", e.g. (-ignore_alerts) or
 # (-smtp_from "addr" -smtp_to "addr1 addr2").
 CELL_PATCH_EXTRA_ARGS=()
-CELL_PATCH_TIMEOUT_MINUTES=360  # per patchmgr command (about 2 hours for 17 cells)
+# patchmgr is never stopped by this script; past this long a warning is logged.
+CELL_PATCH_WARN_MINUTES=360     # per patchmgr command (about 2 hours for 17 cells)
+# TODO(site): check whether -patch should always use -ignore_alerts.
 DCLI="dcli"
 
 # SQL on the appliance, as the raadmin account (see the config example).
@@ -187,6 +189,10 @@ trap 'on_error $LINENO $?' ERR
 # job) or on a refused approval check must not overwrite the status of the run.
 on_exit() {
     local rc=$?
+    # A detached command (patchmgr, racli) still running: leave it, say so, hand it the lock.
+    if (( ! STATUS_MODE && ! LOCK_HANDED_OFF )) && detached_leave_running; then
+        return
+    fi
     if (( ! STATUS_MODE && ! LOCK_HANDED_OFF )); then
         if (( rc == 0 )); then
             if [[ -n "$FINAL_STATUS" ]]; then set_status "$FINAL_STATUS"
@@ -793,18 +799,142 @@ report_cell_plan() {
     fi
 }
 
-# Run one patchmgr command from the patch folder, with a time limit, saving its
-# output. Success: exit 0, "SUCCESS: Completed run of command", "Exit status:0",
-# and no FAILED lines. $1 = folder, $2 = log name, rest = patchmgr arguments.
+# ---------------------------------------------------------------------------
+# Commands that must never be cut short (patchmgr, and the racli upgrade steps)
+# ---------------------------------------------------------------------------
+# run_detached starts the command in a session of its own (setsid, nohup, no
+# terminal), writing straight to its log: nothing that happens to this script or the
+# operator's ssh session can reach it. This script only waits, shows the log as it
+# grows, and reads the exit status from a file. Nothing here ever stops the command:
+# there is no time limit (past WARN minutes a warning is logged), and if this script
+# itself stops, the run's status says the command is still running and the lock
+# passes to it, so nothing can start over it.
+DETACHED_PID=""
+DETACHED_LOG=""
+DETACHED_WHAT=""
+DETACHED_RC=""
+DETACHED_POLL_SECONDS=10
+
+detached_pidfile() { echo "${RUN_DIR}/detached.pid"; }
+
+# The command this run started, if it is still running: prints "pid N".
+detached_running() {
+    local f pid
+    f="$(detached_pidfile)"
+    [[ -f "$f" ]] || return 1
+    pid="$(cat "$f")"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && { echo "pid $pid"; return 0; }
+    return 1
+}
+
+# Called when this script stops (exit trap, or INT/TERM/HUP) while the command runs:
+# leave it alone, say so in the status, and hand it the lock.
+detached_leave_running() {
+    [[ -n "$DETACHED_PID" ]] && kill -0 "$DETACHED_PID" 2>/dev/null || return 1
+    err "Stopping the script, NOT ${DETACHED_WHAT}: it keeps running (pid $DETACHED_PID). Log: $DETACHED_LOG"
+    err "Do not start it again until it has finished."
+    set_status "${DETACHED_WHAT} still running (pid $DETACHED_PID), log $DETACHED_LOG; do not start it again until it finishes"
+    echo "$DETACHED_PID" > "$LOCK_FILE"
+    LOCK_HANDED_OFF=1
+    return 0
+}
+
+detached_on_signal() {
+    trap - INT TERM HUP
+    detached_leave_running || true
+    exit 1
+}
+
+# run_detached WHAT DIR LOG WARN_MINUTES COMMAND [ARGS...]
+# Runs COMMAND in DIR, detached as above; sets DETACHED_RC to its exit status.
+run_detached() {
+    local what="$1" dir="$2" log="$3" warn_min="$4"; shift 4
+    local rcfile="${log}.rc" pidfile
+    pidfile="$(detached_pidfile)"
+    rm -f -- "$rcfile" "$pidfile"
+    : > "$log"
+    info "[exec] cd $dir && $* (own session; log: $log)"
+
+    local launcher=(nohup)
+    if command -v setsid >/dev/null 2>&1; then
+        launcher=(setsid nohup)
+    else
+        warn "setsid not found: $what runs with nohup only."
+    fi
+    # The inner bash records its pid, runs the command, then writes the exit status.
+    "${launcher[@]}" bash -c 'echo $$ > "$1"; cd "$2" || exit 97; shift 3; "$@"; echo $? > "$0"' \
+        "$rcfile" "$pidfile" "$dir" _ "$@" >> "$log" 2>&1 < /dev/null &
+    local waited=0
+    while [[ ! -s "$pidfile" ]] && (( waited < 30 )); do sleep 1; waited=$((waited + 1)); done
+    DETACHED_PID="$(cat "$pidfile" 2>/dev/null)"
+    DETACHED_LOG="$log"
+    DETACHED_WHAT="$what"
+    [[ -n "$DETACHED_PID" ]] || die "$what did not start. Log: $log"
+    trap detached_on_signal INT TERM HUP
+
+    # Show the log as it grows: print the lines added since the last look, and once
+    # more at the end so nothing is missed.
+    local shown=0 start warned=0
+    show_new_lines() {
+        local total
+        total=$(wc -l < "$log")
+        (( total > shown )) && sed -n "$(( shown + 1 )),${total}p" "$log" >&2
+        shown=$total
+    }
+    start=$(date +%s)
+    while [[ ! -s "$rcfile" ]]; do
+        show_new_lines
+        if ! kill -0 "$DETACHED_PID" 2>/dev/null; then
+            sleep 2
+            [[ -s "$rcfile" ]] && break
+            show_new_lines
+            DETACHED_PID=""
+            die "$what ended without an exit status (was it killed?). Log: $log"
+        fi
+        if (( ! warned && $(date +%s) - start > warn_min * 60 )); then
+            warn "$what has run for over ${warn_min} min; still waiting (not stopping it). Log: $log"
+            warned=1
+        fi
+        sleep "$DETACHED_POLL_SECONDS"
+    done
+    show_new_lines
+    trap - INT TERM HUP
+    DETACHED_RC="$(tr -dc '0-9' < "$rcfile")"
+    DETACHED_PID=""
+    rm -f -- "$pidfile"
+    cat "$log" >> "$LOG_FILE"
+    (( DETACHED_RC != 97 )) || die "$what: cannot enter $dir. Log: $log"
+}
+
+# A patchmgr this run started, or any "patchmgr -cells" on this node, still running.
+patchmgr_running() {
+    local pid
+    detached_running && return 0
+    if ps -eo pid=,args= >/dev/null 2>&1; then
+        pid="$(ps -eo pid=,args= | awk '$2 ~ /patchmgr$/ && / -cells / { print $1; exit }')"
+        [[ -n "$pid" ]] && { echo "pid $pid"; return 0; }
+    fi
+    return 1
+}
+
+# Called before the cells phase is marked as running, so a refusal leaves the run's
+# status as it is.
+cells_refuse_if_running() {
+    local running
+    if running="$(patchmgr_running)"; then
+        PRESERVE_STATUS=1
+        die "A patchmgr is still running ($running). Wait for it to finish before starting the cells phase again."
+    fi
+}
+
+# Run one patchmgr command from the patch folder, never cut short (run_detached).
+# Success: exit 0, "SUCCESS: Completed run of command", "Exit status:0", and no
+# FAILED lines. $1 = folder, $2 = log name, rest = patchmgr arguments.
 run_patchmgr() {
     local dir="$1" name="$2"; shift 2
-    local log="${RUN_DIR}/cells_${name}.log" rc=0 step="-$name"
-    info "[exec] cd $dir && ./patchmgr $* (log: $log)"
-    # Output goes to its own log, the run log and the screen. PIPESTATUS is read inside
-    # the group, before anything else can reset it.
-    { ( cd "$dir" && timeout "$(( CELL_PATCH_TIMEOUT_MINUTES * 60 ))" ./patchmgr "$@" ) 2>&1 \
-        | tee "$log" | tee -a "$LOG_FILE" >&2; rc="${PIPESTATUS[0]}"; } || true
-    (( rc != 124 )) || die "patchmgr $step timed out after ${CELL_PATCH_TIMEOUT_MINUTES} min. Log: $log"
+    local log="${RUN_DIR}/cells_${name}.log" rc step="-$name"
+    run_detached "cells patchmgr $step" "$dir" "$log" "$CELL_PATCH_WARN_MINUTES" ./patchmgr "$@"
+    rc="$DETACHED_RC"
     local failed
     failed="$(grep -E 'FAILED' "$log" | head -10 || true)"
     if [[ -n "$failed" ]]; then
@@ -976,6 +1106,7 @@ main() {
         # Check approval before marking a changing step as running, so a refusal leaves
         # the run's status as it was.
         [[ "$p" == patch* || "$p" == quiesce || "$p" == cells ]] && require_approval
+        [[ "$p" == cells ]] && cells_refuse_if_running
         CURRENT_PHASE="$p"
         set_status "running $p"
         "phase_${p}"

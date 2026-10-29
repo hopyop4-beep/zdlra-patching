@@ -15,7 +15,7 @@ The script breaks a patch into phases. You can run them one at a time or all tog
 | `snapshot` | Saves configuration and state before patching |
 | `patch1` | Runs `racli <patch\|upgrade> appliance --step=1` |
 | `patch2` | Runs `racli <patch\|upgrade> appliance --step=2` |
-| `cells` | Patches the storage cells from the first compute node. In the cell patch folder (worked out from the `FILES_CELL` zip, because its name changes per release), it runs `patchmgr -cells /root/cell_group` with `-patch_check_prereq`, `-reset_force`, `-cleanup` and then `-patch` (plus `CELL_PATCH_EXTRA_ARGS`). Each step must report a completed run with exit status 0 and no `FAILED` lines. Afterwards every cell must be on `TARGET_CELL_VERSION` from the conf file, according to both `patchmgr` and `dcli ... imageinfo -ver` |
+| `cells` | Patches the storage cells from the first compute node. Each `patchmgr` runs in a session of its own and is never stopped by the script (see below). In the cell patch folder (worked out from the `FILES_CELL` zip, because its name changes per release), it runs `patchmgr -cells /root/cell_group` with `-patch_check_prereq`, `-reset_force`, `-cleanup` and then `-patch` (plus `CELL_PATCH_EXTRA_ARGS`). Each step must report a completed run with exit status 0 and no `FAILED` lines. Afterwards every cell must be on `TARGET_CELL_VERSION` from the conf file, according to both `patchmgr` and `dcli ... imageinfo -ver` |
 | `postcheck` | Runs the checks again and compares the result with the snapshot |
 | `resume` | Resumes only the replication servers that this run paused |
 | `report` | Writes a summary of the run |
@@ -46,6 +46,14 @@ vi zdlra_patch.conf
 Each run writes its log, snapshots and report to `$WORK_DIR/<run id>/`.
 
 The patches must be staged first with `staging/zdlra_stage.sh` (see [Staging the patches](#staging-the-patches-windows-pc)). The approval covers the staged archive: if a different bundle is staged after you approve, the patch steps refuse to run.
+
+## Commands that must not be interrupted
+
+An interrupted `patchmgr` session (and, later, an interrupted `racli` upgrade step) can cause major problems. So the script runs each one in a session of its own (`setsid`, `nohup`, no terminal), with its output written straight to a log file:
+
+- **Nothing reaches it:** stopping the script, a dropped SSH session or a closed terminal doesn't affect the command. The script only waits for it, shows its log as it grows, and reads its exit status from a file.
+- **No time limit stops it:** past `CELL_PATCH_WARN_MINUTES`, the script only logs a warning and keeps waiting.
+- **If the script itself stops while the command runs,** it says so, and leaves the command running. The run's status becomes "… still running (pid …), do not start it again until it finishes". The lock passes to the command, so nothing can start over it until it ends.
 
 ## Replication and incoming backups
 
@@ -236,7 +244,7 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [x] Staging unzips `patches.zip` in `/radump` and rewrites `patch.conf_<SR>` for the appliance; the patch script relies on the staged record (the `stage` phase is gone)
 - [x] Unzip the compute, cell and switch patches into `tmp/`, and move the RA patches to `/raacfs/raadmin/tmp`
 - [ ] What to do with the `FILES_PATCHBASE`, `STAGE_FILE` and `FRAMEWORK_FILE` files, if anything
-- [ ] RA software upgrade (3 steps, as root on node 1; to come back to). These replace the current `patch1`/`patch2` phases (`racli patch appliance --step=1/2`):
+- [ ] RA software upgrade (3 steps, as root on node 1; to come back to). These replace the current `patch1`/`patch2` phases (`racli patch appliance --step=1/2`). Each `racli` step must run through `run_detached`, like `patchmgr`, so nothing can cut it short:
   - [ ] Step 1, pre-install: `racli run preinstall --zdlra_release_file=/raacfs/raadmin/tmp/<zip>`.
     - Success: the output reaches `End: ra_preinstall post cleanup`, every `CHECK:`/`HOST:` line says PASS, and it writes `/root/.ra_preinstall.install`.
     - Still to check: whether the precheck already covers it, and which `FILES_RA` file is the release zip (probably the first).
