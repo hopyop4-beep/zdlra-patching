@@ -21,20 +21,24 @@ CONF_GLOB="patch.conf_*"
 COMPONENT_VARS=(COMPUTE_NODE COMPUTE_NODE_01 CELL_NODE CELL_PATCH_LAUNCH_NODE
                 SWITCHE_TYPE SWITCHES IB_SWITCHES RA_DATABASE)
 
-# How each value is found on the appliance: a command run on its first compute
-# node; output lines are joined with commas. COMPUTE_NODE, COMPUTE_NODE_01 and
-# CELL_PATCH_LAUNCH_NODE come from the node list. Assign entries one by one (the
-# script declares the list). components/<appliance>.conf overrides any value.
-# TODO(site): first guesses; confirm or replace each command.
-COMPONENT_CMDS[CELL_NODE]='cat /root/cell_group'
-COMPONENT_CMDS[SWITCHE_TYPE]='if ls /sys/class/net | grep -qE "^re[0-9]"; then echo roce; elif ls /sys/class/net | grep -qE "^ib[0-9]"; then echo IB; fi'
-COMPONENT_CMDS[SWITCHES]='cat /root/roce_switches.lst'
-COMPONENT_CMDS[IB_SWITCHES]='cat /root/ib_switches.lst 2>/dev/null || true'
-COMPONENT_CMDS[RA_DATABASE]='su - oracle -c "srvctl config database" | head -1'
+# Group files on the appliance's first compute node, one host name per line. If one
+# is missing or empty, the script pauses and asks you to create it.
+DBS_GROUP_FILE="/root/dbs_group"        # -> COMPUTE_NODE; first line -> COMPUTE_NODE_01, CELL_PATCH_LAUNCH_NODE
+CELL_GROUP_FILE="/root/cell_group"      # -> CELL_NODE
+SWITCH_GROUP_FILE="/root/switch_group"  # -> SWITCHES and IB_SWITCHES (RoCE switches on a RoCE rack)
+                                        # TODO(site): confirm this file name
+
+# How each value is found: a command run on the first compute node; output lines
+# are joined with commas. The defaults read the group files above. To change one,
+# assign that entry (the script declares the list and fills in the rest), e.g.:
+#   COMPONENT_CMDS[RA_DATABASE]='su - oracle -c "srvctl config database" | head -1'
+# TODO(site): the defaults for SWITCHE_TYPE (network interface names: re* = roce,
+# ib* = IB) and RA_DATABASE (srvctl as oracle) are still guesses.
+# components/<appliance>.conf overrides any value.
 COMPONENTS_DIR="$(dirname "${BASH_SOURCE[0]}")/components"
 
-# Settings that name patch files; each file must be in patches/.
-# TODO(site): confirm the names and the value format (comma- or space-separated).
+# Settings that name patch files (comma-separated); each file must be in patches/.
+# TODO(site): confirm the setting names (FILSE_YUM as written?).
 FILE_VARS_RE='^(FILES?_[A-Z0-9_]+|FILSE_[A-Z0-9_]+|STAGE_FILE|FRAMEWORK_FILE)$'
 
 # Record written in the unzipped folder on each node (read by zdlra_patch.sh).

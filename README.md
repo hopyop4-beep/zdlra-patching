@@ -192,11 +192,22 @@ Copy the archive and its `.sha256` file to a Linux jump server that can reach th
 
 **Before touching any node**, the jump server reads `patch.conf_<SR>` from the zip and checks that every file its `FILES_*` settings name (plus `STAGE_FILE` and `FRAMEWORK_FILE`) is in `patches/patches/`. It then works out each appliance's component settings and shows them as old → new:
 
-- `COMPUTE_NODE`, `COMPUTE_NODE_01` and `CELL_PATCH_LAUNCH_NODE` come from the compute node list.
-- `CELL_NODE`, `SWITCHE_TYPE`, `SWITCHES`, `IB_SWITCHES` and `RA_DATABASE` come from the appliance itself: the jump server runs `COMPONENT_CMDS` on the first compute node. **These commands are first guesses (`TODO(site)` in `zdlra_stage.conf.example`).**
-- `staging/components/<appliance>.conf` can override any value (see `components/example.conf`).
+The values come from the appliance itself, read on the first compute node:
 
-If any value can't be found, the appliance is refused, so a conf file never keeps another appliance's components. The one exception is `IB_SWITCHES`, which may be empty on a RoCE rack.
+| Setting | Source |
+|---|---|
+| `COMPUTE_NODE` | `/root/dbs_group` |
+| `COMPUTE_NODE_01`, `CELL_PATCH_LAUNCH_NODE` | First line of `/root/dbs_group` |
+| `CELL_NODE` | `/root/cell_group` |
+| `SWITCHES`, `IB_SWITCHES` | The switch group file. On a RoCE rack, both hold the RoCE switch names |
+| `SWITCHE_TYPE` | Network interface names: `re*` means `roce`, `ib*` means `IB` (`TODO(site)`: not confirmed) |
+| `RA_DATABASE` | `srvctl config database` as oracle (`TODO(site)`: not confirmed) |
+
+- **Missing group files:** if a group file is missing or empty, the script **pauses**. It names the files to create on that node, waits for you to press Enter, and checks again; type `q` to stop. With no terminal attached, it stops instead.
+- **Mismatch check:** `dbs_group` must list the compute nodes being staged. If it doesn't, the appliance is refused.
+- **Overrides:** `staging/components/<appliance>.conf` can override any value (see `components/example.conf`). Each command can be changed in `zdlra_stage.conf` (`COMPONENT_CMDS`).
+
+If any value can't be found, the appliance is refused, so a conf file never keeps another appliance's components.
 
 **Older versions:** with `OLD_VERSION_ACTION=backup` (the default), the first older `patches.zip` and `/radump/patches/` are kept as `<name>.<date>.bak`. After that, only that oldest backup is kept.
 
@@ -214,7 +225,7 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [ ] Fill in the replication and incoming-backup SQL (placeholders in place)
 - [ ] Verify the bundle checksum
 - [x] Staging unzips `patches.zip` in `/radump` and rewrites `patch.conf_<SR>` for the appliance; the patch script relies on the staged record (the `stage` phase is gone)
-- [ ] Confirm the commands that find each component on the appliance (`COMPONENT_CMDS`)
+- [ ] Confirm the switch group file name, and how to find `SWITCHE_TYPE` and `RA_DATABASE` on the appliance
 - [ ] What to do with each patch file named by the `FILES_*` settings
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout

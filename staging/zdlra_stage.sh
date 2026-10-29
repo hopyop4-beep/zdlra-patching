@@ -24,11 +24,14 @@
 #               the result, and writes /radump/patches/ZDLRA_STAGED.txt
 #
 # Component values, per appliance, come from the appliance itself: the jump server
-# runs COMPONENT_CMDS on its first compute node (cells, switch type, switches, RA
-# database), and COMPUTE_NODE, COMPUTE_NODE_01 and CELL_PATCH_LAUNCH_NODE come from
-# the node list. components/<appliance>.conf next to this script can override any
-# of them. An appliance with any value missing is refused, so a conf file with
-# another appliance's components is never left behind.
+# reads /root/dbs_group (COMPUTE_NODE; its first line is COMPUTE_NODE_01 and
+# CELL_PATCH_LAUNCH_NODE), /root/cell_group (CELL_NODE) and the switch group file
+# (SWITCHES and IB_SWITCHES; on a RoCE rack both hold the RoCE switches) on the first
+# compute node, and works out SWITCHE_TYPE and RA_DATABASE there (COMPONENT_CMDS).
+# If a group file is missing, the script pauses and asks you to create it.
+# dbs_group must match the compute nodes being staged. components/<appliance>.conf
+# next to this script can override any value. An appliance with any value missing
+# is refused, so a conf file with another appliance's components is never left behind.
 #
 # Older versions (OLD_VERSION_ACTION=backup, the default): the first older version
 # is kept as <name>.<date>.bak. Once a backup exists, later older versions are
@@ -92,21 +95,41 @@ CONF_GLOB="patch.conf_*"        # exactly one, e.g. patch.conf_4-003351830
 # Settings in the conf file rewritten for each appliance.
 COMPONENT_VARS=(COMPUTE_NODE COMPUTE_NODE_01 CELL_NODE CELL_PATCH_LAUNCH_NODE
                 SWITCHE_TYPE SWITCHES IB_SWITCHES RA_DATABASE)
+# Group files on the appliance's first compute node. They must exist and not be
+# empty; if one is missing the script pauses and asks you to create it.
+# TODO(site): confirm the switch group file name.
+DBS_GROUP_FILE="/root/dbs_group"        # compute nodes, one per line
+CELL_GROUP_FILE="/root/cell_group"      # storage cells, one per line
+SWITCH_GROUP_FILE="/root/switch_group"  # switches, one per line (RoCE switches on a RoCE rack)
 # How each component value is found: a command run on the appliance's first compute
-# node (as SSH_USER). Its output lines are joined with commas. COMPUTE_NODE,
-# COMPUTE_NODE_01 and CELL_PATCH_LAUNCH_NODE come from the node list instead.
+# node (as SSH_USER). Its output lines are joined with commas.
 # components/<appliance>.conf, if present, overrides any of them.
-# TODO(site): these commands are first guesses; confirm or replace each one.
-declare -A COMPONENT_CMDS=(
-    [CELL_NODE]='cat /root/cell_group'
-    [SWITCHE_TYPE]='if ls /sys/class/net | grep -qE "^re[0-9]"; then echo roce; elif ls /sys/class/net | grep -qE "^ib[0-9]"; then echo IB; fi'
-    [SWITCHES]='cat /root/roce_switches.lst'
-    [IB_SWITCHES]='cat /root/ib_switches.lst 2>/dev/null || true'
-    [RA_DATABASE]='su - oracle -c "srvctl config database" | head -1'
-)
+# On a RoCE rack the RoCE switch names go in IB_SWITCHES as well, so both read the
+# switch group file. TODO(site): SWITCHE_TYPE and RA_DATABASE are still guesses.
+# The config can set any entry; default_component_cmds fills in the rest after the
+# config is loaded, so it uses the group file paths from the config.
+declare -A COMPONENT_CMDS=()
+
+default_component_cmds() {
+    local first="grep -v '^[[:space:]]*\$' '$DBS_GROUP_FILE' | head -1"
+    declare -A defaults=(
+        [COMPUTE_NODE]="cat '$DBS_GROUP_FILE'"
+        [COMPUTE_NODE_01]="$first"
+        [CELL_PATCH_LAUNCH_NODE]="$first"
+        [CELL_NODE]="cat '$CELL_GROUP_FILE'"
+        [SWITCHES]="cat '$SWITCH_GROUP_FILE'"
+        [IB_SWITCHES]="cat '$SWITCH_GROUP_FILE'"
+        [SWITCHE_TYPE]='if ls /sys/class/net | grep -qE "^re[0-9]"; then echo roce; elif ls /sys/class/net | grep -qE "^ib[0-9]"; then echo IB; fi'
+        [RA_DATABASE]='su - oracle -c "srvctl config database" | head -1'
+    )
+    local key
+    for key in "${!defaults[@]}"; do
+        [[ -n "${COMPONENT_CMDS[$key]:-}" ]] || COMPONENT_CMDS[$key]="${defaults[$key]}"
+    done
+}
 # Settings in the conf file that name patch files (checked in PATCHES_SUBDIR).
-# TODO(site): confirm the variable names (FILSE_YUM as written?) and the value
-# format; values are split on commas and spaces.
+# Values are comma-separated file names. TODO(site): confirm the variable names
+# (FILSE_YUM as written?).
 FILE_VARS_RE='^(FILES?_[A-Z0-9_]+|FILSE_[A-Z0-9_]+|STAGE_FILE|FRAMEWORK_FILE)$'
 STAGED_RECORD_NAME="ZDLRA_STAGED.txt"   # written in the unzipped folder on each node
 
@@ -212,7 +235,7 @@ validate() {
     local z p v
     for z in "${ZDLRAS[@]}"; do safe_host "$z" || die "Bad appliance name: $z"; done
     [[ "$SSH_USER" =~ ^[A-Za-z0-9._-]+$ ]] || die "Bad ssh user: $SSH_USER"
-    for p in "$REMOTE_DIR" "$EXTRACT_ROOT"; do
+    for p in "$REMOTE_DIR" "$EXTRACT_ROOT" "$DBS_GROUP_FILE" "$CELL_GROUP_FILE" "$SWITCH_GROUP_FILE"; do
         safe_path "$p" || die "Path has unsupported characters: $p"
     done
     for v in "$PATCHES_SUBDIR" "$CONF_SUBDIR" "$CONF_GLOB" "$STAGED_RECORD_NAME"; do
@@ -310,8 +333,10 @@ verify_local() {
         [[ "$key" =~ $FILE_VARS_RE ]] || continue
         value="$(sed -E "s/^\"(.*)\"$/\\1/; s/^'(.*)'$/\\1/" <<<"$value")"
         local parts=()
-        IFS=', ' read -r -a parts <<<"$value"    # no word splitting/globbing of the raw value
+        IFS=',' read -r -a parts <<<"$value"    # comma-separated; no globbing of the raw value
         for f in ${parts[@]+"${parts[@]}"}; do
+            f="$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$f")"
+            [[ -n "$f" ]] || continue
             f="$(basename "$f")"
             [[ "$f" =~ ^[A-Za-z0-9._+-]+$ ]] || die "Unexpected file name in $key: $f"
             PATCH_FILES+=("$f")
@@ -357,12 +382,43 @@ step_nodes() {
     done
 }
 
+# The group files must exist (and not be empty) on the appliance's first compute
+# node. If any is missing, pause and ask the operator to create them, then check
+# again; without a terminal to ask, stop instead.
+wait_for_group_files() {
+    local z="$1" node="${NODES[0]}" f missing reply
+    while :; do
+        missing=()
+        for f in "$DBS_GROUP_FILE" "$CELL_GROUP_FILE" "$SWITCH_GROUP_FILE"; do
+            on_node "$node" "[ -s '$f' ]" || missing+=("$f")
+        done
+        (( ${#missing[@]} == 0 )) && return 0
+
+        err "${z}: missing or empty on ${node}: ${missing[*]}"
+        {
+            echo "  Create them on ${node}, one host name per line:"
+            for f in "${missing[@]}"; do
+                case "$f" in
+                    "$DBS_GROUP_FILE")    echo "    $f    the compute nodes" ;;
+                    "$CELL_GROUP_FILE")   echo "    $f    the storage cells" ;;
+                    "$SWITCH_GROUP_FILE") echo "    $f    the switches (RoCE switches on a RoCE rack)" ;;
+                esac
+            done
+        } | tee -a "$LOG_FILE" >&2
+        [[ -t 0 ]] || die "${z}: cannot wait for the files (no terminal). Create them and run again."
+        reply=""
+        read -r -p "  Press Enter when they are in place to check again, or type q to stop: " reply || reply=q
+        [[ "$reply" != q ]] || die "${z}: stopped by the operator; group files missing on ${node}."
+    done
+}
+
 # Component values for the appliance, in order of precedence:
 #   1. components/<appliance>.conf (optional override; read as KEY=VALUE lines, not run)
-#   2. COMPONENT_CMDS, run on the appliance's first compute node
-#   3. the node list (COMPUTE_NODE, COMPUTE_NODE_01, CELL_PATCH_LAUNCH_NODE)
-# Every COMPONENT_VARS entry must end up set. Empty is accepted only when the
-# override file sets it on purpose, or for IB_SWITCHES on a RoCE rack.
+#   2. COMPONENT_CMDS, run on the appliance's first compute node (group files etc.)
+#   3. the node list (COMPUTE_NODE, COMPUTE_NODE_01, CELL_PATCH_LAUNCH_NODE), if the
+#      command for them is unset
+# Every COMPONENT_VARS entry must end up set; empty is accepted only when the
+# override file sets it on purpose.
 step_components() {
     local z="$1" file="${COMPONENTS_DIR}/${1}.conf" key value
     COMP=()
@@ -371,6 +427,8 @@ step_components() {
     COMP[COMPUTE_NODE_01]="${NODES[0]}"
     COMP[CELL_PATCH_LAUNCH_NODE]="${NODES[0]}"
     for key in COMPUTE_NODE COMPUTE_NODE_01 CELL_PATCH_LAUNCH_NODE; do source[$key]="node list"; done
+
+    wait_for_group_files "$z"
 
     # Ask the appliance.
     local out
@@ -405,17 +463,19 @@ step_components() {
         roce|RoCE|ROCE|ib|IB) ;;
         *) die "${z}: SWITCHE_TYPE must be roce or IB (got '${COMP[SWITCHE_TYPE]:-}'). Check COMPONENT_CMDS[SWITCHE_TYPE] or set it in $file." ;;
     esac
-    local missing=() rocerack=0
-    [[ "${COMP[SWITCHE_TYPE],,}" == roce ]] && rocerack=1
+    local missing=()
     for key in "${COMPONENT_VARS[@]}"; do
-        [[ -n "${COMP[$key]:-}" || -n "${given[$key]:-}" ]] && continue
-        if [[ "$key" == IB_SWITCHES ]] && (( rocerack )); then
-            source[$key]="empty on a RoCE rack"
-            continue
-        fi
-        missing+=("$key")
+        [[ -n "${COMP[$key]:-}" || -n "${given[$key]:-}" ]] || missing+=("$key")
     done
     (( ${#missing[@]} == 0 )) || die "${z}: could not find ${missing[*]} on the appliance. Check COMPONENT_CMDS, or set them in $file."
+
+    # dbs_group must list the compute nodes being staged (short names compared), or
+    # the conf would point at the wrong nodes.
+    local listed staged
+    listed="$(tr ',' '\n' <<<"${COMP[COMPUTE_NODE]}" | sed 's/\..*//' | sort -u | paste -sd' ' -)"
+    staged="$(printf '%s\n' "${NODES[@]}" | sed 's/\..*//' | sort -u | paste -sd' ' -)"
+    [[ "$listed" == "$staged" ]] \
+        || die "${z}: COMPUTE_NODE ($listed, ${source[COMPUTE_NODE]:-?}) does not match the compute nodes being staged ($staged). Fix $DBS_GROUP_FILE on ${NODES[0]} or the inventory."
 
     info "${z}: component settings for ${CONF_NAME} (was -> now):"
     for key in "${COMPONENT_VARS[@]}"; do
@@ -656,6 +716,7 @@ stage_appliance() {
 main() {
     parse_args "$@"
     load_config
+    default_component_cmds
     validate
     init_log
     verify_local
