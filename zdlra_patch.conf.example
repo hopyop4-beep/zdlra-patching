@@ -129,3 +129,15 @@ QUIESCE_POLL_SECONDS=60
 QUIESCE_TIMEOUT_MINUTES=120          # stop before patching if still busy after this long
 QUIESCE_WAIT_FOR_BACKUPS=1           # 0 = never wait for incoming backups (or use --skip-backup-wait)
 QUIESCE_ALLOW_UNCONFIGURED=0
+
+# verify (the last phase; the jump server runs it after resuming the OEM jobs and
+# ending the blackout): new backups, and replication if this run paused it, must
+# arrive. Each query prints one number. {since} becomes
+# to_date('<time>', 'YYYY-MM-DD HH24:MI:SS'): when the resume phase ran. Nothing
+# arriving within VERIFY_TIMEOUT_MINUTES is a warning only. An empty query is not
+# checked (a warning).
+# TODO(site): fill in both queries.
+VERIFY_BACKUPS_SQL=""                # backups received since {since}
+VERIFY_REPLICATION_SQL=""            # replication completed since {since}
+VERIFY_POLL_SECONDS=300
+VERIFY_TIMEOUT_MINUTES=210           # archivelog backups run every 3 hours

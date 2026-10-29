@@ -17,6 +17,9 @@
 #   8. patch       the phases after "compute" run on the node, and are watched
 #   9. finish      when the run completes: OEM jobs resumed, then the blackout ended.
 #                  When it fails, both are left as they are while you investigate.
+#  10. verify      ("verify" in the phase list) the node waits for new backups, and
+#                  replication if it paused it, to arrive (a warning if none do in
+#                  time); then the run's report is shown here, with the version table
 #
 # Compute nodes ("compute" in the phase list): patchmgr runs on one compute node and
 # upgrades another, which reboots. First the first node upgrades each of the others,
@@ -61,7 +64,7 @@ CONFIG_FILE="${SCRIPT_DIR}/zdlra_jump.conf"
 INVENTORY="${SCRIPT_DIR}/../staging/appliances.conf"
 ZDLRA=""
 DRY_RUN=1
-PHASES="quiesce snapshot ra_preinstall ra_alter ra_update cells compute switches postcheck resume report"
+PHASES="quiesce snapshot ra_preinstall ra_alter ra_update cells compute switches postcheck resume report verify"
 SKIP_BACKUP_WAIT=0
 RESUME_RUN_ID=""
 WATCH_RUN_ID=""
@@ -145,6 +148,7 @@ parse_args() {
     [[ "$PHASES" =~ ^[a-z0-9_\ ]+$ ]] || die "Bad phase list: $PHASES"
     [[ " $PHASES " != *" precheck "* ]] || die "Leave precheck out of --phases; it always runs first."
     [[ "$(grep -o '\bcompute\b' <<<"$PHASES" | wc -l)" -le 1 ]] || die "compute can appear only once in --phases."
+    [[ " $PHASES " != *" verify "* || "$(xargs <<<"$PHASES")" == *verify ]] || die "verify must be the last phase in --phases."
     local id
     for id in "$RESUME_RUN_ID" "$WATCH_RUN_ID" "$CONTINUE_RUN_ID"; do
         [[ -z "$id" || "$id" =~ ^[0-9_]+$ ]] || die "Bad run id: $id"
@@ -285,10 +289,13 @@ print_undo() {
     return 0
 }
 
-# The node phases before and after "compute" in PHASES.
-phases_before() { sed -E 's/(^| )compute( |$).*//' <<<"$PHASES" | xargs; }
-phases_after()  { [[ " $PHASES " == *" compute "* ]] && sed -E 's/.*(^| )compute( |$)//' <<<"$PHASES" | xargs || true; }
+# The node phases before and after "compute" in PHASES ("verify" runs on its own,
+# after the OEM jobs are resumed).
+no_verify()     { awk '{ for (i = 1; i <= NF; i++) if ($i != "verify") printf "%s ", $i }' | xargs; }
+phases_before() { sed -E 's/(^| )compute( |$).*//' <<<"$PHASES" | no_verify; }
+phases_after()  { [[ " $PHASES " == *" compute "* ]] && sed -E 's/.*(^| )compute( |$)//' <<<"$PHASES" | no_verify || true; }
 has_compute()   { [[ " $PHASES " == *" compute "* ]]; }
+has_verify()    { [[ " $PHASES " == *" verify "* ]]; }
 
 # Where this run is, on the jump server, so --watch can pick it up:
 #   stage=before|compute|after|done, and during compute the pass being worked on.
@@ -586,6 +593,9 @@ on_interrupt() {
         warn "Watch again:     $0 -z $ZDLRA --watch $RUN_ID$(xflag)"
         warn "Watching again picks up the compute pass where it was, then carries on."
         print_undo
+    elif [[ "$STAGE" == verify ]]; then
+        warn "Stopped watching. verify keeps running on $NODE; the patching is finished, OEM jobs are resumed and the blackout ended."
+        warn "Watch again:     $0 -z $ZDLRA --watch $RUN_ID$(xflag)"
     elif [[ "$STAGE" == precheck ]]; then
         warn "Stopped watching. The precheck keeps running on $NODE; nothing has changed yet."
         warn "Continue later:  $0 -z $ZDLRA --resume $RUN_ID$(xflag)"
@@ -709,7 +719,8 @@ main() {
         STAGE="patch"
         stage="$(state_get stage)"; stage="${stage:-before}"
         info "Picking up run $RUN_ID at: $stage"
-        if (( ! DRY_RUN )); then
+        [[ "$stage" != done ]] || die "Run $RUN_ID is already done. Report: ssh ${SSH_USER}@${NODE} $REMOTE_SCRIPT -c $REMOTE_CONFIG --report --run-id $RUN_ID"
+        if (( ! DRY_RUN )) && [[ "$stage" != verify ]]; then
             BLACKOUT_ACTIVE=1
             (( ${#OEM_JOBS_SUSPEND_CMD[@]} == 0 )) || JOBS_SUSPENDED=1
         fi
@@ -751,15 +762,43 @@ main() {
         [[ -z "$(phases_after)" ]] || step_patch "$(phases_after)"
     fi
 
-    if watch_until_done >/dev/null; then
-        state_set stage=done
+    if [[ "$stage" != verify ]]; then
+        watch_until_done >/dev/null || patch_failed
         info "Run $RUN_ID completed on $NODE."
         step_jobs_resume
         step_blackout_stop
-        info "Done. Report on $NODE: $REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID"
-    else
-        patch_failed
+        JOBS_SUSPENDED=0; BLACKOUT_ACTIVE=0
+        if has_verify; then
+            if (( KEEP_BLACKOUT )); then
+                warn "verify not run: the OEM jobs are still suspended (--keep-blackout). Once they are resumed: ssh ${SSH_USER}@${NODE} $(remote_cmd --run-id "$RUN_ID" verify)"
+            else
+                state_set stage=verify
+                step_patch verify
+                stage=verify
+            fi
+        fi
     fi
+    if [[ "$stage" == verify ]]; then
+        STAGE="verify"
+        watch_until_done >/dev/null || {
+            err "verify failed on $NODE. The patching itself completed; OEM jobs are resumed and the blackout ended."
+            err "Details:         ssh ${SSH_USER}@${NODE} $REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID"
+            err "Run it again:    $0 -z $ZDLRA --continue $RUN_ID$(xflag)"
+            exit 1
+        }
+    fi
+    state_set stage=done
+    step_show_report
+    info "Done. Report on $NODE: $REMOTE_SCRIPT -c $REMOTE_CONFIG --report --run-id $RUN_ID"
+}
+
+# The run's report from the node: summary, version table, backup/replication check.
+step_show_report() {
+    local report
+    report="$(on_node "$REMOTE_SCRIPT -c $REMOTE_CONFIG --report --run-id $RUN_ID" 2>/dev/null)" \
+        || { warn "Could not read the report from $NODE."; return 0; }
+    info "== report (run $RUN_ID on $NODE) =="
+    printf '%s\n' "$report"
 }
 
 patch_failed() {
@@ -785,6 +824,9 @@ step_continue() {
             [[ -n "$(phases_after)" ]] || die "Nothing to continue after compute."
             info "Continuing the node phases after compute."
             step_patch "$(phases_after)" continue ;;
+        verify:*failed*)
+            info "Running verify again."
+            step_patch verify continue ;;
         compute:*)
             info "Continuing the compute passes." ;;
         done:*)

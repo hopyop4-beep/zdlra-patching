@@ -31,9 +31,16 @@
 #               (--roceswitch-precheck, then --upgrade); InfiniBand racks are skipped
 #               with a warning (needs an approved precheck). The jump server upgrades
 #               the compute nodes between cells and switches
-#   postcheck   rerun health checks and compare with the snapshot
+#   postcheck   rerun health checks, compare with the snapshot, and show a table of
+#               every component's version against its target (RA, compute nodes,
+#               cells, switches); a compute node, cell or switch on another version
+#               fails it
 #   resume      resume the replication that quiesce paused
-#   report      write a summary of this run
+#   report      write a summary of this run, with the version table
+#   verify      after the OEM backup jobs are resumed: wait for new backups to
+#               arrive, and replication too if this run paused it (up to
+#               VERIFY_TIMEOUT_MINUTES). Nothing arriving in time is a warning only.
+#               The jump server runs it after resuming the jobs and ending the blackout
 #
 # Options:
 #   -c, --config FILE   config file (default: ./zdlra_patch.conf)
@@ -50,6 +57,7 @@
 #                       it stopped). Rerunning the precheck marks ra_preinstall as not
 #                       done, because the precheck rolls back what it installed
 #   -s, --status        show the state of the latest run, or of --run-id ID
+#       --report        show the report of the latest run, or of --run-id ID
 #       --skip-backup-wait  quiesce does not wait for incoming backups to finish
 #   -h, --help          show this help
 
@@ -58,9 +66,9 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.6.0"
+VERSION="0.7.0"
 
-ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells switches postcheck resume report)
+ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells switches postcheck resume report verify)
 
 # ---------------------------------------------------------------------------
 # Defaults (override in the config file)
@@ -73,6 +81,7 @@ DETACH=0
 APPROVE_MODE=0
 BG_CHILD=0                      # set internally on the detached process
 STATUS_MODE=0
+REPORT_MODE=0
 FINAL_STATUS=""                 # status to record on success instead of "completed"
 PRESERVE_STATUS=0               # 1 = a failure now leaves the run's status unchanged
 SKIP_BACKUP_WAIT=0
@@ -175,6 +184,16 @@ QUIESCE_POLL_SECONDS=60
 QUIESCE_TIMEOUT_MINUTES=120     # give up waiting after this long
 QUIESCE_WAIT_FOR_BACKUPS=1      # 0 = do not wait for incoming backups (same as --skip-backup-wait)
 QUIESCE_ALLOW_UNCONFIGURED=0    # 1 = a real run may continue with these SQL settings empty
+
+# verify phase: after patching, new backups (and replication, if this run paused it)
+# must arrive. Each query prints one number; {since} becomes
+# to_date('<time>', 'YYYY-MM-DD HH24:MI:SS'), the time the resume phase ran (or, without
+# it, when verify started). An empty query is not checked (a warning).
+# TODO(site): both queries are still to be filled in.
+VERIFY_BACKUPS_SQL=""           # backups received since {since}
+VERIFY_REPLICATION_SQL=""       # replication completed since {since}
+VERIFY_POLL_SECONDS=300
+VERIFY_TIMEOUT_MINUTES=210      # archivelog backups run every 3 hours; then a warning only
 
 RUN_ID=""
 RUN_DIR=""
@@ -311,6 +330,7 @@ parse_args() {
             --skip-backup-wait) SKIP_BACKUP_WAIT=1; shift ;;
             --continue)      CONTINUE=1; shift ;;
             -s|--status)     STATUS_MODE=1; shift ;;
+            --report)        STATUS_MODE=1; REPORT_MODE=1; shift ;;
             --bg-child)      BG_CHILD=1; ASSUME_YES=1; shift ;;
             -h|--help)       usage; exit 0 ;;
             all)             PHASES+=("${ALL_PHASES[@]}"); shift ;;
@@ -386,6 +406,11 @@ show_status() {
         dir="${dir%/}"
     fi
     [[ -n "$dir" && -d "$dir" ]] || die "No runs found in $WORK_DIR"
+    if (( REPORT_MODE )); then
+        [[ -f "${dir}/report.txt" ]] || die "Run $(basename "$dir") has no report yet."
+        cat "${dir}/report.txt"
+        return 0
+    fi
     echo "Run:     $(basename "$dir")"
     echo "Folder:  $dir"
     echo "Status:  $(cat "${dir}/status" 2>/dev/null || echo unknown)"
@@ -807,6 +832,8 @@ phase_quiesce() {
 phase_resume() {
     info "== resume =="
     local paused="${RUN_DIR}/replication_paused.txt" server
+    # verify counts backups and replication from this time on.
+    (( DRY_RUN )) || date '+%F %T' > "${RUN_DIR}/resumed_at"
     if [[ ! -s "$paused" ]]; then
         info "This run paused no replication servers; nothing to resume."
         return 0
@@ -818,7 +845,6 @@ phase_resume() {
         info "Resumed replication server $server"
     done < "$paused"
     (( DRY_RUN )) || mv "$paused" "${paused%.txt}_resumed_$(date +%Y%m%d_%H%M%S).txt"
-    # TODO: confirm replication catches up and backups arrive again.
 }
 
 phase_snapshot() {
@@ -1256,7 +1282,7 @@ switch_version() {
 # The line worth showing from a version output: the NXOS/version line, else the first.
 switch_version_line() {
     local line
-    line="$(grep -iE 'nxos|version' <<<"$1" | head -1)"
+    line="$(grep -iE 'nxos|version' <<<"$1" | head -1 || true)"
     [[ -n "$line" ]] || line="$(head -1 <<<"$1")"
     sed -E 's/^[[:space:]]+//' <<<"$line"
 }
@@ -1322,7 +1348,191 @@ phase_postcheck() {
     if (( POSTCHECK_RERUN_PRECHECK )); then
         run_external_precheck after
     fi
-    # TODO: confirm backups and replication resume, test a restore validate.
+    version_summary
+}
+
+# ---------------------------------------------------------------------------
+# Version table (postcheck)
+# ---------------------------------------------------------------------------
+VERSION_ROWS=()
+VERSION_BAD=0
+VERSION_SOFT=0
+VERSION_UNREAD=0
+
+# One row of the table. $1 component, $2 name, $3 version now (empty = could not be
+# read), $4 target, $5 1 = on target, $6 "soft" = a mismatch is a warning only.
+version_row() {
+    local result
+    if [[ -z "$3" ]]; then
+        result="UNREAD"; VERSION_UNREAD=$((VERSION_UNREAD + 1))
+    elif [[ -z "$4" ]]; then
+        result="NO TARGET"; VERSION_UNREAD=$((VERSION_UNREAD + 1))
+    elif (( $5 )); then
+        result="OK"
+    elif [[ "${6:-}" == soft ]]; then
+        result="CHECK"; VERSION_SOFT=$((VERSION_SOFT + 1))
+    else
+        result="MISMATCH"; VERSION_BAD=$((VERSION_BAD + 1))
+    fi
+    VERSION_ROWS+=("$(printf '%-9s %-20s %-34s %-24s %s' "$1" "$2" "${3:-?}" "${4:-<not set>}" "$result")")
+}
+
+# Rows from "name: version" lines (dcli ... imageinfo -ver), one per expected name.
+# $1 component, $2 target, $3 dcli output, rest = names
+image_rows() {
+    local comp="$1" target="$2" text="$3" name ver; shift 3
+    for name in "$@"; do
+        ver="$(sed -nE "s/^[[:space:]]*${name//./[.]}:[[:space:]]*([0-9][0-9.]*)[[:space:]]*$/\1/p" <<<"$text" | head -1 || true)"
+        version_row "$comp" "$name" "$ver" "$target" "$([[ -n "$ver" && "$ver" == "$target" ]] && echo 1 || echo 0)"
+    done
+}
+
+# Every component's version against its target, shown and saved to versions.txt.
+# A compute node, cell or switch on another version fails (dry run: a warning, as
+# nothing has been patched); the RA line is a warning only, like after ra_update.
+version_summary() {
+    info "Versions after patching:"
+    VERSION_ROWS=(); VERSION_BAD=0; VERSION_SOFT=0; VERSION_UNREAD=0
+    local target text line names=() sw
+
+    target="$(conf_value TARGET_RA_VERSION || true)"
+    text="$("$RACLI" version 2>&1 || true)"
+    line="$(grep -F -- "${target:-@@none@@}" <<<"$text" | head -1 || true)"
+    [[ -n "$line" ]] || line="$(grep -iE 'version' <<<"$text" | head -1 || true)"
+    line="$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$line")"
+    version_row RA "$(hostname -s 2>/dev/null || hostname)" "$line" "$target" "$([[ -n "$target" ]] && grep -qF -- "$target" <<<"$text" && echo 1 || echo 0)" soft
+
+    target="$(conf_value TARGET_COMPUTE_VERSION || true)"
+    IFS=',' read -r -a names <<<"$(staged_value component_COMPUTE_NODE | tr -d ' ')"
+    if (( ${#names[@]} )); then
+        text="$("$DCLI" -l root -c "$(IFS=,; echo "${names[*]}")" 'imageinfo -ver' 2>&1 || true)"
+        image_rows compute "$target" "$text" "${names[@]}"
+    else
+        version_row compute "-" "" "$target" 0
+    fi
+
+    target="$(target_cell_version)"
+    mapfile -t names < <(sed '/^[[:space:]]*$/d' "$CELL_GROUP_FILE" 2>/dev/null)
+    if (( ${#names[@]} )); then
+        text="$(cell_versions || true)"
+        image_rows cell "$target" "$text" "${names[@]}"
+    else
+        version_row cell "-" "" "$target" 0
+    fi
+
+    target="$(conf_value TARGET_SWITCH_VERSION || true)"
+    if [[ "$(switch_type || true)" != roce ]]; then
+        VERSION_ROWS+=("$(printf '%-9s %-20s %-34s %-24s %s' switch "-" "(not RoCE: not patched here)" "${target:-<not set>}" "SKIPPED")")
+    elif [[ -s "$SWITCH_GROUP_FILE" ]]; then
+        while IFS= read -r sw; do
+            [[ -n "$sw" ]] || continue
+            if text="$(switch_version "$sw")"; then
+                version_row switch "$sw" "$(switch_version_line "$text")" "$target" "$([[ -n "$target" ]] && grep -qF -- "$target" <<<"$text" && echo 1 || echo 0)"
+            else
+                version_row switch "$sw" "" "$target" 0
+            fi
+        done < "$SWITCH_GROUP_FILE"
+    else
+        version_row switch "-" "" "$target" 0
+    fi
+
+    {
+        printf '%-9s %-20s %-34s %-24s %s\n' COMPONENT NAME "VERSION NOW" TARGET RESULT
+        printf '%s\n' "${VERSION_ROWS[@]}"
+    } > "${RUN_DIR}/versions.txt"
+    while IFS= read -r line; do info "  $line"; done < "${RUN_DIR}/versions.txt"
+
+    (( VERSION_UNREAD == 0 )) || warn "$VERSION_UNREAD version(s) could not be read or have no target; check them by hand."
+    (( VERSION_SOFT == 0 )) || warn "racli version does not show TARGET_RA_VERSION; check: $RACLI version"
+    if (( VERSION_BAD )); then
+        if (( DRY_RUN )); then
+            warn "[dry-run] $VERSION_BAD component(s) not on target yet (nothing was patched)."
+        else
+            die "$VERSION_BAD component(s) not on their target version (see the table above, saved to ${RUN_DIR}/versions.txt)."
+        fi
+    else
+        info "Version table saved to ${RUN_DIR}/versions.txt"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# verify: backups and replication arrive again after patching
+# ---------------------------------------------------------------------------
+# Did this run pause any replication (resumed or not)?
+run_paused_replication() {
+    cat "${RUN_DIR}"/replication_paused*.txt 2>/dev/null | grep -q .
+}
+
+phase_verify() {
+    info "== verify (backups and replication after patching) =="
+    local out="${RUN_DIR}/verify.txt" since since_sql checks=() line
+    since="$(cat "${RUN_DIR}/resumed_at" 2>/dev/null || date '+%F %T')"
+    since_sql="to_date('${since}', 'YYYY-MM-DD HH24:MI:SS')"
+    echo "Since $since (up to ${VERIFY_TIMEOUT_MINUTES} min):" > "$out"
+    note() { echo "  $*" >> "$out"; }
+
+    if [[ -z "$RA_SQL_CONNECT" || "$RA_SQL_CONNECT" == *"<password>"* ]]; then
+        warn "RA_SQL_CONNECT is not set up; backups and replication not checked."
+        note "not checked: RA_SQL_CONNECT is not set up"
+    else
+        if [[ -n "$VERIFY_BACKUPS_SQL" ]]; then
+            checks+=(backups)
+        else
+            warn "VERIFY_BACKUPS_SQL is not set (TODO in config); backups not checked."
+            note "backups: not checked (VERIFY_BACKUPS_SQL not set)"
+        fi
+        if ! run_paused_replication; then
+            info "This run paused no replication; replication not checked."
+            note "replication: not checked (this run paused none)"
+        elif [[ -n "$VERIFY_REPLICATION_SQL" ]]; then
+            checks+=(replication)
+        else
+            warn "VERIFY_REPLICATION_SQL is not set (TODO in config); replication not checked."
+            note "replication: not checked (VERIFY_REPLICATION_SQL not set)"
+        fi
+    fi
+
+    local pending=(${checks[@]+"${checks[@]}"}) left c q n waited=0 limit=$(( VERIFY_TIMEOUT_MINUTES * 60 ))
+    while (( ${#pending[@]} )); do
+        left=()
+        for c in "${pending[@]}"; do
+            if [[ "$c" == backups ]]; then q="$VERIFY_BACKUPS_SQL"; else q="$VERIFY_REPLICATION_SQL"; fi
+            if n="$(sql_count "${q//\{since\}/$since_sql}")"; then
+                if (( n > 0 )); then
+                    info "$c: $n since $since - OK"
+                    note "$c: OK ($n since $since, after $(( waited / 60 )) min)"
+                    continue
+                fi
+            else
+                warn "Could not count $c; trying again."
+            fi
+            left+=("$c")
+        done
+        pending=(${left[@]+"${left[@]}"})
+        (( ${#pending[@]} )) || break
+        if (( DRY_RUN )); then
+            info "[dry-run] would wait up to ${VERIFY_TIMEOUT_MINUTES} min for: ${pending[*]}"
+            for c in "${pending[@]}"; do note "$c: none yet (dry run, no wait)"; done
+            break
+        fi
+        if (( waited >= limit )); then
+            for c in "${pending[@]}"; do
+                warn "No $c since $since after ${VERIFY_TIMEOUT_MINUTES} min. Check them by hand."
+                note "$c: WARNING - none since $since within ${VERIFY_TIMEOUT_MINUTES} min"
+            done
+            break
+        fi
+        info "Waiting for ${pending[*]} since $since ($(( waited / 60 )) of ${VERIFY_TIMEOUT_MINUTES} min)"
+        set_status "running verify: waiting for ${pending[*]} ($(( waited / 60 )) of ${VERIFY_TIMEOUT_MINUTES} min)"
+        sleep "$VERIFY_POLL_SECONDS"
+        waited=$(( waited + VERIFY_POLL_SECONDS ))
+    done
+
+    local report="${RUN_DIR}/report.txt"
+    if [[ -f "$report" ]]; then
+        { echo; echo "Backups and replication after patching:"; cat "$out"; } >> "$report"
+    fi
+    while IFS= read -r line; do info "$line"; done < "$out"
 }
 
 phase_report() {
@@ -1331,7 +1541,7 @@ phase_report() {
     {
         echo "ZDLRA patch run $RUN_ID"
         echo "Host:      $(hostname)"
-        echo "Done:      $(paste -sd' ' "${RUN_DIR}/phases_done" 2>/dev/null)"
+        echo "Done:      $(paste -sd' ' "${RUN_DIR}/phases_done" 2>/dev/null || true)"
         echo "Staged:    $(staged_value archive) (SHA-256 $(staged_value sha256))"
         echo "Dry run:   $DRY_RUN"
         echo "Phases:    ${PHASES[*]}"
@@ -1339,10 +1549,14 @@ phase_report() {
             echo "Approved:  $(sed -n 's/^approved_by=//p' "$approval") at $(sed -n 's/^approved_at=//p' "$approval")"
         fi
         local paused
-        paused="$(cat "${RUN_DIR}"/replication_paused*.txt 2>/dev/null | sort -u | tr '
-' ' ')"
+        paused="$(cat "${RUN_DIR}"/replication_paused*.txt 2>/dev/null | sort -u | paste -sd' ' || true)"
         echo "Paused:    ${paused:-no replication servers}"
         echo "Log:       $LOG_FILE"
+        if [[ -f "${RUN_DIR}/versions.txt" ]]; then
+            echo
+            echo "Versions after patching:"
+            sed 's/^/  /' "${RUN_DIR}/versions.txt"
+        fi
     } > "$report"
     # TODO: optional email/webhook notification (useful when the run is in the background).
     info "Report written to $report"

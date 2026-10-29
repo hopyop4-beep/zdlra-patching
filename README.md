@@ -18,9 +18,10 @@ The script breaks a patch into phases. You can run them one at a time or all tog
 | `ra_update` | Runs `racli update appliance --ignore_incidents`, which patches the appliance (about 2 hours). Success: `End: Patch Recovery Appliance - Step [Patch]`. Afterwards `racli version` should show `TARGET_RA_VERSION` from the conf file (a warning if not) |
 | `cells` | Patches the storage cells from the first compute node. Each `patchmgr` runs in a session of its own and is never stopped by the script (see below). In the cell patch folder (worked out from the `FILES_CELL` zip, because its name changes per release), it runs `patchmgr -cells /root/cell_group` with `-patch_check_prereq`, `-reset_force`, `-cleanup` and then `-patch` (plus `CELL_PATCH_EXTRA_ARGS`). Each step must report a completed run with exit status 0 and no `FAILED` lines. Afterwards every cell must be on `TARGET_CELL_VERSION` from the conf file, according to both `patchmgr` and `dcli ... imageinfo -ver` |
 | `switches` | Upgrades the RoCE switches from the first compute node, in the switch patch folder (worked out from the `FILES_SWITCH` zip, e.g. `patch_switch_24.1.14.0.0.250706`): `patchmgr --roceswitches /root/switch_group --upgrade --roceswitch-precheck` (about 12 minutes in one sample), then `--upgrade`. Each runs in a session of its own and is never stopped by the script, and must report a completed run with exit status 0 and no `FAILED` lines. Afterwards each switch's version (`SWITCH_VERSION_CMD`, by default `ssh admin@<switch> show version`) must show `TARGET_SWITCH_VERSION` from the conf file; a switch that can't be read only gives a warning. On an InfiniBand rack (`SWITCH_TYPE` not `roce`) the phase only warns that the switches were not patched. From the jump server it runs after `compute` |
-| `postcheck` | Runs the checks again and compares the result with the snapshot |
+| `postcheck` | Runs the checks again and compares the result with the snapshot. Then shows a table of every component's version against its target: RA (`racli version`, `TARGET_RA_VERSION`), each compute node and cell (`imageinfo -ver`, `TARGET_COMPUTE_VERSION` and `TARGET_CELL_VERSION`), and each RoCE switch (`TARGET_SWITCH_VERSION`). A compute node, cell or switch on another version fails the phase; the RA line and anything that can't be read are warnings. Saved to `versions.txt` |
 | `resume` | Resumes only the replication servers that this run paused |
-| `report` | Writes a summary of the run |
+| `report` | Writes a summary of the run, with the version table. `zdlra_patch.sh --report --run-id <id>` shows it |
+| `verify` | After the OEM backup jobs are resumed: waits for new backups to arrive (`VERIFY_BACKUPS_SQL`), and replication too if this run paused it (`VERIFY_REPLICATION_SQL`), counted from when `resume` ran. It checks every `VERIFY_POLL_SECONDS` (5 min) for up to `VERIFY_TIMEOUT_MINUTES` (210, as archivelog backups run every 3 hours). Nothing arriving in time is a warning only. The result is added to the report. Both queries are still `TODO` |
 
 You must list phases in this order. You can leave phases out, but you can't reorder them.
 
@@ -169,8 +170,9 @@ cp jump/zdlra_jump.conf.example jump/zdlra_jump.conf   # then edit it
 5. **OEM backup jobs:** `sr_jobs_new.ksh -z <zdlra db> -a s` suspends them, run in `OEM_JOBS_DIR`; at the end `-a r` resumes them. Each appliance's zdlra db value for that script (for example `RA1GF2`) is set in `OEM_JOBS_DB`, and a run stops before it starts if its appliance isn't listed. That script writes another one, `<zdlra db>_suspend_job_<stamp>.ksh`, with one `emcli suspend_job` per job, and the run then executes it (only the file it just created), with the output in the matching `.log`; about 30 minutes is normal. That script runs every command even if some fail, so the run checks the log for a `Job "<name>" suspended successfully` line for every job the script names. Jobs without one are listed as warnings and the run carries on. Resuming at the end works the same way with `-a r`. A dry run only shows what would run. Without `-t`, all the appliance's backup jobs are suspended. A failure is a nonzero exit, or the script's usage text in its output (what it prints for a wrong value), matched by `OEM_JOBS_FAIL_RE`. If suspending fails, patching does not start.
 6. **Patch:** the phases before `compute` start on the node in the background, and the script prints each phase as the node reports it.
 7. **Compute:** the compute nodes are upgraded from the jump server (see below).
-8. **Patch again:** the phases after `compute` (`postcheck`, `resume`, `report`) run on the node.
+8. **Patch again:** the phases after `compute` (`switches`, `postcheck`, `resume`, `report`) run on the node.
 9. **Finish:** when the run completes, `OEM_JOBS_RESUME_CMD` resumes the jobs and then the blackout ends. Pass `--keep-blackout` to leave both as they are. If the run fails, both stay as they are while you investigate, and the script prints the commands to undo them.
+10. **Verify:** `verify` runs on the node, waiting for new backups and replication (up to 3.5 hours by default). Then the report is shown here: the summary, the version table, and the backup and replication results. With `--keep-blackout`, `verify` is not run, as the jobs are still suspended; the script prints the command to run it later.
 
 Ctrl-C only stops watching; the work on the node carries on. To pick up again:
 
@@ -313,6 +315,8 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
 - [x] Operator approval of the precheck, and background runs
 - [ ] Email or webhook notification (most useful for background runs)
+- [x] Version table after patching (`postcheck`), shown in the report
+- [ ] Backups and replication arrive after patching (`verify`): the two queries are still to be filled in
 - [x] Exadata infrastructure patching with `patchmgr`. The order in the window is: RA upgrade, cells, compute, switches. The node runs the RA upgrade, then `cells`; the jump server then runs `compute`; then the node runs `switches`:
   - [x] Storage cells (`cells` phase; rolling is handled by `patchmgr` itself)
   - [x] Compute nodes (`compute`, from the jump server; see "Compute nodes" above). Both passes are run from the jump server, with each `patchmgr` detached on the node so nothing can cut it short:
