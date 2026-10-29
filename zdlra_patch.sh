@@ -99,8 +99,6 @@ REPLICATION_SERVERS_SQL="select remote_ra_dbname from ra_replication_pair where 
 # Shown in the precheck review: every replication server with its state and role.
 REPLICATION_STATUS_SQL="select remote_ra_dbname || '  state=' || replication_server_state || '  role=' || replication_server_role from ra_replication_pair;"
 # Pause/resume each one by its remote_ra_dbname.
-# TODO(site): confirm the procedure and parameter names. If they are wrong, the first
-# pause fails with an SQL error and the run stops before patching.
 REPLICATION_PAUSE_SQL="begin dbms_ra.pause_replication_server(replication_server_name => '{server}'); end;"
 REPLICATION_RESUME_SQL="begin dbms_ra.resume_replication_server(replication_server_name => '{server}'); end;"
 ACTIVE_REPLICATION_SQL=""       # count of replication still in flight

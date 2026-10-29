@@ -70,7 +70,6 @@ RA_SQL_CONNECT=""                    # TODO(site): e.g. "/@raadmin"
 REPLICATION_SERVERS_SQL="select remote_ra_dbname from ra_replication_pair where upper(replication_server_state) = 'RUNNING' and upper(replication_server_role) in ('UPSTREAM','PAIRED');"
 REPLICATION_STATUS_SQL="select remote_ra_dbname || '  state=' || replication_server_state || '  role=' || replication_server_role from ra_replication_pair;"
 # Pause/resume each one by its remote_ra_dbname.
-# TODO(site): confirm the procedure and parameter names.
 REPLICATION_PAUSE_SQL="begin dbms_ra.pause_replication_server(replication_server_name => '{server}'); end;"
 REPLICATION_RESUME_SQL="begin dbms_ra.resume_replication_server(replication_server_name => '{server}'); end;"
 # TODO(site): the two count queries.

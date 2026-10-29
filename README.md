@@ -54,7 +54,7 @@ The `precheck`, `quiesce` and `resume` phases run SQL with `sqlplus` as the raad
 |---|---|
 | `REPLICATION_SERVERS_SQL` | Print the replication to pause, one `remote_ra_dbname` per line. Default: from `ra_replication_pair`, every server whose state is running and whose role is upstream or paired |
 | `REPLICATION_STATUS_SQL` | Shown in the precheck review: every pair with its state and role (read only) |
-| `REPLICATION_PAUSE_SQL` / `REPLICATION_RESUME_SQL` | Statement to run for each one; `{server}` is the `remote_ra_dbname`. Default: `dbms_ra.pause_replication_server` / `resume_replication_server` (procedure name still to be confirmed) |
+| `REPLICATION_PAUSE_SQL` / `REPLICATION_RESUME_SQL` | Statement to run for each one; `{server}` is the `remote_ra_dbname`. Default: `dbms_ra.pause_replication_server` / `resume_replication_server` |
 | `ACTIVE_REPLICATION_SQL` | Print one number: replication still in progress |
 | `ACTIVE_BACKUPS_SQL` | Print one number: incoming backups still running |
 
