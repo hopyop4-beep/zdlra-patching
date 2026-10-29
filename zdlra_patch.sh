@@ -643,8 +643,9 @@ phase_precheck() {
     approve_precheck
 }
 
-# TODO(site): confirm the replication pause process (it may be done from the upstream
-# appliance) and fill in the SQL settings; the steps below are placeholders around them.
+# Pauses the running upstream/paired replication (REPLICATION_SERVERS_SQL), then waits
+# for in-flight replication and incoming backups. TODO(site): RA_SQL_CONNECT and the two
+# count queries (ACTIVE_REPLICATION_SQL, ACTIVE_BACKUPS_SQL) are still to be filled in.
 phase_quiesce() {
     info "== quiesce =="
     local missing
