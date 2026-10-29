@@ -242,14 +242,13 @@ Running the same archive again is safe, because nodes that are already staged ar
   - [ ] Step 2, alter: `racli alter appliance --online_updates --gold_images_path=/radump/`.
     - It validates the gold images and installs the new grid and DB homes (about 13 min in one sample).
     - Success: the output reaches `End: Alter Appliance`, prints the new home paths, and ends with "Please run 'racli update appliance' to finish patch process".
-  - [ ] Step 3, update: `racli update appliance [--ignore_incidents]`. It runs Patch Appliance step 1 (prechecks) and step 2 (stops services, switches homes, installs the patch, datapatch, OS/AHF updates, re-enables services).
+  - [ ] Step 3, update: `racli update appliance --ignore_incidents` (always with `--ignore_incidents`). It runs Patch Appliance step 1 (prechecks) and step 2 (stops services, switches homes, installs the patch, datapatch, OS/AHF updates, re-enables services).
     - Success: the output reaches `End: Patch Recovery Appliance - Step [Patch]`.
     - On an error it stops; running it again carries on from where it failed. About 2h in one sample.
     - If step 2 wasn't run first, `update` runs Alter Appliance itself.
-  - Still to check:
-    - when to use `--ignore_incidents`
-    - whether step 2 (`--online_updates`) can run ahead of the maintenance window
-    - where the gold images in `/radump/` come from (staged with the patches?)
+  - All three run in the maintenance window. Step 2 doesn't need to run ahead of it.
+  - Still to look into:
+    - the gold images in `/radump/` versus the RA patch files in `FILES_RA`: which is which, and where the gold images come from
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
