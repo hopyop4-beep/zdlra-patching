@@ -121,10 +121,11 @@ REPLICATION_STATUS_SQL="select remote_ra_dbname || '  state=' || replication_ser
 REPLICATION_PAUSE_SQL="begin dbms_ra.pause_replication_server(replication_server_name => '{server}'); end;"
 REPLICATION_RESUME_SQL="begin dbms_ra.resume_replication_server(replication_server_name => '{server}'); end;"
 ACTIVE_REPLICATION_SQL=""       # count of replication still in flight
-# Incoming backups: RMAN sessions connected to the appliance database, on all instances.
-ACTIVE_BACKUPS_SQL="select count(*) from gv\$session s where lower(s.program) like '%rman%' or lower(s.module) like '%rman%';"
+# Incoming backups: active RMAN sessions on the appliance database, on all instances
+# (idle sessions that are only connected are not counted).
+ACTIVE_BACKUPS_SQL="select count(*) from gv\$session s where s.status = 'ACTIVE' and (lower(s.program) like '%rman%' or lower(s.module) like '%rman%');"
 # The same sessions, one per line: shown in the precheck review and when the wait gives up.
-ACTIVE_BACKUPS_LIST_SQL="select 'inst=' || s.inst_id || ' sid=' || s.sid || ',' || s.serial# || '  ' || s.program || '  machine=' || s.machine || '  event=' || s.event || '  wait=' || s.seconds_in_wait || 's' from gv\$session s where lower(s.program) like '%rman%' or lower(s.module) like '%rman%' order by s.inst_id, s.sid;"
+ACTIVE_BACKUPS_LIST_SQL="select 'inst=' || s.inst_id || ' sid=' || s.sid || ',' || s.serial# || '  ' || s.program || '  machine=' || s.machine || '  event=' || s.event || '  wait=' || s.seconds_in_wait || 's' from gv\$session s where s.status = 'ACTIVE' and (lower(s.program) like '%rman%' or lower(s.module) like '%rman%') order by s.inst_id, s.sid;"
 QUIESCE_POLL_SECONDS=60
 QUIESCE_TIMEOUT_MINUTES=120     # give up waiting after this long
 QUIESCE_WAIT_FOR_BACKUPS=1      # 0 = do not wait for incoming backups (same as --skip-backup-wait)

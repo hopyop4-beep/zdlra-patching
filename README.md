@@ -65,7 +65,7 @@ The `precheck`, `quiesce` and `resume` phases run SQL with `sqlplus` as the raad
 | `REPLICATION_STATUS_SQL` | Shown in the precheck review: every pair with its state and role (read only) |
 | `REPLICATION_PAUSE_SQL` / `REPLICATION_RESUME_SQL` | Statement to run for each one; `{server}` is the `remote_ra_dbname`. Default: `dbms_ra.pause_replication_server` / `resume_replication_server` |
 | `ACTIVE_REPLICATION_SQL` | Print one number: replication still in progress |
-| `ACTIVE_BACKUPS_SQL` | Print one number: incoming backups still running. Default: RMAN sessions in `gv$session` (program or module like `rman`, any case), on all instances |
+| `ACTIVE_BACKUPS_SQL` | Print one number: incoming backups still running. Default: active RMAN sessions in `gv$session` (status `ACTIVE`, program or module like `rman`, any case), on all instances |
 | `ACTIVE_BACKUPS_LIST_SQL` | Optional: those sessions one per line (instance, sid, program, machine, event, wait), shown in the precheck review and when the wait gives up |
 
 While any of these are empty, a dry run warns and skips `quiesce`, and a real run stops before patching. Set `QUIESCE_ALLOW_UNCONFIGURED=1` to override that.
