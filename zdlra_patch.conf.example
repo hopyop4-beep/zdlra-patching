@@ -8,9 +8,8 @@ PATCH_ACTION="patch"
 
 # Record that staging/zdlra_stage.sh writes once the patches and the precheck are
 # in place. The precheck phase stops if it is missing, and the approval covers the
-# archive it names. TODO(site): placeholder; must match zdlra_stage.conf
-# (PATCH_TARGET_DIR/STAGED_RECORD_NAME).
-STAGED_RECORD="/radump/ra_patches/ZDLRA_STAGED.txt"
+# archive it names. It is written in the unzipped folder, /radump/patches.
+STAGED_RECORD="/radump/patches/ZDLRA_STAGED.txt"
 
 WORK_DIR="/radump/zdlra_patch_runs"
 MIN_FREE_GB=50                       # free space needed in WORK_DIR's filesystem
@@ -25,10 +24,11 @@ REQUIRED_USER="root"
 # The phase fails on any failure that is not waived, on a timeout, or on a
 # non-zero exit code with no summary. Warnings are logged but do not stop the
 # run unless PRECHECK_FAIL_ON_WARN=1.
-# Staging puts the precheck in PRECHECK_TARGET_DIR (zdlra_stage.conf).
-# TODO(site): placeholder path and script name.
-PRECHECK_SCRIPT="/radump/ra_precheck/<precheck-script>"
-PRECHECK_ARGS=()                     # e.g. PRECHECK_ARGS=(--option value)
+# TODO(site): the precheck's real path and arguments (in /radump/patches/bin?).
+# {patch_conf} in PRECHECK_ARGS is replaced with the conf file staging set up for
+# this appliance (/radump/patches/conf/patch.conf_<SR>, from the staged record).
+PRECHECK_SCRIPT="/radump/patches/bin/<precheck-script>"
+PRECHECK_ARGS=()                     # e.g. PRECHECK_ARGS=(-c {patch_conf})
 PRECHECK_TIMEOUT=3600
 PRECHECK_SUMMARY_HEADER="FAILURE SUMMARY"
 PRECHECK_FAIL_PATTERN='\[FAIL\]'

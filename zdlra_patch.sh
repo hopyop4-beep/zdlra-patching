@@ -63,8 +63,8 @@ SKIP_BACKUP_WAIT=0
 RACLI="/opt/oracle.RecoveryAppliance/bin/racli"
 PATCH_ACTION="patch"            # "patch" for a bundle patch, "upgrade" for a release upgrade
 # Written by staging/zdlra_stage.sh once the patches and precheck are in place.
-# TODO(site): placeholder path; must match PATCH_TARGET_DIR/STAGED_RECORD_NAME there.
-STAGED_RECORD="/radump/ra_patches/ZDLRA_STAGED.txt"
+# It names the archive and the patch.conf_<SR> it set up (patch_conf=...).
+STAGED_RECORD="/radump/patches/ZDLRA_STAGED.txt"
 WORK_DIR="/radump/zdlra_patch_runs"
 MIN_FREE_GB=50                  # free space needed in WORK_DIR's filesystem
 REQUIRED_USER="root"
@@ -340,10 +340,20 @@ run_external_precheck() {
     local out_dir="${RUN_DIR}/precheck_${label}"
     local out_file="${out_dir}/output.txt"
     mkdir -p "$out_dir"
-    info "Running precheck ($label): $PRECHECK_SCRIPT ${PRECHECK_ARGS[*]-} (timeout ${PRECHECK_TIMEOUT}s)"
+    # {patch_conf} -> the conf file staging set up for this appliance.
+    local args=() a conf
+    conf="$(staged_value patch_conf)"
+    for a in ${PRECHECK_ARGS[@]+"${PRECHECK_ARGS[@]}"}; do
+        if [[ "$a" == *"{patch_conf}"* ]]; then
+            [[ -n "$conf" ]] || die "PRECHECK_ARGS uses {patch_conf}, but the staged record names no patch_conf."
+            a="${a//\{patch_conf\}/$conf}"
+        fi
+        args+=("$a")
+    done
+    info "Running precheck ($label): $PRECHECK_SCRIPT ${args[*]-} (timeout ${PRECHECK_TIMEOUT}s)"
 
     local rc=0
-    ( cd "$out_dir" && timeout "$PRECHECK_TIMEOUT" "$PRECHECK_SCRIPT" ${PRECHECK_ARGS[@]+"${PRECHECK_ARGS[@]}"} ) \
+    ( cd "$out_dir" && timeout "$PRECHECK_TIMEOUT" "$PRECHECK_SCRIPT" ${args[@]+"${args[@]}"} ) \
         > "$out_file" 2>&1 || rc=$?
     info "Precheck output: $out_file (exit code $rc)"
     (( rc == 124 )) && die "Precheck timed out after ${PRECHECK_TIMEOUT}s."

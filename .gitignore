@@ -8,3 +8,5 @@ staging/manifests/*.txt
 staging/appliances.conf
 jump/zdlra_jump.conf
 staging/zdlra_stage.conf
+staging/components/*.conf
+!staging/components/example.conf

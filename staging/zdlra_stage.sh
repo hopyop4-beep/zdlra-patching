@@ -1,39 +1,49 @@
 #!/usr/bin/env bash
 #
-# zdlra_stage.sh - stage a patch archive on the compute nodes of one or more ZDLRAs
+# zdlra_stage.sh - stage patches.zip on the compute nodes of one or more ZDLRAs
 #
-# Step 2 of staging. Runs on a jump server that holds the patch archive (.zip or .tar
-# from Copy-ZdlraPatches.ps1, plus <archive>.sha256) and can reach the appliances over
-# ssh. For each appliance given with -z, it:
+# Step 2 of staging. Runs on a jump server that holds patches.zip (plus
+# patches.zip.sha256) and can reach the appliances over ssh. Unzipped, the archive is
+# /radump/patches/ with patches/ (the patch files), conf/ (patch.conf_<SR>), bin/,
+# tmp/ and so on. The conf file lists the right patches and versions, but its
+# component settings (COMPUTE_NODE ... RA_DATABASE) come from the appliance it was
+# prepared on, so they are rewritten for each appliance this script stages.
 #
+#   verify      on the jump server: checks the SHA-256, reads patch.conf_<SR> from the
+#               zip, and checks every file its FILES_* variables name is in patches/
 #   nodes       finds the compute nodes (inventory file, or olsnodes on the appliance)
-#   distribute  copies the archive to every node as <remote dir>/patches.zip (skips
-#               nodes that already have it); an older patches.zip there is backed up
-#               or overwritten (OLD_VERSION_ACTION)
+#               and works out the appliance's component values (see below)
+#   distribute  copies the archive to every node as /radump/patches.zip (skips nodes
+#               that already have it); an older patches.zip is backed up or replaced
 #   check       verifies the SHA-256 and free space on every node; nodes already
 #               staged with this archive are skipped from here on
-#   extract     unzips it on every node in <extract root> (default /radump). The zip
-#               holds one top folder (patches/), so this gives /radump/patches/; an
-#               older folder there is backed up or removed (OLD_VERSION_ACTION). A zip
-#               without a single top folder is unzipped into <extract root>/patches_zip/.
-#   place       on every node: moves the patch files to PATCH_TARGET_DIR and the
-#               precheck folder to PRECHECK_TARGET_DIR, updates the precheck's config
-#               file, checks the result, and writes a "staged" record
+#   extract     unzips it in /radump, giving /radump/patches/; an older
+#               /radump/patches/ is backed up or replaced first
+#   configure   on every node: checks the patch files are there, rewrites the
+#               component settings in patch.conf_<SR> (original kept as .orig), checks
+#               the result, and writes /radump/patches/ZDLRA_STAGED.txt
 #
-# Oracle's precheck (run by zdlra_patch.sh) then confirms the files are in place; the
-# staged record tells zdlra_patch.sh which archive was staged.
+# Component values, per appliance, come from the appliance itself: the jump server
+# runs COMPONENT_CMDS on its first compute node (cells, switch type, switches, RA
+# database), and COMPUTE_NODE, COMPUTE_NODE_01 and CELL_PATCH_LAUNCH_NODE come from
+# the node list. components/<appliance>.conf next to this script can override any
+# of them. An appliance with any value missing is refused, so a conf file with
+# another appliance's components is never left behind.
+#
+# Older versions (OLD_VERSION_ACTION=backup, the default): the first older version
+# is kept as <name>.<date>.bak. Once a backup exists, later older versions are
+# replaced without another backup, so only the oldest is kept.
 #
 # STATUS: skeleton. Commands that change something run only with --execute.
 #
 # Usage:
-#   ./zdlra_stage.sh [options] -a ARCHIVE -z ZDLRA [-z ZDLRA ...]
+#   ./zdlra_stage.sh [options] -a patches.zip -z ZDLRA [-z ZDLRA ...]
 #
 # Options:
 #   -a, --archive FILE      archive on this jump server (required)
 #   -s, --sha-file FILE     checksum file (default: ARCHIVE.sha256)
 #   -z, --zdlra NAME        appliance to stage; repeat for several (required)
-#   -c, --config FILE       settings for the place step (default: zdlra_stage.conf next
-#                           to this script, if it exists)
+#   -c, --config FILE       settings (default: zdlra_stage.conf next to this script, if any)
 #   -i, --inventory FILE    appliance-to-nodes list (default: appliances.conf next to
 #                           this script); appliances not listed use olsnodes
 #   -u, --user USER         ssh user on the nodes (default: root)
@@ -51,19 +61,20 @@ set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 ARCHIVE=""
 SHA_FILE=""
 ZDLRAS=()
 CONFIG_FILE="${SCRIPT_DIR}/zdlra_stage.conf"
 INVENTORY="${SCRIPT_DIR}/appliances.conf"
+COMPONENTS_DIR="${SCRIPT_DIR}/components"
 SSH_USER="root"
 REMOTE_DIR="/radump"
-REMOTE_ARCHIVE_NAME="patches.zip"   # name of the archive on the nodes, whatever it is called here
+REMOTE_ARCHIVE_NAME="patches.zip"   # name of the archive on the nodes
 EXTRACT_ROOT="/radump"
-# What to do with an older patches.zip, or an older unpacked folder, on a node:
-#   backup     rename it to <name>.<date>.bak (default)
+# What to do with an older patches.zip, or an older unzipped folder, on a node:
+#   backup     keep the oldest older version as <name>.<date>.bak (default)
 #   overwrite  replace it
 OLD_VERSION_ACTION="backup"
 RELAY=0
@@ -74,25 +85,44 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15)
 LOG_DIR="${HOME}/zdlra_stage_logs"
 LOG_FILE=""
 
-# Place step. TODO(site): the defaults below are placeholders until the real
-# directories and precheck settings are known; override them in zdlra_stage.conf.
-PATCH_TARGET_DIR="/radump/ra_patches"          # where the patch files go
-PATCH_FILES_GLOB="*.zip"                       # which files in the archive are patch files
-PRECHECK_SRC_SUBDIR="precheck"                 # precheck folder inside the archive
-PRECHECK_TARGET_DIR="/radump/ra_precheck"      # where the precheck folder goes
-PRECHECK_CONF_FILE="precheck.conf"             # precheck's config file, inside PRECHECK_TARGET_DIR
-# KEY=VALUE lines to set in that file. {patch_dir} and {precheck_dir} are replaced
-# with PATCH_TARGET_DIR and PRECHECK_TARGET_DIR.
-PRECHECK_CONF_SETTINGS=("PATCH_DIR={patch_dir}")
-STAGED_RECORD_NAME="ZDLRA_STAGED.txt"          # written in PATCH_TARGET_DIR on each node
+# Layout inside the unzipped folder, and the conf file.
+PATCHES_SUBDIR="patches"        # the patch files
+CONF_SUBDIR="conf"
+CONF_GLOB="patch.conf_*"        # exactly one, e.g. patch.conf_4-003351830
+# Settings in the conf file rewritten for each appliance.
+COMPONENT_VARS=(COMPUTE_NODE COMPUTE_NODE_01 CELL_NODE CELL_PATCH_LAUNCH_NODE
+                SWITCHE_TYPE SWITCHES IB_SWITCHES RA_DATABASE)
+# How each component value is found: a command run on the appliance's first compute
+# node (as SSH_USER). Its output lines are joined with commas. COMPUTE_NODE,
+# COMPUTE_NODE_01 and CELL_PATCH_LAUNCH_NODE come from the node list instead.
+# components/<appliance>.conf, if present, overrides any of them.
+# TODO(site): these commands are first guesses; confirm or replace each one.
+declare -A COMPONENT_CMDS=(
+    [CELL_NODE]='cat /root/cell_group'
+    [SWITCHE_TYPE]='if ls /sys/class/net | grep -qE "^re[0-9]"; then echo roce; elif ls /sys/class/net | grep -qE "^ib[0-9]"; then echo IB; fi'
+    [SWITCHES]='cat /root/roce_switches.lst'
+    [IB_SWITCHES]='cat /root/ib_switches.lst 2>/dev/null || true'
+    [RA_DATABASE]='su - oracle -c "srvctl config database" | head -1'
+)
+# Settings in the conf file that name patch files (checked in PATCHES_SUBDIR).
+# TODO(site): confirm the variable names (FILSE_YUM as written?) and the value
+# format; values are split on commas and spaces.
+FILE_VARS_RE='^(FILES?_[A-Z0-9_]+|FILSE_[A-Z0-9_]+|STAGE_FILE|FRAMEWORK_FILE)$'
+STAGED_RECORD_NAME="ZDLRA_STAGED.txt"   # written in the unzipped folder on each node
 
 ARCHIVE_NAME=""
 REMOTE_ARCHIVE=""
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"   # suffix for backups made by this run
-STAGE_DIR=""
+STAGE_DIR=""                    # unzipped folder on the nodes, e.g. /radump/patches
+UNPACK_INTO=""                  # where unzip runs, e.g. /radump
+ZIP_PREFIX=""                   # top folder inside the zip, e.g. "patches/"
+CONF_NAME=""                    # e.g. patch.conf_4-003351830
+CONF_TEXT=""                    # its contents, read from the zip
+PATCH_FILES=()                  # files named by the FILES_* settings
 EXPECTED_SHA=""
 NODES=()
 TODO_NODES=()                   # nodes of the current appliance that still need staging
+declare -A COMP=()              # component values for the current appliance
 
 # ---------------------------------------------------------------------------
 # Logging and helpers
@@ -108,9 +138,10 @@ usage() { awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' 
 trap 'err "Failed at line $LINENO (exit $?). Log: ${LOG_FILE:-none}"' ERR
 
 # Paths and names go into remote shell commands, so allow only plain characters.
-safe_path() { [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ && "$1" != *..* ]]; }
-safe_host() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; }
-safe_name() { [[ "$1" =~ ^[A-Za-z0-9._*-]+$ && "$1" != *..* ]]; }
+safe_path()  { [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ && "$1" != *..* ]]; }
+safe_host()  { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; }
+safe_name()  { [[ "$1" =~ ^[A-Za-z0-9._*-]+$ && "$1" != *..* ]]; }
+safe_value() { [[ "$1" =~ ^[A-Za-z0-9_.,:@-]*$ ]]; }
 
 # Run a command string on a node over ssh.
 on_node() {
@@ -137,7 +168,12 @@ remote_sha() {
 
 # SHA-256 in the node's staged record, or empty if it has none.
 staged_sha() {
-    on_node "$1" "sed -n 's/^sha256=//p' '${PATCH_TARGET_DIR}/${STAGED_RECORD_NAME}' 2>/dev/null" 2>/dev/null || true
+    on_node "$1" "sed -n 's/^sha256=//p' '${STAGE_DIR}/${STAGED_RECORD_NAME}' 2>/dev/null" 2>/dev/null || true
+}
+
+# Value of KEY in conf text ($1 = text, $2 = key), without surrounding quotes.
+conf_value() {
+    sed -n "s/^$2=//p" <<<"$1" | head -1 | sed -E "s/^\"(.*)\"$/\\1/; s/^'(.*)'$/\\1/"
 }
 
 # ---------------------------------------------------------------------------
@@ -173,20 +209,17 @@ load_config() {
 }
 
 validate() {
-    local z kv
+    local z p v
     for z in "${ZDLRAS[@]}"; do safe_host "$z" || die "Bad appliance name: $z"; done
     [[ "$SSH_USER" =~ ^[A-Za-z0-9._-]+$ ]] || die "Bad ssh user: $SSH_USER"
-    local p
-    for p in "$REMOTE_DIR" "$EXTRACT_ROOT" "$PATCH_TARGET_DIR" "$PRECHECK_TARGET_DIR"; do
+    for p in "$REMOTE_DIR" "$EXTRACT_ROOT"; do
         safe_path "$p" || die "Path has unsupported characters: $p"
     done
-    safe_name "$PATCH_FILES_GLOB"    || die "Bad PATCH_FILES_GLOB: $PATCH_FILES_GLOB"
-    safe_name "$PRECHECK_SRC_SUBDIR" || die "Bad PRECHECK_SRC_SUBDIR: $PRECHECK_SRC_SUBDIR"
-    safe_name "$PRECHECK_CONF_FILE"  || die "Bad PRECHECK_CONF_FILE: $PRECHECK_CONF_FILE"
-    safe_name "$STAGED_RECORD_NAME"  || die "Bad STAGED_RECORD_NAME: $STAGED_RECORD_NAME"
-    # Settings are written with sed on the node, so keep them to plain characters.
-    for kv in ${PRECHECK_CONF_SETTINGS[@]+"${PRECHECK_CONF_SETTINGS[@]}"}; do
-        [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:,@+{}-]*$ ]] || die "Bad PRECHECK_CONF_SETTINGS entry: $kv"
+    for v in "$PATCHES_SUBDIR" "$CONF_SUBDIR" "$CONF_GLOB" "$STAGED_RECORD_NAME"; do
+        safe_name "$v" || die "Setting has unsupported characters: $v"
+    done
+    for v in "${COMPONENT_VARS[@]}"; do
+        [[ "$v" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "Bad name in COMPONENT_VARS: $v"
     done
     case "$ARCHIVE" in
         *.zip|*.tar) ;;
@@ -199,7 +232,6 @@ validate() {
         || die "$ARCHIVE_NAME is a .${ARCHIVE##*.} but the nodes expect $REMOTE_ARCHIVE_NAME; set REMOTE_ARCHIVE_NAME to match."
     case "$OLD_VERSION_ACTION" in backup|overwrite) ;; *) die "OLD_VERSION_ACTION must be backup or overwrite: $OLD_VERSION_ACTION" ;; esac
     REMOTE_ARCHIVE="${REMOTE_DIR}/${REMOTE_ARCHIVE_NAME}"
-    # STAGE_DIR (the folder the archive unpacks to) is set by find_archive_top.
 }
 
 init_log() {
@@ -209,11 +241,27 @@ init_log() {
     info "Archive:      $ARCHIVE"
     info "Appliances:   ${ZDLRAS[*]}"
     info "On nodes:     copy to $REMOTE_ARCHIVE, unzip in $EXTRACT_ROOT (older versions: $OLD_VERSION_ACTION)"
-    info "Place:        $PATCH_FILES_GLOB -> $PATCH_TARGET_DIR, $PRECHECK_SRC_SUBDIR/ -> $PRECHECK_TARGET_DIR"
-    [[ -f "$CONFIG_FILE" ]] || warn "No $CONFIG_FILE; using the built-in placeholder directories (TODO)."
 }
 
-# Check the archive on the jump server once, before touching any appliance.
+# ---------------------------------------------------------------------------
+# Archive checks on the jump server, before touching any appliance
+# ---------------------------------------------------------------------------
+zip_list() {
+    case "$ARCHIVE" in
+        *.tar) tar -tf "$ARCHIVE" ;;
+        *) if command -v unzip >/dev/null 2>&1; then unzip -Z1 "$ARCHIVE"
+           else python3 -c 'import sys, zipfile; print("\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))' "$ARCHIVE"; fi ;;
+    esac
+}
+
+zip_cat() {
+    case "$ARCHIVE" in
+        *.tar) tar -xOf "$ARCHIVE" "$1" ;;
+        *) if command -v unzip >/dev/null 2>&1; then unzip -p "$ARCHIVE" "$1"
+           else python3 -c 'import sys, zipfile; sys.stdout.write(zipfile.ZipFile(sys.argv[1]).read(sys.argv[2]).decode())' "$ARCHIVE" "$1"; fi ;;
+    esac
+}
+
 verify_local() {
     info "== verify (jump server) =="
     [[ -f "$ARCHIVE" ]]  || die "Archive not found: $ARCHIVE"
@@ -224,36 +272,61 @@ verify_local() {
     actual="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
     [[ "$actual" == "$EXPECTED_SHA" ]] || die "SHA-256 mismatch on the jump server: $actual, expected $EXPECTED_SHA"
     info "SHA-256 OK ($(du -h "$ARCHIVE" | cut -f1))"
-    find_archive_top
-}
 
-# Read the archive's file list. One top folder (e.g. patches/) -> unzip straight into
-# EXTRACT_ROOT, giving EXTRACT_ROOT/<top>. Anything else -> unzip into a folder of
-# its own, EXTRACT_ROOT/<archive name>_zip, so files are not scattered in EXTRACT_ROOT.
-UNPACK_INTO=""
-find_archive_top() {
     local list tops
-    case "$ARCHIVE" in
-        *.zip)
-            if command -v unzip >/dev/null 2>&1; then
-                list="$(unzip -Z1 "$ARCHIVE")" || die "Cannot read the file list of $ARCHIVE"
-            else
-                list="$(python3 -c 'import sys, zipfile; print("\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))' "$ARCHIVE")" \
-                    || die "Cannot read the file list of $ARCHIVE (no unzip or python3 here)"
-            fi ;;
-        *.tar)  list="$(tar -tf "$ARCHIVE")" || die "Cannot read the file list of $ARCHIVE" ;;
-    esac
-    tops="$(sed -E 's#^\./##; s#/.*##' <<<"$list" | grep -v '^$' | sort -u)"
-    if [[ "$(grep -c . <<<"$tops")" == 1 ]] && grep -q "^${tops}/" <<<"$(sed -E 's#^\./##' <<<"$list")"; then
+    list="$(zip_list | sed -E 's#^\./##')" || die "Cannot read the file list of $ARCHIVE"
+
+    # One top folder (patches/) -> unzip straight into EXTRACT_ROOT. Otherwise unzip
+    # into a folder of its own, so files are not scattered in EXTRACT_ROOT.
+    tops="$(sed -E 's#/.*##' <<<"$list" | grep -v '^$' | sort -u)"
+    if [[ "$(grep -c . <<<"$tops")" == 1 ]] && grep -q "^${tops}/" <<<"$list"; then
         [[ "$tops" =~ ^[A-Za-z0-9._-]+$ ]] || die "Top folder in the archive has unsupported characters: $tops"
+        ZIP_PREFIX="${tops}/"
         UNPACK_INTO="$EXTRACT_ROOT"
         STAGE_DIR="${EXTRACT_ROOT}/${tops}"
-        info "Archive holds one top folder, $tops/; unzips to $STAGE_DIR on each node"
     else
+        ZIP_PREFIX=""
         UNPACK_INTO="${EXTRACT_ROOT}/${REMOTE_ARCHIVE_NAME%.*}_zip"
         STAGE_DIR="$UNPACK_INTO"
-        warn "Archive has no single top folder; unzipping into $STAGE_DIR on each node"
+        warn "Archive has no single top folder; it will be unzipped into $STAGE_DIR"
     fi
+    info "Unzips to:    $STAGE_DIR on each node"
+
+    # The conf file: exactly one conf/patch.conf_<SR>.
+    local confs pattern
+    pattern="^${ZIP_PREFIX}${CONF_SUBDIR}/${CONF_GLOB//\*/[^/]+}$"
+    confs="$(grep -E "$pattern" <<<"$list" || true)"
+    [[ -n "$confs" ]] || die "No ${CONF_SUBDIR}/${CONF_GLOB} in the archive."
+    [[ "$(grep -c . <<<"$confs")" == 1 ]] || die "More than one conf file in the archive: $(tr '\n' ' ' <<<"$confs")"
+    CONF_NAME="$(basename "$confs")"
+    [[ "$CONF_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "Conf file name has unsupported characters: $CONF_NAME"
+    CONF_TEXT="$(zip_cat "$confs" | tr -d '\r')" || die "Cannot read $confs from the archive."
+    info "Conf file:    ${CONF_SUBDIR}/${CONF_NAME} (SR ${CONF_NAME#*_})"
+
+    # Patch files named by the FILES_* settings must be in patches/.
+    local key value f missing=()
+    PATCH_FILES=()
+    while IFS='=' read -r key value; do
+        [[ "$key" =~ $FILE_VARS_RE ]] || continue
+        value="$(sed -E "s/^\"(.*)\"$/\\1/; s/^'(.*)'$/\\1/" <<<"$value")"
+        local parts=()
+        IFS=', ' read -r -a parts <<<"$value"    # no word splitting/globbing of the raw value
+        for f in ${parts[@]+"${parts[@]}"}; do
+            f="$(basename "$f")"
+            [[ "$f" =~ ^[A-Za-z0-9._+-]+$ ]] || die "Unexpected file name in $key: $f"
+            PATCH_FILES+=("$f")
+            if grep -qxF "${ZIP_PREFIX}${PATCHES_SUBDIR}/${f}" <<<"$list"; then
+                info "  $key: $f"
+            else
+                missing+=("$f ($key)")
+            fi
+        done
+    done < <(grep -E '^[A-Z_][A-Z0-9_]*=' <<<"$CONF_TEXT")
+    (( ${#PATCH_FILES[@]} )) || die "The conf file names no patch files (no ${FILE_VARS_RE} settings with values)."
+    (( ${#missing[@]} == 0 )) || die "Not in ${PATCHES_SUBDIR}/ in the archive: ${missing[*]}"
+    # A file named by several settings is checked once.
+    mapfile -t PATCH_FILES < <(printf '%s\n' "${PATCH_FILES[@]}" | sort -u)
+    info "All ${#PATCH_FILES[@]} patch file(s) named in the conf file are in ${PATCHES_SUBDIR}/."
 }
 
 # ---------------------------------------------------------------------------
@@ -284,17 +357,106 @@ step_nodes() {
     done
 }
 
-# Deal with an older file or folder at $2 on node $1, per OLD_VERSION_ACTION:
-# rename it to <path>.<RUN_STAMP>.bak, or remove it. $3 = what it is, for messages.
+# Component values for the appliance, in order of precedence:
+#   1. components/<appliance>.conf (optional override; read as KEY=VALUE lines, not run)
+#   2. COMPONENT_CMDS, run on the appliance's first compute node
+#   3. the node list (COMPUTE_NODE, COMPUTE_NODE_01, CELL_PATCH_LAUNCH_NODE)
+# Every COMPONENT_VARS entry must end up set. Empty is accepted only when the
+# override file sets it on purpose, or for IB_SWITCHES on a RoCE rack.
+step_components() {
+    local z="$1" file="${COMPONENTS_DIR}/${1}.conf" key value
+    COMP=()
+    declare -A given=() source=()
+    COMP[COMPUTE_NODE]="$(IFS=,; echo "${NODES[*]}")"
+    COMP[COMPUTE_NODE_01]="${NODES[0]}"
+    COMP[CELL_PATCH_LAUNCH_NODE]="${NODES[0]}"
+    for key in COMPUTE_NODE COMPUTE_NODE_01 CELL_PATCH_LAUNCH_NODE; do source[$key]="node list"; done
+
+    # Ask the appliance.
+    local out
+    for key in "${COMPONENT_VARS[@]}"; do
+        [[ -n "${COMPONENT_CMDS[$key]:-}" ]] || continue
+        if out="$(on_node "${NODES[0]}" "${COMPONENT_CMDS[$key]}" 2>/dev/null)"; then
+            value="$(tr -d '\r' <<<"$out" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$' | paste -sd, -)"
+            safe_value "$value" || die "${z}: unexpected output for $key from '${COMPONENT_CMDS[$key]}': $value"
+            if [[ -n "$value" ]]; then
+                COMP[$key]="$value"
+                source[$key]="from ${NODES[0]}"
+            fi
+        else
+            warn "${z}: the command for $key failed on ${NODES[0]}: ${COMPONENT_CMDS[$key]}"
+        fi
+    done
+
+    if [[ -f "$file" ]]; then
+        while IFS='=' read -r key value; do
+            key="${key//[[:space:]]/}"
+            [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
+            [[ " ${COMPONENT_VARS[*]} " == *" $key "* ]] || { warn "${z}: $file: $key is not a component setting; ignored"; continue; }
+            value="$(sed -E "s/^[[:space:]]+//; s/[[:space:]]+$//; s/^\"(.*)\"$/\\1/; s/^'(.*)'$/\\1/" <<<"$value")"
+            safe_value "$value" || die "${z}: $file: unsupported characters in $key=$value"
+            COMP[$key]="$value"
+            given[$key]=1
+            source[$key]="override in $file"
+        done < <(grep -E '^[[:space:]]*[A-Z_][A-Z0-9_]*[[:space:]]*=' "$file")
+    fi
+
+    case "${COMP[SWITCHE_TYPE]:-}" in
+        roce|RoCE|ROCE|ib|IB) ;;
+        *) die "${z}: SWITCHE_TYPE must be roce or IB (got '${COMP[SWITCHE_TYPE]:-}'). Check COMPONENT_CMDS[SWITCHE_TYPE] or set it in $file." ;;
+    esac
+    local missing=() rocerack=0
+    [[ "${COMP[SWITCHE_TYPE],,}" == roce ]] && rocerack=1
+    for key in "${COMPONENT_VARS[@]}"; do
+        [[ -n "${COMP[$key]:-}" || -n "${given[$key]:-}" ]] && continue
+        if [[ "$key" == IB_SWITCHES ]] && (( rocerack )); then
+            source[$key]="empty on a RoCE rack"
+            continue
+        fi
+        missing+=("$key")
+    done
+    (( ${#missing[@]} == 0 )) || die "${z}: could not find ${missing[*]} on the appliance. Check COMPONENT_CMDS, or set them in $file."
+
+    info "${z}: component settings for ${CONF_NAME} (was -> now):"
+    for key in "${COMPONENT_VARS[@]}"; do
+        local was
+        was="$(conf_value "$CONF_TEXT" "$key")"
+        info "    $key: ${was:-<empty>} -> ${COMP[$key]:-<empty>}   (${source[$key]:-?})"
+    done
+}
+
+# Deal with an older file or folder at $2 on node $1, per OLD_VERSION_ACTION.
+# backup: keep it as <path>.<date>.bak, unless a backup already exists - then only
+# the oldest backup is kept and the current old version is replaced.
+# $3 = what it is, for messages.
 set_aside_old() {
-    local node="$1" path="$2" what="$3"
-    if [[ "$OLD_VERSION_ACTION" == backup ]]; then
-        change_on_node "$node" "mv '$path' '$path.$RUN_STAMP.bak'" || die "${node}: could not back up the old $what."
-        (( DRY_RUN )) || info "${node}: old $what kept as $path.$RUN_STAMP.bak"
-    else
+    local node="$1" path="$2" what="$3" baks oldest
+    if [[ "$OLD_VERSION_ACTION" == overwrite ]]; then
         change_on_node "$node" "rm -rf -- '$path'" || die "${node}: could not remove the old $what."
         (( DRY_RUN )) || info "${node}: old $what removed"
+        return 0
     fi
+    # Only this path's own backups (<path>.YYYYmmdd_HHMMSS.bak): a plain '<path>.*.bak'
+    # would also match /radump/patches.zip.<date>.bak when path is /radump/patches.
+    local d='[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]' t='[0-9][0-9][0-9][0-9][0-9][0-9]'
+    baks="$(on_node "$node" "ls -1d '$path'.${d}_${t}.bak 2>/dev/null | sort" || true)"
+    if [[ -z "$baks" ]]; then
+        change_on_node "$node" "mv '$path' '$path.$RUN_STAMP.bak'" || die "${node}: could not back up the old $what."
+        (( DRY_RUN )) || info "${node}: old $what kept as $path.$RUN_STAMP.bak"
+        return 0
+    fi
+    oldest="$(head -1 <<<"$baks")"
+    info "${node}: keeping the oldest backup, $oldest; replacing the current old $what without another backup"
+    local extra
+    extra="$(tail -n +2 <<<"$baks")"
+    if [[ -n "$extra" ]]; then
+        local b
+        while IFS= read -r b; do
+            safe_path "$b" || die "${node}: unexpected backup name: $b"
+            change_on_node "$node" "rm -rf -- '$b'" || die "${node}: could not remove extra backup $b"
+        done <<<"$extra"
+    fi
+    change_on_node "$node" "rm -rf -- '$path'" || die "${node}: could not remove the old $what."
 }
 
 # Copy the archive to one node: from the jump server, or with --relay from the first node.
@@ -311,13 +473,12 @@ copy_to_node() {
 }
 
 step_distribute() {
-    local z="$1" node first="${NODES[0]}"
+    local z="$1" node first="${NODES[0]}" sha
     for node in "${NODES[@]}"; do
         if [[ "$(staged_sha "$node")" == "$EXPECTED_SHA" ]]; then
             info "${z}/${node}: already staged with this archive; not copying"
             continue
         fi
-        local sha
         sha="$(remote_sha "$node")"
         if [[ "$sha" == "$EXPECTED_SHA" ]]; then
             info "${z}/${node}: already has the archive (SHA-256 matches); not copying"
@@ -341,7 +502,7 @@ step_check() {
     TODO_NODES=()
     for node in "${NODES[@]}"; do
         if [[ "$(staged_sha "$node")" == "$EXPECTED_SHA" ]]; then
-            info "${z}/${node}: already staged with this archive (record in $PATCH_TARGET_DIR); skipping"
+            info "${z}/${node}: already staged with this archive ($STAGE_DIR/$STAGED_RECORD_NAME); skipping"
             continue
         fi
         sha="$(remote_sha "$node")"
@@ -366,10 +527,10 @@ step_extract() {
         *.tar) unpack="tar -xf '$REMOTE_ARCHIVE' -C '$UNPACK_INTO'" ;;
     esac
     for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
-        # An older (or half-finished) unpacked folder from an earlier staging.
+        # An older (or half-finished) unzipped folder from an earlier staging.
         if on_node "$node" "[ -e '$STAGE_DIR' ]"; then
             info "${z}/${node}: $STAGE_DIR is from an earlier staging"
-            set_aside_old "$node" "$STAGE_DIR" "unpacked folder"
+            set_aside_old "$node" "$STAGE_DIR" "unzipped folder"
         fi
         change_on_node "$node" "mkdir -p '$UNPACK_INTO' && $unpack" || die "${z}/${node}: unpack failed."
         if (( ! DRY_RUN )); then
@@ -379,129 +540,103 @@ step_extract() {
 }
 
 # ---------------------------------------------------------------------------
-# Place step: runs on the node as one bash script (fed on stdin). Arguments:
-#   <dry> <stage dir> <patch target> <precheck src subdir> <precheck target>
-#   <files glob> <conf file> <record name> <archive> <sha256> <from host>
-#   <archive path on the node> [KEY=VALUE ...]
+# Configure step: runs on the node as one bash script (fed on stdin). Arguments:
+#   <dry> <stage dir> <patches subdir> <conf subdir> <conf name> <record name>
+#   <archive> <sha256> <from host> <archive path on the node>
+#   KEY=VALUE ... -- FILE ...
 # Paths are passed as arguments, never written into the script itself.
 # ---------------------------------------------------------------------------
-PLACE_SCRIPT=$(cat <<'REMOTE'
+CONFIGURE_SCRIPT=$(cat <<'REMOTE'
 set -uo pipefail
-dry=$1 stage=$2 ptarget=$3 csub=$4 ctarget=$5 glob=$6 conf=$7 record=$8 archive=$9 sha=${10} from=${11} remote=${12}
-shift 12
+dry=$1 stage=$2 psub=$3 csub=$4 confname=$5 record=$6 archive=$7 sha=$8 from=$9 remote=${10}
+shift 10
+settings=(); files=()
+while [ $# -gt 0 ] && [ "$1" != "--" ]; do settings+=("$1"); shift; done
+[ $# -gt 0 ] && shift
+files=("$@")
 fail() { echo "ERROR $*"; exit 1; }
-do_or_say() { if [ "$dry" = 1 ]; then echo "[dry-run] $*"; else "$@" || fail "command failed: $*"; fi; }
+c="$stage/$csub/$confname"
 
 if [ "$dry" = 1 ]; then
-    echo "[dry-run] would move $glob from $stage/ to $ptarget/"
-    echo "[dry-run] would move $stage/$csub/ to $ctarget/"
-    for kv in "$@"; do
-        k=${kv%%=*}
-        cur=$(grep -m1 "^$k=" "$ctarget/$conf" 2>/dev/null || true)
-        echo "[dry-run] would set in $ctarget/$conf: $kv (now: ${cur:-not set, or file not there yet})"
-    done
-    echo "[dry-run] would write $ptarget/$record"
+    echo "[dry-run] would check ${#files[@]} patch file(s) in $stage/$psub/"
+    echo "[dry-run] would update ${#settings[@]} component setting(s) in $c (original kept as .orig)"
+    echo "[dry-run] would write $stage/$record"
     exit 0
 fi
 
-# The unpacked folder (e.g. /radump/patches) holds the patch files and the precheck folder.
-[ -d "$stage" ] || fail "unpacked folder not found: $stage"
-src=$stage
-
-# Check everything before moving anything, so a problem never leaves a node half-staged.
-shopt -s nullglob
-files=( "$src"/$glob )
-[ ${#files[@]} -gt 0 ] || fail "no $glob files in $src"
-[ -d "$src/$csub" ] || fail "no $csub/ folder in $src"
-[ -f "$src/$csub/$conf" ] || fail "precheck config $csub/$conf not found in the archive"
-[ ! -e "$ctarget" ] || fail "$ctarget already exists; move it aside first"
+# Check everything before changing anything.
+[ -d "$stage" ] || fail "unzipped folder not found: $stage"
+[ -f "$c" ] || fail "conf file not found: $c"
 for f in "${files[@]}"; do
-    name=$(basename "$f")
-    if [ -e "$ptarget/$name" ] && ! cmp -s "$f" "$ptarget/$name"; then
-        fail "$ptarget/$name exists and differs from the staged file; not overwriting"
-    fi
+    [ -s "$stage/$psub/$f" ] || fail "patch file missing or empty: $stage/$psub/$f"
 done
-echo "OK checks passed: ${#files[@]} patch file(s), $csub/ with $conf, targets free"
+echo "OK ${#files[@]} patch file(s) present in $stage/$psub/"
 
-# 1. Patch files. A file already at the target is kept (it was checked to be identical).
-mkdir -p "$ptarget" || fail "cannot create $ptarget"
-placed=()
-for f in "${files[@]}"; do
-    name=$(basename "$f")
-    if [ -e "$ptarget/$name" ]; then
-        echo "OK already in place: $ptarget/$name"
-    else
-        mv "$f" "$ptarget/$name" || fail "cannot move $name to $ptarget"
-        echo "OK moved $name -> $ptarget/"
-    fi
-    placed+=("$name")
-done
-
-# 2. Precheck folder.
-mkdir -p "$(dirname "$ctarget")" || fail "cannot create $(dirname "$ctarget")"
-mv "$src/$csub" "$ctarget" || fail "cannot move $csub/ to $ctarget"
-echo "OK moved $csub/ -> $ctarget/"
-
-# 3. Precheck config: keep the original, then set each KEY=VALUE.
-c="$ctarget/$conf"
+# Rewrite the component settings, keeping each line's quoting style.
 cp -p "$c" "$c.orig" || fail "cannot back up $c"
-for kv in "$@"; do
-    k=${kv%%=*}
-    if grep -q "^$k=" "$c"; then
-        sed -i "s|^$k=.*|$kv|" "$c" || fail "cannot update $k in $c"
+for kv in "${settings[@]}"; do
+    k=${kv%%=*}; v=${kv#*=}
+    cur=$(grep -m1 "^$k=" "$c" || true)
+    if [ -n "$cur" ]; then
+        old=${cur#*=}
+        case "$old" in
+            \"*) q='"' ;;
+            \'*) q="'" ;;
+            *)   q='' ;;
+        esac
+        sed -i "s|^$k=.*|$k=$q$v$q|" "$c" || fail "cannot update $k in $c"
     else
-        echo "$kv" >> "$c" || fail "cannot add $k to $c"
+        echo "$k=$v" >> "$c" || fail "cannot add $k to $c"
+        echo "NOTE $k was not in $c; added it"
     fi
 done
 echo "OK updated $c (original kept as $c.orig); changes:"
 diff "$c.orig" "$c" | sed 's/^/   /'
 
-# 4. Check the result.
-for name in "${placed[@]}"; do
-    [ -s "$ptarget/$name" ] || fail "check: $ptarget/$name missing"
+# Check the result.
+for kv in "${settings[@]}"; do
+    k=${kv%%=*}; v=${kv#*=}
+    got=$(sed -n "s/^$k=//p" "$c" | head -1 | sed -E "s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/")
+    [ "$got" = "$v" ] || fail "check: $k is '$got' in $c, expected '$v'"
 done
-for kv in "$@"; do
-    grep -qxF "$kv" "$c" || fail "check: $c does not contain $kv"
-done
-echo "OK checked: ${#placed[@]} patch file(s) in $ptarget, precheck config updated"
+echo "OK checked: component settings in $c"
 
-# 5. Staged record, read by zdlra_patch.sh.
+# Staged record, read by zdlra_patch.sh.
 {
     echo "archive=$archive"
     echo "node_archive=$remote"
     echo "sha256=$sha"
     echo "staged_at=$(date '+%F %T %Z')"
     echo "staged_from=$from"
-    echo "patch_dir=$ptarget"
-    echo "precheck_dir=$ctarget"
-    for name in "${placed[@]}"; do echo "file=$name"; done
-} > "$ptarget/$record" || fail "cannot write $ptarget/$record"
-echo "OK wrote $ptarget/$record"
+    echo "patch_conf=$c"
+    echo "sr=${confname#*_}"
+    for kv in "${settings[@]}"; do echo "component_$kv"; done
+    for f in "${files[@]}"; do echo "file=$f"; done
+} > "$stage/$record" || fail "cannot write $stage/$record"
+echo "OK wrote $stage/$record"
 REMOTE
 )
 
-step_place() {
-    local z="$1" node kv out rc
-    local settings=()
-    for kv in ${PRECHECK_CONF_SETTINGS[@]+"${PRECHECK_CONF_SETTINGS[@]}"}; do
-        kv="${kv//\{patch_dir\}/$PATCH_TARGET_DIR}"
-        settings+=("'${kv//\{precheck_dir\}/$PRECHECK_TARGET_DIR}'")
-    done
-    local args="'$DRY_RUN' '$STAGE_DIR' '$PATCH_TARGET_DIR' '$PRECHECK_SRC_SUBDIR' '$PRECHECK_TARGET_DIR'"
-    args+=" '$PATCH_FILES_GLOB' '$PRECHECK_CONF_FILE' '$STAGED_RECORD_NAME' '$ARCHIVE_NAME' '$EXPECTED_SHA' '$(hostname)' '$REMOTE_ARCHIVE'"
-    args+=" ${settings[*]-}"
+step_configure() {
+    local z="$1" node key out rc
+    local args="'$DRY_RUN' '$STAGE_DIR' '$PATCHES_SUBDIR' '$CONF_SUBDIR' '$CONF_NAME' '$STAGED_RECORD_NAME'"
+    args+=" '$ARCHIVE_NAME' '$EXPECTED_SHA' '$(hostname)' '$REMOTE_ARCHIVE'"
+    for key in "${COMPONENT_VARS[@]}"; do args+=" '$key=${COMP[$key]:-}'"; done
+    args+=" --"
+    local f
+    for f in "${PATCH_FILES[@]}"; do args+=" '$f'"; done
     for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
         rc=0
-        out="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" "bash -s -- $args" <<<"$PLACE_SCRIPT" 2>&1)" || rc=$?
+        out="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" "bash -s -- $args" <<<"$CONFIGURE_SCRIPT" 2>&1)" || rc=$?
         printf '%s\n' "$out" | sed "s|^|  ${z}/${node}: |" | tee -a "$LOG_FILE" >&2
-        (( rc == 0 )) || die "${z}/${node}: place step failed (see above). Files moved so far stay where they are."
+        (( rc == 0 )) || die "${z}/${node}: configure step failed (see above)."
     done
 }
 
 stage_appliance() {
     local z="$1"
     info "======== $z ========"
-    info "== nodes ==";      step_nodes "$z"
+    info "== nodes ==";      step_nodes "$z"; step_components "$z"
     info "== distribute =="; step_distribute "$z"
     info "== check ==";      step_check "$z"
     if (( ${#TODO_NODES[@]} == 0 )); then
@@ -509,11 +644,11 @@ stage_appliance() {
         return 0
     fi
     info "== extract ==";    step_extract "$z"
-    info "== place ==";      step_place "$z"
+    info "== configure ==";  step_configure "$z"
     if (( DRY_RUN )); then
         info "${z}: dry run passed; would stage on ${TODO_NODES[*]}"
     else
-        info "${z}: staged on ${TODO_NODES[*]} (patches in $PATCH_TARGET_DIR, precheck in $PRECHECK_TARGET_DIR)"
+        info "${z}: staged on ${TODO_NODES[*]} in $STAGE_DIR (conf ${CONF_NAME} set for ${z})"
     fi
 }
 

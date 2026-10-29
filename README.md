@@ -186,11 +186,19 @@ Copy the archive and its `.sha256` file to a Linux jump server that can reach th
 | verify | Checks the archive's SHA-256 against the `.sha256` file, once, on the jump server |
 | nodes | Finds the compute nodes: from `staging/appliances.conf`, or from `olsnodes` on the appliance |
 | distribute | Copies the archive to `/radump/patches.zip` on every node, skipping nodes that already have an identical copy. An older `patches.zip` there is backed up as `patches.zip.<date>.bak`, or overwritten if `OLD_VERSION_ACTION=overwrite`. With `--relay`, it copies to the first node only, and that node copies on to the others |
-| check | On every node: verifies the SHA-256 and free space. Nodes already staged with this archive are skipped from here on; a node where an earlier staging stopped partway is refused |
+| check | On every node: verifies the SHA-256 and free space. Nodes already staged with this archive are skipped from here on |
 | extract | Unzips it in `/radump` on every node. The zip holds one top folder, so this gives `/radump/patches/`; an older `/radump/patches/` is backed up or replaced first. A zip without a single top folder is unzipped into `/radump/patches_zip/` instead |
-| place | On every node: moves the patch files to `PATCH_TARGET_DIR` and the precheck folder to `PRECHECK_TARGET_DIR`, then sets the values in `PRECHECK_CONF_SETTINGS` in the precheck's config file (the original is kept as `.orig`, and the change is logged). It checks the result and writes a staged record. Everything is checked before anything moves, and an existing file is never overwritten with a different one |
+| configure | On every node: checks that every patch file named in the conf file's `FILES_*` settings is in `/radump/patches/patches/`, then rewrites the component settings in `/radump/patches/conf/patch.conf_<SR>` for this appliance. The original is kept as `.orig` and the change is logged. It checks the result and writes `/radump/patches/ZDLRA_STAGED.txt` |
 
-The place step reads `staging/zdlra_stage.conf` (see `zdlra_stage.conf.example`). **Its directories are placeholders for now.** Set `STAGED_RECORD` in `zdlra_patch.conf` to the record path, so the patch script finds it.
+**Before touching any node**, the jump server reads `patch.conf_<SR>` from the zip and checks that every file its `FILES_*` settings name (plus `STAGE_FILE` and `FRAMEWORK_FILE`) is in `patches/patches/`. It then works out each appliance's component settings and shows them as old → new:
+
+- `COMPUTE_NODE`, `COMPUTE_NODE_01` and `CELL_PATCH_LAUNCH_NODE` come from the compute node list.
+- `CELL_NODE`, `SWITCHE_TYPE`, `SWITCHES`, `IB_SWITCHES` and `RA_DATABASE` come from the appliance itself: the jump server runs `COMPONENT_CMDS` on the first compute node. **These commands are first guesses (`TODO(site)` in `zdlra_stage.conf.example`).**
+- `staging/components/<appliance>.conf` can override any value (see `components/example.conf`).
+
+If any value can't be found, the appliance is refused, so a conf file never keeps another appliance's components. The one exception is `IB_SWITCHES`, which may be empty on a RoCE rack.
+
+**Older versions:** with `OLD_VERSION_ACTION=backup` (the default), the first older `patches.zip` and `/radump/patches/` are kept as `<name>.<date>.bak`. After that, only that oldest backup is kept.
 
 Running the same archive again is safe, because nodes that are already staged are skipped. At the end, the script prints a summary marking each appliance OK or FAILED. The jump server needs SSH access to the nodes without a password; the user is `root` by default and you can change it with `-u`. See `staging/appliances.conf.example` for the inventory format. Real inventories are in `.gitignore`.
 
@@ -205,9 +213,9 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [x] Call an external precheck script and fail on errors
 - [ ] Fill in the replication and incoming-backup SQL (placeholders in place)
 - [ ] Verify the bundle checksum
-- [x] Staging places the patches and the precheck, and updates the precheck's config; the patch script relies on the staged record (the `stage` phase is gone)
-- [ ] Fill in the real directories and precheck settings (placeholders in place)
-- [ ] Ownership and permissions of the placed files, if the patch README asks for them
+- [x] Staging unzips `patches.zip` in `/radump` and rewrites `patch.conf_<SR>` for the appliance; the patch script relies on the staged record (the `stage` phase is gone)
+- [ ] Confirm the commands that find each component on the appliance (`COMPONENT_CMDS`)
+- [ ] What to do with each patch file named by the `FILES_*` settings
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
 - [ ] Wider before/after comparison (CRS resources, policies, replication)

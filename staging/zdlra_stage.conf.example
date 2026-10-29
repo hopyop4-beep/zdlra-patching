@@ -1,37 +1,41 @@
-# Settings for the place step of zdlra_stage.sh. Copy to zdlra_stage.conf (not
-# committed) and edit. This file is sourced by bash.
-#
+# Optional settings for zdlra_stage.sh. Copy to zdlra_stage.conf (not committed)
+# and edit. This file is sourced by bash; every value below is the built-in default.
+
 # On each node the archive is copied to /radump/patches.zip and unzipped in /radump
-# (a zip with a patches/ top folder gives /radump/patches/). Change with -r/-d or
-# REMOTE_ARCHIVE_NAME if that ever differs.
+# (its patches/ top folder becomes /radump/patches/).
 REMOTE_ARCHIVE_NAME="patches.zip"
 
-# What to do when a node already has an older patches.zip or unzipped folder:
-#   backup     rename it to <name>.<date>.bak (default)
+# What to do when a node already has an older patches.zip or /radump/patches/:
+#   backup     keep the oldest older version as <name>.<date>.bak (default); once a
+#              backup exists, later older versions are replaced without another
 #   overwrite  replace it
 OLD_VERSION_ACTION="backup"
 
-# TODO(site): the values below are placeholders until the real directories and
-# precheck settings are confirmed.
+# Layout of the unzipped folder: patch files in patches/, the conf file in
+# conf/patch.conf_<SR> (exactly one).
+PATCHES_SUBDIR="patches"
+CONF_SUBDIR="conf"
+CONF_GLOB="patch.conf_*"
 
-# Where the patch files go on each compute node, and which files in the archive
-# count as patch files.
-PATCH_TARGET_DIR="/radump/ra_patches"
-PATCH_FILES_GLOB="*.zip"
+# Settings in the conf file that are rewritten for each appliance.
+COMPONENT_VARS=(COMPUTE_NODE COMPUTE_NODE_01 CELL_NODE CELL_PATCH_LAUNCH_NODE
+                SWITCHE_TYPE SWITCHES IB_SWITCHES RA_DATABASE)
 
-# The precheck folder inside the archive, and where it goes on each node.
-PRECHECK_SRC_SUBDIR="precheck"
-PRECHECK_TARGET_DIR="/radump/ra_precheck"
+# How each value is found on the appliance: a command run on its first compute
+# node; output lines are joined with commas. COMPUTE_NODE, COMPUTE_NODE_01 and
+# CELL_PATCH_LAUNCH_NODE come from the node list. Assign entries one by one (the
+# script declares the list). components/<appliance>.conf overrides any value.
+# TODO(site): first guesses; confirm or replace each command.
+COMPONENT_CMDS[CELL_NODE]='cat /root/cell_group'
+COMPONENT_CMDS[SWITCHE_TYPE]='if ls /sys/class/net | grep -qE "^re[0-9]"; then echo roce; elif ls /sys/class/net | grep -qE "^ib[0-9]"; then echo IB; fi'
+COMPONENT_CMDS[SWITCHES]='cat /root/roce_switches.lst'
+COMPONENT_CMDS[IB_SWITCHES]='cat /root/ib_switches.lst 2>/dev/null || true'
+COMPONENT_CMDS[RA_DATABASE]='su - oracle -c "srvctl config database" | head -1'
+COMPONENTS_DIR="$(dirname "${BASH_SOURCE[0]}")/components"
 
-# The precheck's config file (inside PRECHECK_TARGET_DIR), and the KEY=VALUE lines
-# to set in it. An existing KEY= line is replaced; a missing one is added. The
-# original is kept as <file>.orig. {patch_dir} and {precheck_dir} are replaced
-# with the two directories above.
-PRECHECK_CONF_FILE="precheck.conf"
-PRECHECK_CONF_SETTINGS=(
-    "PATCH_DIR={patch_dir}"
-)
+# Settings that name patch files; each file must be in patches/.
+# TODO(site): confirm the names and the value format (comma- or space-separated).
+FILE_VARS_RE='^(FILES?_[A-Z0-9_]+|FILSE_[A-Z0-9_]+|STAGE_FILE|FRAMEWORK_FILE)$'
 
-# Record written in PATCH_TARGET_DIR on each node once staging succeeds. Set
-# STAGED_RECORD in zdlra_patch.conf to the same path.
+# Record written in the unzipped folder on each node (read by zdlra_patch.sh).
 STAGED_RECORD_NAME="ZDLRA_STAGED.txt"
