@@ -48,4 +48,6 @@ COMPUTE_FILES_DIR="/radump/patches/patches"    # the computepatch (iso repo)
 COMPUTE_WORK_DIR="/radump/zdlra_compute"       # per run: db_nodes files, logs, exit status
 COMPUTE_WARN_MINUTES=240                       # warning only; patchmgr is never stopped
 COMPUTE_POLL_SECONDS=60
-COMPUTE_PAUSE_ON_WARNINGS=0                    # TODO(site): pause on SUCCESS WITH WARNING(S)?
+# SUCCESS WITH WARNING(S) carries on (warnings are listed): allowed for now because
+# the prechecks were already reviewed; to revisit. 1 = stop for review instead.
+COMPUTE_PAUSE_ON_WARNINGS=0

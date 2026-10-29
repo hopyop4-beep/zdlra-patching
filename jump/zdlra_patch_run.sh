@@ -78,8 +78,9 @@ COMPUTE_WORK_DIR="/radump/zdlra_compute"       # per run: db_nodes files, logs, 
 NODE_DCLI="dcli"
 COMPUTE_WARN_MINUTES=240        # past this, a warning only; patchmgr is never stopped
 COMPUTE_POLL_SECONDS=60
-# TODO(site): decide whether a precheck with "SUCCESS WITH WARNING(S)" should pause
-# for review before -upgrade (0 = carry on, the warnings are listed).
+# "SUCCESS WITH WARNING(S)" from patchmgr: 0 = carry on (the warnings are listed),
+# 1 = stop for review before going on. Decided for now: carry on, because the
+# prechecks have already been reviewed. To revisit.
 COMPUTE_PAUSE_ON_WARNINGS=0
 STATE_DIR="${HOME}/zdlra_jump_state"
 LOG_DIR="${HOME}/zdlra_jump_logs"

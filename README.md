@@ -176,7 +176,7 @@ Each pass works like this:
 3. Run the same with `-upgrade` (without `-nomodify_at_prereq`).
 4. `dcli ... imageinfo -ver` must show the target on the patched node.
 
-- **Success:** `SUCCESS: Completed run of command`, `Exit status:0`, and every node in state `SUCCESS`. `SUCCESS WITH WARNING(S)` is accepted, and the warnings are listed. `COMPUTE_PAUSE_ON_WARNINGS` is a `TODO`.
+- **Success:** `SUCCESS: Completed run of command`, `Exit status:0`, and every node in state `SUCCESS`. `SUCCESS WITH WARNING(S)` is accepted, and the warnings are listed. That is allowed for now, because the prechecks were already reviewed; it is to be revisited. `COMPUTE_PAUSE_ON_WARNINGS=1` stops for review instead.
 - **Nothing can cut it short:** each `patchmgr` runs detached on its node, with its own log and exit-status file there. The jump server only starts it and checks on it over SSH, through the reboots.
 - **Picking up:** if the jump-server script stops (Ctrl-C, a dropped session), `--watch <run id>` continues the pass where it was. It skips finished passes, waits for a `patchmgr` that's still running rather than starting another, and starts a failed step again once you've fixed the problem.
 
@@ -300,7 +300,7 @@ Running the same archive again is safe, because nodes that are already staged ar
     - Pass 2: on node 2, the same against node 1. Node 1 reboots.
     - Both run from the db_server_patch folder after `unzip -q dbnodeupdate.zip`, with `-log_dir auto`, `-target_version` set to `TARGET_COMPUTE_VERSION`, and `-iso_repo` set to the full path of the computepatch (1st `FILES_YUM` file). Afterwards `dcli ... imageinfo -ver` must show the target.
     - Order: after the cells. `db_nodes`: a per-run file with only the node being patched. After node 1 is back, only the image version is checked.
-    - Still to decide: whether `SUCCESS WITH WARNING(S)` should pause for review (`COMPUTE_PAUSE_ON_WARNINGS`)
+    - To revisit: `SUCCESS WITH WARNING(S)` carries on for now (`COMPUTE_PAUSE_ON_WARNINGS=0`), since the prechecks were already reviewed
   - [ ] Switches (RoCE or InfiniBand, depending on the rack)
 
 ## Disclaimer
