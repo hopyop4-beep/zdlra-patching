@@ -15,6 +15,7 @@ The script breaks a patch into phases. You can run them one at a time or all tog
 | `snapshot` | Saves configuration and state before patching |
 | `patch1` | Runs `racli <patch\|upgrade> appliance --step=1` |
 | `patch2` | Runs `racli <patch\|upgrade> appliance --step=2` |
+| `cells` | Patches the storage cells from the first compute node. In the cell patch folder (worked out from the `FILES_CELL` zip, because its name changes per release), it runs `patchmgr -cells /root/cell_group` with `-patch_check_prereq`, `-reset_force`, `-cleanup` and then `-patch` (plus `CELL_PATCH_EXTRA_ARGS`). Each step must report a completed run with exit status 0 and no `FAILED` lines. Afterwards every cell must be on `TARGET_CELL_VERSION` from the conf file, according to both `patchmgr` and `dcli ... imageinfo -ver` |
 | `postcheck` | Runs the checks again and compares the result with the snapshot |
 | `resume` | Resumes only the replication servers that this run paused |
 | `report` | Writes a summary of the run |
@@ -259,8 +260,8 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
 - [x] Operator approval of the precheck, and background runs
 - [ ] Email or webhook notification (most useful for background runs)
-- [ ] Exadata infrastructure patching with `patchmgr`:
-  - [ ] Storage cells (rolling or non-rolling)
+- [ ] Exadata infrastructure patching with `patchmgr`. The order in the window is: RA upgrade, compute, cells, switches. The `cells` phase sits after `patch2` for now and moves into place as the others are built:
+  - [x] Storage cells (`cells` phase; rolling is handled by `patchmgr` itself)
   - [ ] Compute nodes
   - [ ] Switches (RoCE or InfiniBand, depending on the rack)
 

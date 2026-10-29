@@ -18,6 +18,9 @@
 #   snapshot    save configuration and state so you can compare after patching
 #   patch1      racli <action> appliance --step=1   (needs an approved precheck)
 #   patch2      racli <action> appliance --step=2   (needs an approved precheck)
+#   cells       patch the storage cells with patchmgr from the cell patch folder,
+#               then check every cell is on TARGET_CELL_VERSION (needs an approved
+#               precheck)
 #   postcheck   rerun health checks and compare with the snapshot
 #   resume      resume the replication that quiesce paused
 #   report      write a summary of this run
@@ -43,7 +46,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
 VERSION="0.5.0"
 
-ALL_PHASES=(precheck quiesce snapshot patch1 patch2 postcheck resume report)
+ALL_PHASES=(precheck quiesce snapshot patch1 patch2 cells postcheck resume report)
 
 # ---------------------------------------------------------------------------
 # Defaults (override in the config file)
@@ -88,6 +91,20 @@ PRECHECK_REQUIRED=1             # 1 = stop if PRECHECK_SCRIPT is not set
 PRECHECK_REQUIRE_APPROVAL=1     # 1 = operator must type APPROVE after the precheck
 PRECHECK_APPROVAL_MAX_AGE_HOURS=24   # patch steps refuse an approval older than this
 POSTCHECK_RERUN_PRECHECK=1      # 1 = run the same script again after patching
+
+# Storage cells (cells phase). Runs from the first compute node, in the folder the
+# cell patch (FILES_CELL) unzipped to under /radump/patches/tmp; the folder's name is
+# read from the zip, as it changes with every release.
+CELL_GROUP_FILE="/root/cell_group"
+CELL_PATCH_TMP_DIR="/radump/patches/tmp"     # where staging unzipped the cell patch
+CELL_PATCH_FILES_DIR="/radump/patches/patches"
+# Run in this order before the patch itself.
+CELL_PREP_STEPS=(-patch_check_prereq -reset_force -cleanup)
+# Added to "patchmgr -cells <group> -patch", e.g. (-ignore_alerts) or
+# (-smtp_from "addr" -smtp_to "addr1 addr2").
+CELL_PATCH_EXTRA_ARGS=()
+CELL_PATCH_TIMEOUT_MINUTES=360  # per patchmgr command (about 2 hours for 17 cells)
+DCLI="dcli"
 
 # SQL on the appliance, as the raadmin account (see the config example).
 SQLPLUS="sqlplus"
@@ -635,6 +652,7 @@ phase_precheck() {
 
     # Read-only look at what quiesce will deal with, so it is part of the review.
     report_activity
+    report_cell_plan
 
     # TODO: confirm the patch is valid for the current version (compare racli version with patch README).
 
@@ -728,6 +746,122 @@ phase_patch2() {
     confirm "Run '$RACLI $PATCH_ACTION appliance --step=2'? This stops services."
     run "$RACLI" "$PATCH_ACTION" appliance --step=2
     # TODO: wait for services to return, with a timeout.
+}
+
+# ---------------------------------------------------------------------------
+# Storage cells
+# ---------------------------------------------------------------------------
+# The cell patch zip (from the staged record) and the folder it unzipped to.
+# Prints "<zip> <folder>"; fails with a message if either cannot be found.
+cell_patch_location() {
+    local zip top
+    zip="$(sed -n 's/^unpacked=FILES_CELL:\([^:]*\):.*/\1/p' "$STAGED_RECORD" 2>/dev/null | head -1)"
+    [[ -n "$zip" ]] || { echo "the staged record names no unpacked FILES_CELL file"; return 1; }
+    zip="${CELL_PATCH_FILES_DIR}/${zip}"
+    [[ -f "$zip" ]] || { echo "cell patch zip not found: $zip"; return 1; }
+    top="$(unzip -Z1 "$zip" 2>/dev/null | sed 's#^\./##; s#/.*##' | grep -v '^$' | sort -u)"
+    [[ -n "$top" && "$(wc -l <<<"$top")" -eq 1 ]] || { echo "cannot tell the patch folder from $zip (top entries: $(tr '\n' ' ' <<<"$top"))"; return 1; }
+    [[ -x "${CELL_PATCH_TMP_DIR}/${top}/patchmgr" ]] || { echo "no patchmgr in ${CELL_PATCH_TMP_DIR}/${top}"; return 1; }
+    echo "$zip ${CELL_PATCH_TMP_DIR}/${top}"
+}
+
+# TARGET_CELL_VERSION from the conf file staging set up.
+target_cell_version() {
+    local conf
+    conf="$(staged_value patch_conf)"
+    [[ -f "$conf" ]] || return 0
+    sed -n 's/^TARGET_CELL_VERSION=//p' "$conf" | head -1 | tr -d '\r' | sed -E "s/^[\"']//; s/[\"']$//; s/[[:space:]]+$//"
+}
+
+# Current image version of every cell, as "cell: version" lines.
+cell_versions() { "$DCLI" -g "$CELL_GROUP_FILE" -l root 'imageinfo -ver' 2>&1; }
+
+# For the precheck review: what the cells phase will use. Read only; never fatal.
+report_cell_plan() {
+    [[ " ${ALL_PHASES[*]} " == *" cells "* ]] || return 0
+    local loc target
+    if loc="$(cell_patch_location)"; then
+        info "Cell patch:   ${loc#* } (from $(basename "${loc%% *}"))"
+    else
+        warn "Cell patch:   not ready ($loc)"
+    fi
+    target="$(target_cell_version)"
+    info "Cell target:  ${target:-<TARGET_CELL_VERSION not set in the conf file>}"
+    if command -v "$DCLI" >/dev/null 2>&1 && [[ -s "$CELL_GROUP_FILE" ]]; then
+        local line
+        while IFS= read -r line; do info "    now $line"; done < <(cell_versions)
+    fi
+}
+
+# Run one patchmgr command from the patch folder, with a time limit, saving its
+# output. Success: exit 0, "SUCCESS: Completed run of command", "Exit status:0",
+# and no FAILED lines. $1 = folder, $2 = log name, rest = patchmgr arguments.
+run_patchmgr() {
+    local dir="$1" name="$2"; shift 2
+    local log="${RUN_DIR}/cells_${name}.log" rc=0 step="-$name"
+    info "[exec] cd $dir && ./patchmgr $* (log: $log)"
+    # Output goes to its own log, the run log and the screen. PIPESTATUS is read inside
+    # the group, before anything else can reset it.
+    { ( cd "$dir" && timeout "$(( CELL_PATCH_TIMEOUT_MINUTES * 60 ))" ./patchmgr "$@" ) 2>&1 \
+        | tee "$log" | tee -a "$LOG_FILE" >&2; rc="${PIPESTATUS[0]}"; } || true
+    (( rc != 124 )) || die "patchmgr $step timed out after ${CELL_PATCH_TIMEOUT_MINUTES} min. Log: $log"
+    local failed
+    failed="$(grep -E 'FAILED' "$log" | head -10 || true)"
+    if [[ -n "$failed" ]]; then
+        while IFS= read -r line; do err "  $line"; done <<<"$failed"
+        die "patchmgr $step reported failures. Log: $log"
+    fi
+    (( rc == 0 )) || die "patchmgr $step exited with code $rc. Log: $log"
+    grep -q 'SUCCESS: Completed run of command' "$log" && grep -q 'Exit status:0' "$log" \
+        || die "patchmgr $step did not report a completed run (no 'SUCCESS: Completed run of command' / 'Exit status:0'). Log: $log"
+    info "patchmgr $step: completed."
+}
+
+# Every cell must be on the target version. $1 = text with "cell: version" lines.
+check_cell_versions() {
+    local text="$1" target="$2" line cell ver bad=0 seen=0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9._-]+):[[:space:]]*([0-9][0-9.]*)[[:space:]]*$ ]] || continue
+        cell="${BASH_REMATCH[1]}"; ver="${BASH_REMATCH[2]}"; seen=$((seen + 1))
+        if [[ "$ver" == "$target" ]]; then
+            info "    $cell: $ver"
+        else
+            err "    $cell: $ver (expected $target)"; bad=$((bad + 1))
+        fi
+    done <<<"$text"
+    (( seen > 0 )) || die "No cell versions found to check."
+    (( bad == 0 )) || die "$bad cell(s) not on $target."
+}
+
+phase_cells() {
+    info "== cells =="
+    local loc dir target
+    loc="$(cell_patch_location)" || die "Cell patch: $loc"
+    dir="${loc#* }"
+    [[ -s "$CELL_GROUP_FILE" ]] || die "$CELL_GROUP_FILE is missing or empty."
+    target="$(target_cell_version)"
+    [[ -n "$target" ]] || die "TARGET_CELL_VERSION is not set in $(staged_value patch_conf)."
+    info "Cell patch folder: $dir; cells: $(paste -sd' ' "$CELL_GROUP_FILE"); target: $target"
+
+    local step
+    if (( DRY_RUN )); then
+        for step in "${CELL_PREP_STEPS[@]}"; do info "[dry-run] cd $dir && ./patchmgr -cells $CELL_GROUP_FILE $step"; done
+        info "[dry-run] cd $dir && ./patchmgr -cells $CELL_GROUP_FILE -patch ${CELL_PATCH_EXTRA_ARGS[*]-}"
+        info "[dry-run] $DCLI -g $CELL_GROUP_FILE -l root 'imageinfo -ver'  (each cell must be $target)"
+        return 0
+    fi
+
+    for step in "${CELL_PREP_STEPS[@]}"; do
+        run_patchmgr "$dir" "${step#-}" -cells "$CELL_GROUP_FILE" "$step"
+    done
+    confirm "Patch the storage cells now (patchmgr -patch; the cells reboot)?"
+    run_patchmgr "$dir" patch -cells "$CELL_GROUP_FILE" -patch ${CELL_PATCH_EXTRA_ARGS[@]+"${CELL_PATCH_EXTRA_ARGS[@]}"}
+
+    info "Image version reported by patchmgr:"
+    check_cell_versions "$(sed -n '/Current image version on cell(s) is:/,/For details/p' "${RUN_DIR}/cells_patch.log" | sed -E 's/^.*:INFO *: *//')" "$target"
+    info "Image version from imageinfo:"
+    check_cell_versions "$(cell_versions)" "$target"
+    info "All cells are on $target."
 }
 
 phase_postcheck() {
@@ -833,7 +967,7 @@ main() {
             [[ "$p" == precheck ]] && split=1
         done
         # Without precheck in this run, check the existing approval now, not after detaching.
-        if (( ! ${#fg_phases[@]} )) && [[ " ${BG_PHASES[*]} " == *" patch"* || " ${BG_PHASES[*]} " == *" quiesce "* ]]; then
+        if (( ! ${#fg_phases[@]} )) && [[ " ${BG_PHASES[*]} " == *" patch"* || " ${BG_PHASES[*]} " == *" quiesce "* || " ${BG_PHASES[*]} " == *" cells "* ]]; then
             require_approval
         fi
     fi
@@ -841,7 +975,7 @@ main() {
     for p in ${fg_phases[@]+"${fg_phases[@]}"}; do
         # Check approval before marking a changing step as running, so a refusal leaves
         # the run's status as it was.
-        [[ "$p" == patch* || "$p" == quiesce ]] && require_approval
+        [[ "$p" == patch* || "$p" == quiesce || "$p" == cells ]] && require_approval
         CURRENT_PHASE="$p"
         set_status "running $p"
         "phase_${p}"

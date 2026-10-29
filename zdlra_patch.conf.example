@@ -51,6 +51,14 @@ PRECHECK_REQUIRE_APPROVAL=1
 PRECHECK_APPROVAL_MAX_AGE_HOURS=24
 POSTCHECK_RERUN_PRECHECK=1
 
+# --- Storage cells (cells phase) --------------------------------------------
+# Runs from the first compute node in the folder the cell patch (FILES_CELL) unzipped
+# to under /radump/patches/tmp; the folder's name is read from the zip.
+CELL_GROUP_FILE="/root/cell_group"
+CELL_PREP_STEPS=(-patch_check_prereq -reset_force -cleanup)   # before -patch, in order
+CELL_PATCH_EXTRA_ARGS=()             # e.g. (-ignore_alerts) or (-smtp_from "addr" -smtp_to "addr1 addr2")
+CELL_PATCH_TIMEOUT_MINUTES=360       # per patchmgr command; about 2 hours for 17 cells
+
 # --- Replication and incoming backups (quiesce / resume phases) -------------
 # SQL runs with sqlplus as the raadmin account. Use a connect string that needs no
 # password in this file, such as an Oracle wallet alias.
