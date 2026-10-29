@@ -235,6 +235,11 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [x] Staging unzips `patches.zip` in `/radump` and rewrites `patch.conf_<SR>` for the appliance; the patch script relies on the staged record (the `stage` phase is gone)
 - [x] Unzip the compute, cell and switch patches into `tmp/`, and move the RA patches to `/raacfs/raadmin/tmp`
 - [ ] What to do with the `FILES_PATCHBASE`, `STAGE_FILE` and `FRAMEWORK_FILE` files, if anything
+- [ ] RA software upgrade (3 steps; to come back to):
+  - [ ] Step 1, pre-install: `racli run preinstall --zdlra_release_file=/raacfs/raadmin/tmp/<zip>`, as root on node 1. Still to check:
+    - whether the precheck already covers it
+    - which `FILES_RA` file is the release zip (probably the first)
+  - [ ] Steps 2 and 3: to be described
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
