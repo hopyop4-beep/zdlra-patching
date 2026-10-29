@@ -70,6 +70,9 @@ OEM_JOBS_SUSPEND_CMD=()
 OEM_JOBS_RESUME_CMD=()
 OEM_JOBS_DIR=""                  # folder the OEM job commands run in (empty = current folder)
 declare -A OEM_JOBS_DB=()        # per appliance: the name the OEM jobs script uses ({jobs_db})
+# Output lines that mean the OEM jobs command failed, even if it exits 0: the error
+# and usage text sr_jobs_new.ksh prints for a wrong zdlra db value. Empty = exit status only.
+OEM_JOBS_FAIL_RE='zdlra db values must be|ksh -z <zdlra db>'
 SSH_OPTS=(-n -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30)   # -n: never read this terminal
 
 # Compute nodes (the "compute" phase, run from here). Paths are on the compute nodes.
@@ -196,7 +199,18 @@ run_jobs_cmd() {
         return 0
     fi
     info "[exec] $label OEM jobs: ${OEM_JOBS_DIR:+cd $OEM_JOBS_DIR && }${cmd[*]}"
-    ( if [[ -n "$OEM_JOBS_DIR" ]]; then cd "$OEM_JOBS_DIR" || exit 1; fi; "${cmd[@]}" )
+    # The output is shown as it comes and also checked: a nonzero exit or a line
+    # matching OEM_JOBS_FAIL_RE (the script's error and usage text) counts as failed.
+    local out rc
+    out="$(mktemp)"
+    ( if [[ -n "$OEM_JOBS_DIR" ]]; then cd "$OEM_JOBS_DIR" || exit 1; fi; "${cmd[@]}" ) 2>&1 | tee "$out"
+    rc=${PIPESTATUS[0]}
+    if (( rc == 0 )) && [[ -n "$OEM_JOBS_FAIL_RE" ]] && grep -qE "$OEM_JOBS_FAIL_RE" "$out"; then
+        err "$label OEM jobs: the output shows an error (matches OEM_JOBS_FAIL_RE), although the exit status was 0."
+        rc=1
+    fi
+    rm -f "$out"
+    return "$rc"
 }
 
 jobs_cmd_text() {

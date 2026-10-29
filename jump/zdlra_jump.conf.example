@@ -28,6 +28,11 @@ BLACKOUT_TARGETS[zdlra01]="<target name>:<target type>;<host name>:host"
 OEM_JOBS_DIR="/odb/oem01/swlib/softwarelibrary/automation/ZDLRA_Automation/ZDLRA_Suspend_Resume_Jobs"
 OEM_JOBS_SUSPEND_CMD=(./sr_jobs_new.ksh -z {jobs_db} -a s)
 OEM_JOBS_RESUME_CMD=(./sr_jobs_new.ksh -z {jobs_db} -a r)
+# Without -t, the script suspends/resumes all the appliance's backup jobs (I1 and ARC).
+
+# Output that means the command failed even if it exits 0: the usage text
+# sr_jobs_new.ksh prints for a wrong zdlra db value. Empty = check the exit status only.
+OEM_JOBS_FAIL_RE='zdlra db values must be|ksh -z <zdlra db>'
 
 # Per appliance: its zdlra db value for sr_jobs_new.ksh, one of GF1 GF2 CPGF0NP QAMBL
 # CPGF1 CPGF2 CP2GF0NP CP2GF1 CP2GF2 CP3GF1 CP3GF2, or the new values RAGF1 RAGF2
