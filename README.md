@@ -10,10 +10,9 @@ The script breaks a patch into phases. You can run them one at a time or all tog
 
 | Phase | What it does |
 |-------|--------------|
-| `precheck` | Checks appliance status and free space, runs your external precheck script, and shows the replication and incoming-backup activity. Then asks you to approve the results |
+| `precheck` | Checks that the patches were staged (the record left by `zdlra_stage.sh`), appliance status and free space. Runs Oracle's precheck script, which confirms the staged files are in place, and shows the replication and incoming-backup activity. Then asks you to approve the results, including which archive was staged |
 | `quiesce` | Pauses replication and records which servers it paused. Then waits, up to a time limit, for replication in progress and incoming backups to finish. `--skip-backup-wait` skips the backup wait |
 | `snapshot` | Saves configuration and state before patching |
-| `stage` | Unpacks the patch bundle into the staging directory |
 | `patch1` | Runs `racli <patch\|upgrade> appliance --step=1` |
 | `patch2` | Runs `racli <patch\|upgrade> appliance --step=2` |
 | `postcheck` | Runs the checks again and compares the result with the snapshot |
@@ -37,13 +36,15 @@ vi zdlra_patch.conf
 ./zdlra_patch.sh precheck
 
 # Real run of step 1 (prompts before it starts)
-./zdlra_patch.sh --execute precheck snapshot stage patch1
+./zdlra_patch.sh --execute precheck quiesce snapshot patch1
 
 # Later: continue the same run for step 2
-./zdlra_patch.sh --execute --run-id 20261028_140211 patch2 postcheck report
+./zdlra_patch.sh --execute --run-id 20261028_140211 patch2 postcheck resume report
 ```
 
 Each run writes its log, snapshots and report to `$WORK_DIR/<run id>/`.
+
+The patches must be staged first with `staging/zdlra_stage.sh` (see [Staging the patches](#staging-the-patches-windows-pc)). The approval covers the staged archive: if a different bundle is staged after you approve, the patch steps refuse to run.
 
 ## Replication and incoming backups
 
@@ -185,11 +186,13 @@ Copy the archive and its `.sha256` file to a Linux jump server that can reach th
 | verify | Checks the archive's SHA-256 against the `.sha256` file, once, on the jump server |
 | nodes | Finds the compute nodes: from `staging/appliances.conf`, or from `olsnodes` on the appliance |
 | distribute | Copies the archive to `/radump` on every node, skipping nodes that already have an identical copy. With `--relay`, it copies to the first node only, and that node copies on to the others |
-| check | On every node: verifies the SHA-256 and free space, and makes sure the target folder doesn't exist yet |
+| check | On every node: verifies the SHA-256 and free space. Nodes already staged with this archive are skipped from here on; a node where an earlier staging stopped partway is refused |
 | extract | Unpacks the archive on every node into `/radump/zdlra_stage/<archive name>/` |
-| post | Per-node steps after unpacking: `TODO` hooks, to be filled in |
+| place | On every node: moves the patch files to `PATCH_TARGET_DIR` and the precheck folder to `PRECHECK_TARGET_DIR`, then sets the values in `PRECHECK_CONF_SETTINGS` in the precheck's config file (the original is kept as `.orig`, and the change is logged). It checks the result and writes a staged record. Everything is checked before anything moves, and an existing file is never overwritten with a different one |
 
-At the end, the script prints a summary marking each appliance OK or FAILED. The jump server needs SSH access to the nodes without a password; the user is `root` by default and you can change it with `-u`. See `staging/appliances.conf.example` for the inventory format. Real inventories are in `.gitignore`.
+The place step reads `staging/zdlra_stage.conf` (see `zdlra_stage.conf.example`). **Its directories are placeholders for now.** Set `STAGED_RECORD` in `zdlra_patch.conf` to the record path, so the patch script finds it.
+
+Running the same archive again is safe, because nodes that are already staged are skipped. At the end, the script prints a summary marking each appliance OK or FAILED. The jump server needs SSH access to the nodes without a password; the user is `root` by default and you can change it with `-u`. See `staging/appliances.conf.example` for the inventory format. Real inventories are in `.gitignore`.
 
 ## Before you use it
 
@@ -202,11 +205,9 @@ At the end, the script prints a summary marking each appliance OK or FAILED. The
 - [x] Call an external precheck script and fail on errors
 - [ ] Fill in the replication and incoming-backup SQL (placeholders in place)
 - [ ] Verify the bundle checksum
-- [ ] Use the folder `zdlra_stage.sh` unpacked into:
-  - [ ] Precheck: the staged folder and expected files are on every compute node, and the archive's SHA-256 still matches
-  - [ ] `stage` phase: check the staged files instead of unzipping the bundle again
-  - [ ] Run the precheck script that came in the staged folder
-  - [ ] Fill in the staging hooks: unpack the patch zips where `racli` expects them, ownership and permissions, put the precheck script in place
+- [x] Staging places the patches and the precheck, and updates the precheck's config; the patch script relies on the staged record (the `stage` phase is gone)
+- [ ] Fill in the real directories and precheck settings (placeholders in place)
+- [ ] Ownership and permissions of the placed files, if the patch README asks for them
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
 - [ ] Wider before/after comparison (CRS resources, policies, replication)

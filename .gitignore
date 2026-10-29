@@ -7,3 +7,4 @@ staging/manifests/*.txt
 !staging/manifests/example.txt
 staging/appliances.conf
 jump/zdlra_jump.conf
+staging/zdlra_stage.conf

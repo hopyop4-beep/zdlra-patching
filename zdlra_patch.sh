@@ -16,7 +16,6 @@
 #   quiesce     pause replication, wait for in-flight replication and incoming backups
 #               to finish (needs an approved precheck)
 #   snapshot    save configuration and state so you can compare after patching
-#   stage       verify and unpack the patch bundle on the staging filesystem
 #   patch1      racli <action> appliance --step=1   (needs an approved precheck)
 #   patch2      racli <action> appliance --step=2   (needs an approved precheck)
 #   postcheck   rerun health checks and compare with the snapshot
@@ -42,9 +41,9 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.4.0"
+VERSION="0.5.0"
 
-ALL_PHASES=(precheck quiesce snapshot stage patch1 patch2 postcheck resume report)
+ALL_PHASES=(precheck quiesce snapshot patch1 patch2 postcheck resume report)
 
 # ---------------------------------------------------------------------------
 # Defaults (override in the config file)
@@ -63,10 +62,11 @@ SKIP_BACKUP_WAIT=0
 
 RACLI="/opt/oracle.RecoveryAppliance/bin/racli"
 PATCH_ACTION="patch"            # "patch" for a bundle patch, "upgrade" for a release upgrade
-PATCH_ZIP=""                    # full path to the patch bundle zip
-PATCH_STAGE_DIR="/radump/zdlra_patch_stage"
+# Written by staging/zdlra_stage.sh once the patches and precheck are in place.
+# TODO(site): placeholder path; must match PATCH_TARGET_DIR/STAGED_RECORD_NAME there.
+STAGED_RECORD="/radump/ra_patches/ZDLRA_STAGED.txt"
 WORK_DIR="/radump/zdlra_patch_runs"
-MIN_FREE_GB=50
+MIN_FREE_GB=50                  # free space needed in WORK_DIR's filesystem
 REQUIRED_USER="root"
 
 # External precheck script (e.g. the Oracle-supplied precheck). Not shipped in this repo.
@@ -400,10 +400,15 @@ run_external_precheck() {
 # Operator approval of the precheck
 # ---------------------------------------------------------------------------
 # Fingerprint of the before-patching results, so an approval only covers what was reviewed.
+# It includes the staged archive, so re-staging a different bundle after approval is caught.
 precheck_fingerprint() {
-    cat "${RUN_DIR}/precheck_before/failure_names.txt" "${RUN_DIR}/precheck_before/warning_names.txt" 2>/dev/null \
+    { cat "${RUN_DIR}/precheck_before/failure_names.txt" "${RUN_DIR}/precheck_before/warning_names.txt" 2>/dev/null
+      echo "staged=$(staged_value sha256)"; } \
         | sha256sum | cut -d' ' -f1
 }
+
+# A field from the staged record (archive, sha256, staged_at, ...), or empty.
+staged_value() { sed -n "s/^$1=//p" "$STAGED_RECORD" 2>/dev/null | head -1; }
 
 # Ask the operator to accept the precheck results and record who did, and when.
 # --yes does not skip this; it needs a terminal.
@@ -429,6 +434,8 @@ approve_precheck() {
         echo "Warnings:     $warns"
         [[ -s "${dir}/warning_names.txt" ]] && while IFS= read -r name; do echo "  [WARN] $name"; done < "${dir}/warning_names.txt"
         echo "Full output:  ${dir}/output.txt"
+        echo "Staged:       $(staged_value archive) (staged $(staged_value staged_at))"
+        echo "  SHA-256     $(staged_value sha256)"
         if (( ${#BG_PHASES[@]} )); then
             echo
             echo "After approval these phases run in the BACKGROUND with NO further prompts:"
@@ -468,7 +475,7 @@ require_approval() {
     age=$(( $(date +%s) - epoch ))
     max=$(( PRECHECK_APPROVAL_MAX_AGE_HOURS * 3600 ))
     (( age <= max )) || die "Precheck approval is $(( age / 3600 ))h old (limit ${PRECHECK_APPROVAL_MAX_AGE_HOURS}h). Run precheck again."
-    [[ "$fp" == "$(precheck_fingerprint)" ]] || die "Precheck results changed after they were approved. Run precheck again."
+    [[ "$fp" == "$(precheck_fingerprint)" ]] || die "Precheck results or the staged archive changed after approval. Run precheck again."
     info "Precheck approved by $by, $(( age / 60 )) minute(s) ago."
     PRESERVE_STATUS=0
 }
@@ -570,11 +577,20 @@ phase_precheck() {
     run_ro "$RACLI" version || warn "racli version failed"
     run_ro "$RACLI" status appliance || die "Appliance status check failed"
 
+    # What is being patched: staging/zdlra_stage.sh leaves this record once the patches
+    # and the precheck are in place. Oracle's precheck checks the files themselves.
+    if [[ -n "$STAGED_RECORD" ]]; then
+        [[ -f "$STAGED_RECORD" ]] || die "No staged record at $STAGED_RECORD. Stage the patches first (staging/zdlra_stage.sh)."
+        info "Staged archive: $(staged_value archive), SHA-256 $(staged_value sha256), staged $(staged_value staged_at)"
+    else
+        warn "STAGED_RECORD is not set; not checking what was staged."
+    fi
+
     run_external_precheck before
 
     local free_gb
-    free_gb=$(df -BG --output=avail "$(dirname "$PATCH_STAGE_DIR")" | tail -1 | tr -dc '0-9')
-    info "Free space near $PATCH_STAGE_DIR: ${free_gb}G (need ${MIN_FREE_GB}G)"
+    free_gb=$(df -BG --output=avail "$WORK_DIR" | tail -1 | tr -dc '0-9')
+    info "Free space for $WORK_DIR: ${free_gb}G (need ${MIN_FREE_GB}G)"
     (( free_gb >= MIN_FREE_GB )) || die "Not enough free space."
 
     # Read-only look at what quiesce will deal with, so it is part of the review.
@@ -657,16 +673,6 @@ phase_snapshot() {
     info "Snapshot saved to $snap"
 }
 
-phase_stage() {
-    info "== stage =="
-    [[ -n "$PATCH_ZIP" ]] || die "PATCH_ZIP is not set in the config."
-    [[ -f "$PATCH_ZIP" ]] || die "Patch bundle not found: $PATCH_ZIP"
-    # TODO: verify the checksum against the value published with the patch.
-    run mkdir -p "$PATCH_STAGE_DIR"
-    run unzip -o -q "$PATCH_ZIP" -d "$PATCH_STAGE_DIR"
-    # TODO: copy or link the unpacked bundle to the location racli expects for this release.
-}
-
 phase_patch1() {
     info "== patch step 1 =="
     require_approval
@@ -706,7 +712,7 @@ phase_report() {
         echo "ZDLRA patch run $RUN_ID"
         echo "Host:      $(hostname)"
         echo "Action:    $PATCH_ACTION"
-        echo "Bundle:    ${PATCH_ZIP:-<not set>}"
+        echo "Staged:    $(staged_value archive) (SHA-256 $(staged_value sha256))"
         echo "Dry run:   $DRY_RUN"
         echo "Phases:    ${PHASES[*]}"
         if [[ -f "$approval" ]]; then

@@ -1,0 +1,27 @@
+# Settings for the place step of zdlra_stage.sh. Copy to zdlra_stage.conf (not
+# committed) and edit. This file is sourced by bash.
+#
+# TODO(site): every value below is a placeholder until the real directories and
+# precheck settings are confirmed.
+
+# Where the patch files go on each compute node, and which files in the archive
+# count as patch files.
+PATCH_TARGET_DIR="/radump/ra_patches"
+PATCH_FILES_GLOB="*.zip"
+
+# The precheck folder inside the archive, and where it goes on each node.
+PRECHECK_SRC_SUBDIR="precheck"
+PRECHECK_TARGET_DIR="/radump/ra_precheck"
+
+# The precheck's config file (inside PRECHECK_TARGET_DIR), and the KEY=VALUE lines
+# to set in it. An existing KEY= line is replaced; a missing one is added. The
+# original is kept as <file>.orig. {patch_dir} and {precheck_dir} are replaced
+# with the two directories above.
+PRECHECK_CONF_FILE="precheck.conf"
+PRECHECK_CONF_SETTINGS=(
+    "PATCH_DIR={patch_dir}"
+)
+
+# Record written in PATCH_TARGET_DIR on each node once staging succeeds. Set
+# STAGED_RECORD in zdlra_patch.conf to the same path.
+STAGED_RECORD_NAME="ZDLRA_STAGED.txt"
