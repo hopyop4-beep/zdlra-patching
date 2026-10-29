@@ -26,14 +26,16 @@ COMPONENT_VARS=(COMPUTE_NODE COMPUTE_NODE_01 CELL_NODE CELL_PATCH_LAUNCH_NODE
 DBS_GROUP_FILE="/root/dbs_group"        # -> COMPUTE_NODE; first line -> COMPUTE_NODE_01, CELL_PATCH_LAUNCH_NODE
 CELL_GROUP_FILE="/root/cell_group"      # -> CELL_NODE
 SWITCH_GROUP_FILE="/root/switch_group"  # -> SWITCHES and IB_SWITCHES (RoCE switches on a RoCE rack)
+# NOTE: on an InfiniBand rack (X8 and below) the admin switch is a different type
+# from the IB switches and is not handled by the script; it needs manual changes.
 
 # How each value is found: a command run on the first compute node; output lines
 # are joined with commas. The defaults read the group files above. To change one,
 # assign that entry (the script declares the list and fills in the rest), e.g.:
 #   COMPONENT_CMDS[RA_DATABASE]='su - oracle -c "srvctl config database" | head -1'
 # RA_DATABASE defaults to the database's pmon process (ora_pmon_<db><n>) with the
-# instance number cut off. TODO(site): the default for SWITCH_TYPE (network
-# interface names: re* = roce, ib* = IB) is still a guess.
+# instance number cut off. SWITCH_TYPE comes from the network interface names
+# (re* = roce, ib* = IB).
 # components/<appliance>.conf overrides any value.
 COMPONENTS_DIR="$(dirname "${BASH_SOURCE[0]}")/components"
 

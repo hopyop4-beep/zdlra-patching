@@ -200,7 +200,7 @@ The values come from the appliance itself, read on the first compute node:
 | `COMPUTE_NODE_01`, `CELL_PATCH_LAUNCH_NODE` | First line of `/root/dbs_group` |
 | `CELL_NODE` | `/root/cell_group` |
 | `SWITCHES`, `IB_SWITCHES` | The switch group file. On a RoCE rack, both hold the RoCE switch names |
-| `SWITCH_TYPE` | Network interface names: `re*` means `roce`, `ib*` means `IB` (`TODO(site)`: not confirmed) |
+| `SWITCH_TYPE` | Network interface names: `re*` means `roce`, `ib*` means `IB` |
 | `RA_DATABASE` | The database's pmon process: `ora_pmon_<db><n>` with the instance number cut off. More than one database is refused |
 
 - **Missing group files:** if a group file is missing or empty, the script **pauses**. It names the files to create on that node, waits for you to press Enter, and checks again; type `q` to stop. With no terminal attached, it stops instead.
@@ -208,6 +208,8 @@ The values come from the appliance itself, read on the first compute node:
 - **Overrides:** `staging/components/<appliance>.conf` can override any value (see `components/example.conf`). Each command can be changed in `zdlra_stage.conf` (`COMPONENT_CMDS`).
 
 If any value can't be found, the appliance is refused, so a conf file never keeps another appliance's components.
+
+> **Admin switch on X8 and below:** on an InfiniBand rack, the admin switch is a different type from the IB switches. The script does not handle it: it warns, and **manual changes are required for the admin switch.**
 
 **Older versions:** with `OLD_VERSION_ACTION=backup` (the default), the first older `patches.zip` and `/radump/patches/` are kept as `<name>.<date>.bak`. After that, only that oldest backup is kept.
 
@@ -225,7 +227,6 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [ ] Fill in the replication and incoming-backup SQL (placeholders in place)
 - [ ] Verify the bundle checksum
 - [x] Staging unzips `patches.zip` in `/radump` and rewrites `patch.conf_<SR>` for the appliance; the patch script relies on the staged record (the `stage` phase is gone)
-- [ ] Confirm how to find `SWITCH_TYPE` on the appliance (network interface names for now)
 - [ ] What to do with each patch file named by the `FILES_*` settings
 - [ ] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout

@@ -104,8 +104,10 @@ SWITCH_GROUP_FILE="/root/switch_group"  # switches, one per line (RoCE switches 
 # node (as SSH_USER). Its output lines are joined with commas.
 # components/<appliance>.conf, if present, overrides any of them.
 # On a RoCE rack the RoCE switch names go in IB_SWITCHES as well, so both read the
-# switch group file. RA_DATABASE comes from the database's pmon process.
-# TODO(site): SWITCH_TYPE (from the network interface names) is still a guess.
+# switch group file. On an InfiniBand rack (X8 and below) the admin switch is a
+# different type and is not handled: the script warns that it needs manual changes.
+# SWITCH_TYPE comes from the network interface names (re* = roce, ib* = IB), and
+# RA_DATABASE from the database's pmon process.
 # The config can set any entry; default_component_cmds fills in the rest after the
 # config is loaded, so it uses the group file paths from the config.
 declare -A COMPONENT_CMDS=()
@@ -147,6 +149,7 @@ EXPECTED_SHA=""
 NODES=()
 TODO_NODES=()                   # nodes of the current appliance that still need staging
 declare -A COMP=()              # component values for the current appliance
+ADMIN_SWITCH_NOTE=""            # set for InfiniBand racks (X8 and below)
 
 # ---------------------------------------------------------------------------
 # Logging and helpers
@@ -464,6 +467,12 @@ step_components() {
         roce|RoCE|ROCE|ib|IB) ;;
         *) die "${z}: SWITCH_TYPE must be roce or IB (got '${COMP[SWITCH_TYPE]:-}'). Check COMPONENT_CMDS[SWITCH_TYPE] or set it in $file." ;;
     esac
+    # X8 and below (InfiniBand racks): the admin switch is a different type from the
+    # IB switches and is not handled here.
+    if [[ "${COMP[SWITCH_TYPE],,}" == ib ]]; then
+        ADMIN_SWITCH_NOTE="InfiniBand rack (X8 or below): the admin switch is not handled by this script; manual changes are required for it."
+        warn "${z}: $ADMIN_SWITCH_NOTE"
+    fi
     local missing=()
     for key in "${COMPONENT_VARS[@]}"; do
         [[ -n "${COMP[$key]:-}" || -n "${given[$key]:-}" ]] || missing+=("$key")
@@ -712,6 +721,7 @@ stage_appliance() {
     else
         info "${z}: staged on ${TODO_NODES[*]} in $STAGE_DIR (conf ${CONF_NAME} set for ${z})"
     fi
+    [[ -z "$ADMIN_SWITCH_NOTE" ]] || warn "${z}: NOTE: $ADMIN_SWITCH_NOTE"
 }
 
 # ---------------------------------------------------------------------------
