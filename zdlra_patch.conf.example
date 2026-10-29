@@ -3,9 +3,6 @@
 
 RACLI="/opt/oracle.RecoveryAppliance/bin/racli"
 
-# "patch" for a bundle patch, "upgrade" for a release upgrade
-PATCH_ACTION="patch"
-
 # Record that staging/zdlra_stage.sh writes once the patches and the precheck are
 # in place. The precheck phase stops if it is missing, and the approval covers the
 # archive it names. It is written in the unzipped folder, /radump/patches.
@@ -45,11 +42,31 @@ PRECHECK_WAIVERS=(
 PRECHECK_REQUIRED=1
 
 # After the precheck, the operator must type APPROVE. --yes does not skip this.
-# patch1/patch2 refuse to run without an approval for the same run that is
+# quiesce, the ra_* phases and cells refuse to run without an approval for the same run that is
 # younger than PRECHECK_APPROVAL_MAX_AGE_HOURS and matches the results reviewed.
 PRECHECK_REQUIRE_APPROVAL=1
 PRECHECK_APPROVAL_MAX_AGE_HOURS=24
 POSTCHECK_RERUN_PRECHECK=1
+
+# --- RA software upgrade (ra_preinstall, ra_alter, ra_update) ----------------
+# Each racli step runs in a session of its own and is never stopped by the script;
+# past its WARN minutes a warning is logged. In the arguments, {ra_release} is the
+# ZDLRA software zip from the staged record (ra_release=), and {gold_images_path} is
+# RA_GOLD_IMAGES_PATH. The precheck rolls back what ra_preinstall installs, so
+# ra_preinstall always runs after it.
+RA_PREINSTALL_ARGS=(run preinstall --zdlra_release_file={ra_release})
+RA_PREINSTALL_SUCCESS="End: ra_preinstall post cleanup"
+RA_PREINSTALL_FAIL_RE='(CHECK|HOST):.*FAIL'     # any such line in the output fails the step
+RA_PREINSTALL_DONE_FILE="/root/.ra_preinstall.install"   # must be written by this run
+RA_PREINSTALL_WARN_MINUTES=60
+# The precheck moves the gold images here; ra_alter checks both are present first.
+RA_GOLD_IMAGES_PATH="/radump/"
+RA_ALTER_ARGS=(alter appliance --online_updates --gold_images_path={gold_images_path})
+RA_ALTER_SUCCESS="End: Alter Appliance"
+RA_ALTER_WARN_MINUTES=60
+RA_UPDATE_ARGS=(update appliance --ignore_incidents)    # always --ignore_incidents
+RA_UPDATE_SUCCESS="End: Patch Recovery Appliance - Step [Patch]"
+RA_UPDATE_WARN_MINUTES=240
 
 # --- Storage cells (cells phase) --------------------------------------------
 # Runs from the first compute node in the folder the cell patch (FILES_CELL) unzipped

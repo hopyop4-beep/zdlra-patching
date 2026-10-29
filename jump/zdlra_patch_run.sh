@@ -33,6 +33,7 @@
 #   ./zdlra_patch_run.sh -z ZDLRA [-x] [-p "phase phase ..."]
 #   ./zdlra_patch_run.sh -z ZDLRA --resume RUN_ID [-x]   continue from step 2/3 for a precheck run
 #   ./zdlra_patch_run.sh -z ZDLRA --watch RUN_ID [-x]    pick up watching a run from step 6
+#   ./zdlra_patch_run.sh -z ZDLRA --continue RUN_ID [-x] after a failure is fixed: carry on
 #
 # Options:
 #   -z, --zdlra NAME        appliance (required)
@@ -42,6 +43,12 @@
 #                           marks where the compute nodes are upgraded from here
 #   -r, --resume RUN_ID     pick up a run whose precheck is running, finished or approved
 #   -w, --watch RUN_ID      watch a run whose patch phases are already going
+#       --continue RUN_ID   like --watch, for a run that failed: once the problem is
+#                           fixed, the node phases start again with --continue, so the
+#                           finished ones are skipped and the failed one runs again
+#                           (racli update carries on where it stopped). The blackout and
+#                           the suspended OEM jobs from the first attempt are kept. A
+#                           failed compute pass is picked up the same way as --watch.
 #       --keep-blackout     do not end the blackout or resume OEM jobs when the run completes
 #       --skip-backup-wait  quiesce on the node does not wait for incoming backups to finish
 #   -c, --config FILE       config file (default: zdlra_jump.conf next to this script)
@@ -54,10 +61,11 @@ CONFIG_FILE="${SCRIPT_DIR}/zdlra_jump.conf"
 INVENTORY="${SCRIPT_DIR}/../staging/appliances.conf"
 ZDLRA=""
 DRY_RUN=1
-PHASES="quiesce snapshot patch1 patch2 cells compute postcheck resume report"
+PHASES="quiesce snapshot ra_preinstall ra_alter ra_update cells compute postcheck resume report"
 SKIP_BACKUP_WAIT=0
 RESUME_RUN_ID=""
 WATCH_RUN_ID=""
+CONTINUE_RUN_ID=""
 KEEP_BLACKOUT=0
 
 SSH_USER="root"
@@ -124,6 +132,7 @@ parse_args() {
             -p|--phases)     PHASES="$2"; shift 2 ;;
             -r|--resume)     RESUME_RUN_ID="$2"; shift 2 ;;
             -w|--watch)      WATCH_RUN_ID="$2"; shift 2 ;;
+            --continue)      CONTINUE_RUN_ID="$2"; shift 2 ;;
             --keep-blackout) KEEP_BLACKOUT=1; shift ;;
             --skip-backup-wait) SKIP_BACKUP_WAIT=1; shift ;;
             -c|--config)     CONFIG_FILE="$2"; shift 2 ;;
@@ -133,14 +142,15 @@ parse_args() {
     done
     [[ -n "$ZDLRA" ]] || { usage; exit 1; }
     [[ "$ZDLRA" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "Bad appliance name: $ZDLRA"
-    [[ "$PHASES" =~ ^[a-z0-9\ ]+$ ]] || die "Bad phase list: $PHASES"
+    [[ "$PHASES" =~ ^[a-z0-9_\ ]+$ ]] || die "Bad phase list: $PHASES"
     [[ " $PHASES " != *" precheck "* ]] || die "Leave precheck out of --phases; it always runs first."
     [[ "$(grep -o '\bcompute\b' <<<"$PHASES" | wc -l)" -le 1 ]] || die "compute can appear only once in --phases."
     local id
-    for id in "$RESUME_RUN_ID" "$WATCH_RUN_ID"; do
+    for id in "$RESUME_RUN_ID" "$WATCH_RUN_ID" "$CONTINUE_RUN_ID"; do
         [[ -z "$id" || "$id" =~ ^[0-9_]+$ ]] || die "Bad run id: $id"
     done
-    [[ -z "$RESUME_RUN_ID" || -z "$WATCH_RUN_ID" ]] || die "Use --resume or --watch, not both."
+    (( (${#RESUME_RUN_ID} > 0) + (${#WATCH_RUN_ID} > 0) + (${#CONTINUE_RUN_ID} > 0) <= 1 )) \
+        || die "Use only one of --resume, --watch and --continue."
 }
 
 load_config() {
@@ -649,10 +659,12 @@ step_jobs_suspend() {
 }
 
 # Start node phases ($1, space-separated) in the background on the patch node.
+# $2 = "continue": skip the phases the node already finished in this run.
 step_patch() {
     local phases="$1"
     info "== patch (on $NODE, background): $phases =="
     local opts="--run-id $RUN_ID --background"
+    [[ "${2:-}" == continue ]] && opts+=" --continue"
     (( SKIP_BACKUP_WAIT )) && opts+=" --skip-backup-wait"
     if ! on_node "$(remote_cmd $opts $phases)"; then
         err "Could not start the patch phases on $NODE."
@@ -692,8 +704,8 @@ main() {
     trap on_interrupt INT
 
     local stage="before"
-    if [[ -n "$WATCH_RUN_ID" ]]; then
-        RUN_ID="$WATCH_RUN_ID"
+    if [[ -n "$WATCH_RUN_ID" || -n "$CONTINUE_RUN_ID" ]]; then
+        RUN_ID="${WATCH_RUN_ID:-$CONTINUE_RUN_ID}"
         STAGE="patch"
         stage="$(state_get stage)"; stage="${stage:-before}"
         info "Picking up run $RUN_ID at: $stage"
@@ -701,6 +713,7 @@ main() {
             BLACKOUT_ACTIVE=1
             (( ${#OEM_JOBS_SUSPEND_CMD[@]} == 0 )) || JOBS_SUSPENDED=1
         fi
+        [[ -z "$CONTINUE_RUN_ID" ]] || step_continue "$stage"
     else
         step_preflight
         if [[ -n "$RESUME_RUN_ID" ]]; then
@@ -752,8 +765,33 @@ main() {
 patch_failed() {
     err "Run $RUN_ID failed on $NODE. OEM jobs and the blackout are left as they are while you investigate."
     err "Details:         ssh ${SSH_USER}@${NODE} $REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID"
+    err "Once fixed:      $0 -z $ZDLRA --continue $RUN_ID$(xflag)   (finished phases are skipped)"
     print_undo
     exit 1
+}
+
+# --continue: if the node phases of this stage failed, start them again; the node skips
+# the ones it already finished. A run that is still going is only watched. Compute
+# passes pick up by themselves (a failed patchmgr step is started again).
+step_continue() {
+    local stage="$1" status
+    status="$(run_status || true)"
+    info "Status on $NODE: ${status:-unknown}"
+    case "$stage:$status" in
+        before:*failed*)
+            info "Continuing the node phases before compute."
+            step_patch "$(phases_before)" continue ;;
+        after:*failed*)
+            [[ -n "$(phases_after)" ]] || die "Nothing to continue after compute."
+            info "Continuing the node phases after compute."
+            step_patch "$(phases_after)" continue ;;
+        compute:*)
+            info "Continuing the compute passes." ;;
+        done:*)
+            die "Run $RUN_ID is already done." ;;
+        *)
+            info "The run has not failed; watching it." ;;
+    esac
 }
 
 main "$@"

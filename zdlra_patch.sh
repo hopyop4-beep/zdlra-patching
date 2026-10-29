@@ -16,8 +16,14 @@
 #   quiesce     pause replication, wait for in-flight replication and incoming backups
 #               to finish (needs an approved precheck)
 #   snapshot    save configuration and state so you can compare after patching
-#   patch1      racli <action> appliance --step=1   (needs an approved precheck)
-#   patch2      racli <action> appliance --step=2   (needs an approved precheck)
+#   ra_preinstall  racli run preinstall with the ZDLRA software from the staged
+#               record (ra_release=). Must follow the precheck: the precheck rolls
+#               back the RPM it installs
+#   ra_alter    racli alter appliance --online_updates, with the gold images the
+#               precheck put in /radump: installs the new grid and DB homes
+#   ra_update   racli update appliance --ignore_incidents: patches the appliance
+#               (about 2 hours). The three racli steps need an approved precheck,
+#               run in a session of their own and are never cut short
 #   cells       patch the storage cells with patchmgr from the cell patch folder,
 #               then check every cell is on TARGET_CELL_VERSION (needs an approved
 #               precheck)
@@ -35,6 +41,10 @@
 #                       afterwards with --approve (for long prechecks)
 #   -a, --approve       review and approve the precheck of --run-id ID (after --detach)
 #   -r, --run-id ID     continue an existing run (reuses its folder and approval)
+#       --continue      with --run-id: skip the phases this run already finished, so
+#                       the one that failed runs again (racli update carries on where
+#                       it stopped). Rerunning the precheck marks ra_preinstall as not
+#                       done, because the precheck rolls back what it installed
 #   -s, --status        show the state of the latest run, or of --run-id ID
 #       --skip-backup-wait  quiesce does not wait for incoming backups to finish
 #   -h, --help          show this help
@@ -44,9 +54,9 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.5.0"
+VERSION="0.6.0"
 
-ALL_PHASES=(precheck quiesce snapshot patch1 patch2 cells postcheck resume report)
+ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells postcheck resume report)
 
 # ---------------------------------------------------------------------------
 # Defaults (override in the config file)
@@ -62,9 +72,9 @@ STATUS_MODE=0
 FINAL_STATUS=""                 # status to record on success instead of "completed"
 PRESERVE_STATUS=0               # 1 = a failure now leaves the run's status unchanged
 SKIP_BACKUP_WAIT=0
+CONTINUE=0
 
 RACLI="/opt/oracle.RecoveryAppliance/bin/racli"
-PATCH_ACTION="patch"            # "patch" for a bundle patch, "upgrade" for a release upgrade
 # Written by staging/zdlra_stage.sh once the patches and precheck are in place.
 # It names the archive and the patch.conf_<SR> it set up (patch_conf=...).
 STAGED_RECORD="/radump/patches/ZDLRA_STAGED.txt"
@@ -91,6 +101,24 @@ PRECHECK_REQUIRED=1             # 1 = stop if PRECHECK_SCRIPT is not set
 PRECHECK_REQUIRE_APPROVAL=1     # 1 = operator must type APPROVE after the precheck
 PRECHECK_APPROVAL_MAX_AGE_HOURS=24   # patch steps refuse an approval older than this
 POSTCHECK_RERUN_PRECHECK=1      # 1 = run the same script again after patching
+
+# RA software upgrade (ra_preinstall, ra_alter, ra_update). In the arguments,
+# {ra_release} is the ZDLRA software zip from the staged record (ra_release=) and
+# {gold_images_path} is RA_GOLD_IMAGES_PATH. Each step runs in a session of its own
+# and is never stopped by this script; past its WARN minutes a warning is logged.
+RA_PREINSTALL_ARGS=(run preinstall --zdlra_release_file={ra_release})
+RA_PREINSTALL_SUCCESS="End: ra_preinstall post cleanup"
+RA_PREINSTALL_FAIL_RE='(CHECK|HOST):.*FAIL'     # any such line fails the step
+RA_PREINSTALL_DONE_FILE="/root/.ra_preinstall.install"   # written by a good preinstall
+RA_PREINSTALL_WARN_MINUTES=60
+# The precheck moves the gold images (the first two FILES_RA files) here.
+RA_GOLD_IMAGES_PATH="/radump/"
+RA_ALTER_ARGS=(alter appliance --online_updates --gold_images_path={gold_images_path})
+RA_ALTER_SUCCESS="End: Alter Appliance"
+RA_ALTER_WARN_MINUTES=60        # about 13 minutes in one sample
+RA_UPDATE_ARGS=(update appliance --ignore_incidents)
+RA_UPDATE_SUCCESS="End: Patch Recovery Appliance - Step [Patch]"
+RA_UPDATE_WARN_MINUTES=240      # about 2 hours in one sample
 
 # Storage cells (cells phase). Runs from the first compute node, in the folder the
 # cell patch (FILES_CELL) unzipped to under /radump/patches/tmp; the folder's name is
@@ -228,6 +256,19 @@ acquire_lock() {
     LOCK_HELD=1
 }
 
+# Phases this run has finished (real runs only), one per line in <run dir>/phases_done,
+# so --continue can skip them.
+phase_done() { [[ -f "${RUN_DIR}/phases_done" ]] && grep -qxF "$1" "${RUN_DIR}/phases_done"; }
+phase_mark_done() {
+    (( DRY_RUN )) && return 0
+    phase_done "$1" || echo "$1" >> "${RUN_DIR}/phases_done"
+}
+phase_undone() {
+    phase_done "$1" || return 0
+    sed -i "/^$1\$/d" "${RUN_DIR}/phases_done"
+    info "$1 is marked as not done: it runs again."
+}
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
@@ -251,6 +292,7 @@ parse_args() {
             -a|--approve)    APPROVE_MODE=1; shift ;;
             -r|--run-id)     RUN_ID="$2"; shift 2 ;;
             --skip-backup-wait) SKIP_BACKUP_WAIT=1; shift ;;
+            --continue)      CONTINUE=1; shift ;;
             -s|--status)     STATUS_MODE=1; shift ;;
             --bg-child)      BG_CHILD=1; ASSUME_YES=1; shift ;;
             -h|--help)       usage; exit 0 ;;
@@ -266,6 +308,7 @@ parse_args() {
         return 0
     fi
     (( ${#PHASES[@]} )) || { usage; exit 1; }
+    (( ! CONTINUE )) || [[ -n "$RUN_ID" ]] || die "--continue needs --run-id ID"
     if (( DETACH )); then
         [[ "${PHASES[*]}" == precheck ]] || die "--detach runs the precheck only: $SCRIPT_NAME --detach precheck"
         (( ! BACKGROUND )) || die "Use --detach or --background, not both."
@@ -329,6 +372,7 @@ show_status() {
     echo "Run:     $(basename "$dir")"
     echo "Folder:  $dir"
     echo "Status:  $(cat "${dir}/status" 2>/dev/null || echo unknown)"
+    [[ -s "${dir}/phases_done" ]] && echo "Done:    $(paste -sd' ' "${dir}/phases_done")"
     if [[ -f "${dir}/background.pid" ]]; then
         local pid
         pid="$(cat "${dir}/background.pid")"
@@ -681,6 +725,9 @@ phase_precheck() {
         warn "STAGED_RECORD is not set; not checking what was staged."
     fi
 
+    # The precheck rolls back the RPM ra_preinstall installs, so preinstall must run
+    # again, unless the upgrade has already finished (ra_update done).
+    phase_done ra_update || phase_undone ra_preinstall
     run_external_precheck before
 
     local free_gb
@@ -690,6 +737,7 @@ phase_precheck() {
 
     # Read-only look at what quiesce will deal with, so it is part of the review.
     report_activity
+    report_ra_plan
     report_cell_plan
 
     # TODO: confirm the patch is valid for the current version (compare racli version with patch README).
@@ -770,20 +818,135 @@ phase_snapshot() {
     info "Snapshot saved to $snap"
 }
 
-phase_patch1() {
-    info "== patch step 1 =="
-    require_approval
-    confirm "Run '$RACLI $PATCH_ACTION appliance --step=1'?"
-    run "$RACLI" "$PATCH_ACTION" appliance --step=1
-    # TODO: parse output/log for success markers; stop if step 1 did not complete cleanly.
+# ---------------------------------------------------------------------------
+# RA software upgrade
+# ---------------------------------------------------------------------------
+# The ZDLRA software zip (racli run preinstall) and the gold images, from the staged
+# record. The gold images are named there where staging put them; the precheck moves
+# them to RA_GOLD_IMAGES_PATH.
+ra_release_file() { staged_value ra_release; }
+ra_gold_image_names() { staged_value ra_gold_images | tr ',' '\n' | sed 's#.*/##' | sed '/^$/d'; }
+
+# Gold images missing from RA_GOLD_IMAGES_PATH, one per line (empty = all there).
+ra_gold_images_missing() {
+    local name
+    while IFS= read -r name; do
+        [[ -f "${RA_GOLD_IMAGES_PATH%/}/$name" ]] || echo "$name"
+    done < <(ra_gold_image_names)
 }
 
-phase_patch2() {
-    info "== patch step 2 =="
-    require_approval
-    confirm "Run '$RACLI $PATCH_ACTION appliance --step=2'? This stops services."
-    run "$RACLI" "$PATCH_ACTION" appliance --step=2
-    # TODO: wait for services to return, with a timeout.
+# Fill in {ra_release} and {gold_images_path}; prints one argument per line.
+ra_args() {
+    local a rel
+    rel="$(ra_release_file)"
+    for a in "$@"; do
+        a="${a//\{ra_release\}/$rel}"
+        printf '%s\n' "${a//\{gold_images_path\}/$RA_GOLD_IMAGES_PATH}"
+    done
+}
+
+# For the precheck review: what the RA steps will use. Read only; never fatal.
+report_ra_plan() {
+    local rel names missing
+    rel="$(ra_release_file)"
+    if [[ -z "$rel" ]]; then
+        warn "RA upgrade:   the staged record names no ra_release (stage again with the current staging script)"
+    elif [[ -f "$rel" ]]; then
+        info "RA software:  $rel"
+    else
+        warn "RA software:  $rel not found"
+    fi
+    names="$(ra_gold_image_names | paste -sd' ')"
+    missing="$(ra_gold_images_missing | paste -sd' ')"
+    info "Gold images:  ${names:-<none in the staged record>} (in ${RA_GOLD_IMAGES_PATH})"
+    [[ -z "$missing" ]] || warn "Gold images not in ${RA_GOLD_IMAGES_PATH}: $missing (the precheck should have moved them there)"
+    info "RA target:    $(conf_value TARGET_RA_VERSION || true)"
+}
+
+# A setting from the conf file staging set up (patch_conf in the staged record).
+conf_value() {
+    local conf
+    conf="$(staged_value patch_conf)"
+    [[ -f "$conf" ]] || return 1
+    sed -n "s/^$1=//p" "$conf" | head -1 | tr -d '\r' | sed -E "s/^[\"']//; s/[\"']$//; s/[[:space:]]+$//"
+}
+
+# Run one racli step, never cut short (run_detached), then check its log.
+# $1 = step name (log ra_<name>.log), $2 = WARN minutes, $3 = success line, rest = racli arguments
+run_racli_step() {
+    local name="$1" warn_min="$2" success="$3"; shift 3
+    local log="${RUN_DIR}/ra_${name}.log"
+    run_detached "racli $name" "$RUN_DIR" "$log" "$warn_min" "$RACLI" "$@"
+    (( DETACHED_RC == 0 )) || die "racli $name exited with code $DETACHED_RC. Log: $log"
+    grep -qF "$success" "$log" || die "racli $name did not report '$success'. Log: $log"
+    info "racli $name: completed ('$success')."
+}
+
+phase_ra_preinstall() {
+    info "== RA pre-install =="
+    local rel args=()
+    rel="$(ra_release_file)"
+    [[ -n "$rel" ]] || die "The staged record has no ra_release (the ZDLRA software zip). Stage again with the current staging script."
+    mapfile -t args < <(ra_args "${RA_PREINSTALL_ARGS[@]}")
+    if (( DRY_RUN )); then
+        [[ -f "$rel" ]] || warn "ZDLRA software zip not found: $rel"
+        info "[dry-run] $RACLI ${args[*]}  (success: '$RA_PREINSTALL_SUCCESS', no lines matching '$RA_PREINSTALL_FAIL_RE')"
+        return 0
+    fi
+    [[ -f "$rel" ]] || die "ZDLRA software zip not found: $rel"
+    confirm "Run '$RACLI ${args[*]}'?"
+    local marker="${RUN_DIR}/.ra_preinstall.start"
+    touch "$marker"
+    run_racli_step preinstall "$RA_PREINSTALL_WARN_MINUTES" "$RA_PREINSTALL_SUCCESS" "${args[@]}"
+    local log="${RUN_DIR}/ra_preinstall.log" failed
+    failed="$(grep -E "$RA_PREINSTALL_FAIL_RE" "$log" | head -20 || true)"
+    if [[ -n "$failed" ]]; then
+        while IFS= read -r line; do err "  $line"; done <<<"$failed"
+        die "racli preinstall reported failed checks. Log: $log"
+    fi
+    if [[ -n "$RA_PREINSTALL_DONE_FILE" ]]; then
+        [[ "$RA_PREINSTALL_DONE_FILE" -nt "$marker" || "$RA_PREINSTALL_DONE_FILE" -ef "$marker" ]] \
+            || die "racli preinstall did not write $RA_PREINSTALL_DONE_FILE. Log: $log"
+    fi
+    info "Pre-install passed all checks."
+}
+
+phase_ra_alter() {
+    info "== RA alter appliance (new grid and DB homes) =="
+    local args=() missing
+    mapfile -t args < <(ra_args "${RA_ALTER_ARGS[@]}")
+    missing="$(ra_gold_images_missing | paste -sd' ')"
+    if (( DRY_RUN )); then
+        [[ -z "$missing" ]] || warn "Gold images not in ${RA_GOLD_IMAGES_PATH}: $missing"
+        info "[dry-run] $RACLI ${args[*]}  (success: '$RA_ALTER_SUCCESS')"
+        return 0
+    fi
+    [[ -n "$(ra_gold_image_names)" ]] || die "The staged record names no gold images (ra_gold_images). Stage again with the current staging script."
+    [[ -z "$missing" ]] || die "Gold images not in ${RA_GOLD_IMAGES_PATH}: $missing. The precheck moves them there; check its output."
+    confirm "Run '$RACLI ${args[*]}'?"
+    run_racli_step alter "$RA_ALTER_WARN_MINUTES" "$RA_ALTER_SUCCESS" "${args[@]}"
+}
+
+phase_ra_update() {
+    info "== RA update appliance =="
+    local args=() target ver
+    mapfile -t args < <(ra_args "${RA_UPDATE_ARGS[@]}")
+    target="$(conf_value TARGET_RA_VERSION || true)"
+    if (( DRY_RUN )); then
+        info "[dry-run] $RACLI ${args[*]}  (success: '$RA_UPDATE_SUCCESS'; target ${target:-not set})"
+        return 0
+    fi
+    confirm "Run '$RACLI ${args[*]}'? It stops the appliance services while it patches (about 2 hours)."
+    run_racli_step update "$RA_UPDATE_WARN_MINUTES" "$RA_UPDATE_SUCCESS" "${args[@]}"
+    ver="$("$RACLI" version 2>&1 || true)"
+    printf '%s\n' "$ver" >> "$LOG_FILE"
+    if [[ -n "$target" ]]; then
+        if grep -qF "$target" <<<"$ver"; then
+            info "racli version shows $target."
+        else
+            warn "racli version does not show TARGET_RA_VERSION $target; check: $RACLI version"
+        fi
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -938,24 +1101,25 @@ run_detached() {
     (( DETACHED_RC != 97 )) || die "$what: cannot enter $dir. Log: $log"
 }
 
-# A patchmgr this run started, or any "patchmgr -cells" on this node, still running.
-patchmgr_running() {
-    local pid
+# A command this run started, or any "patchmgr -cells" or racli upgrade step on this
+# node, still running: prints "pid N (command)".
+long_command_running() {
+    local line
     detached_running && return 0
     if ps -eo pid=,args= >/dev/null 2>&1; then
-        pid="$(ps -eo pid=,args= | awk '$2 ~ /patchmgr$/ && / -cells / { print $1; exit }')"
-        [[ -n "$pid" ]] && { echo "pid $pid"; return 0; }
+        line="$(ps -eo pid=,args= | awk '($2 ~ /patchmgr$/ && / -cells /) || / racli (run preinstall|alter appliance|update appliance)/ { print; exit }')"
+        [[ -n "$line" ]] && { echo "pid ${line# }"; return 0; }
     fi
     return 1
 }
 
-# Called before the cells phase is marked as running, so a refusal leaves the run's
-# status as it is.
-cells_refuse_if_running() {
+# Called before a cells or RA phase is marked as running, so a refusal leaves the
+# run's status as it is.
+refuse_if_running() {
     local running
-    if running="$(patchmgr_running)"; then
+    if running="$(long_command_running)"; then
         PRESERVE_STATUS=1
-        die "A patchmgr is still running ($running). Wait for it to finish before starting the cells phase again."
+        die "Still running: $running. Wait for it to finish before starting $1 again."
     fi
 }
 
@@ -1048,7 +1212,7 @@ phase_report() {
     {
         echo "ZDLRA patch run $RUN_ID"
         echo "Host:      $(hostname)"
-        echo "Action:    $PATCH_ACTION"
+        echo "Done:      $(paste -sd' ' "${RUN_DIR}/phases_done" 2>/dev/null)"
         echo "Staged:    $(staged_value archive) (SHA-256 $(staged_value sha256))"
         echo "Dry run:   $DRY_RUN"
         echo "Phases:    ${PHASES[*]}"
@@ -1113,6 +1277,20 @@ main() {
         return 0
     fi
 
+    # --continue: leave out the phases this run already finished.
+    if (( CONTINUE )); then
+        local keep=() q
+        for q in "${PHASES[@]}"; do
+            if phase_done "$q"; then info "Already done in run $RUN_ID: $q"; else keep+=("$q"); fi
+        done
+        PHASES=(${keep[@]+"${keep[@]}"})
+        if (( ! ${#PHASES[@]} )); then
+            info "Every listed phase is already done in run $RUN_ID."
+            return 0
+        fi
+        info "Continuing run $RUN_ID with: ${PHASES[*]}"
+    fi
+
     # With --background, phases up to and including precheck run here, the rest detached.
     # With --detach, the precheck itself runs detached.
     local fg_phases=("${PHASES[@]}") p
@@ -1129,7 +1307,7 @@ main() {
             [[ "$p" == precheck ]] && split=1
         done
         # Without precheck in this run, check the existing approval now, not after detaching.
-        if (( ! ${#fg_phases[@]} )) && [[ " ${BG_PHASES[*]} " == *" patch"* || " ${BG_PHASES[*]} " == *" quiesce "* || " ${BG_PHASES[*]} " == *" cells "* ]]; then
+        if (( ! ${#fg_phases[@]} )) && [[ " ${BG_PHASES[*]} " == *" ra_"* || " ${BG_PHASES[*]} " == *" quiesce "* || " ${BG_PHASES[*]} " == *" cells "* ]]; then
             require_approval
         fi
     fi
@@ -1137,11 +1315,12 @@ main() {
     for p in ${fg_phases[@]+"${fg_phases[@]}"}; do
         # Check approval before marking a changing step as running, so a refusal leaves
         # the run's status as it was.
-        [[ "$p" == patch* || "$p" == quiesce || "$p" == cells ]] && require_approval
-        [[ "$p" == cells ]] && cells_refuse_if_running
+        [[ "$p" == ra_* || "$p" == quiesce || "$p" == cells ]] && require_approval
+        [[ "$p" == ra_* || "$p" == cells ]] && refuse_if_running "$p"
         CURRENT_PHASE="$p"
         set_status "running $p"
         "phase_${p}"
+        phase_mark_done "$p"
     done
 
     if (( ${#BG_PHASES[@]} )); then
