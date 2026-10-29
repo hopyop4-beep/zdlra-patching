@@ -34,6 +34,16 @@ OEM_JOBS_RESUME_CMD=(./sr_jobs_new.ksh -z {jobs_db} -a r)
 # sr_jobs_new.ksh prints for a wrong zdlra db value. Empty = check the exit status only.
 OEM_JOBS_FAIL_RE='zdlra db values must be|ksh -z <zdlra db>'
 
+# sr_jobs_new.ksh writes a script with one emcli command per job
+# (<zdlra db>_<suspend|resume>_job_<stamp>.ksh); it is then run here, from
+# OEM_JOBS_DIR, with its output in <same name>.log, as when run by hand. About 30
+# minutes is normal. Only the one file this run created is used. A dry run only
+# shows what would run. Empty = do not run the generated script.
+OEM_JOBS_GENERATED='{jobs_db}_{action}_job_*.ksh'
+# Lines in that log that mean an emcli command failed. The script runs every command
+# even if some fail, so these are listed as warnings and the run carries on.
+OEM_JOBS_ERROR_RE='^[[:space:]]*Error'
+
 # Per appliance: its zdlra db value for sr_jobs_new.ksh, one of GF1 GF2 CPGF0NP QAMBL
 # CPGF1 CPGF2 CP2GF0NP CP2GF1 CP2GF2 CP3GF1 CP3GF2, or the new values RAGF1 RAGF2
 # RA1GF0NP RAGF1NP RA1GF1 RA1GF2 RA2GF0NP RA2GF1 RA2GF2 RA3GF1 RA3GF2.
