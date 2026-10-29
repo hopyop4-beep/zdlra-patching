@@ -225,7 +225,8 @@ Copy the archive and its `.sha256` file to a Linux jump server that can reach th
 | configure | On every node: checks that every patch file named in the conf file's `FILES_*` settings is in `/radump/patches/patches/`, then rewrites the component settings in `/radump/patches/conf/patch.conf_<SR>` for this appliance. The original is kept as `.orig` and the change is logged |
 | unzip | Unzips into `/radump/patches/tmp/`: the db_server_patch (2nd file of `FILES_YUM`) on every node, and the cell patch (`FILES_CELL`) and switch patch (`FILES_SWITCH`) on the first node. The computepatch (1st file of `FILES_YUM`) stays in `patches/` and is checked to be there. Each setting's archives are integrity-tested before any is unzipped |
 | move | Moves the 3 `FILES_RA` files to `/raacfs/raadmin/tmp/`. That's ACFS, shared by the nodes, so the move runs once from the first node and the others check the files are there. An identical file already there is left alone; a different one is backed up (oldest backup kept) or replaced |
-| record | Writes `/radump/patches/ZDLRA_STAGED.txt` on every node, last. If any step above fails, the node isn't marked as staged, and the next run starts over |
+| identify | Finds the ZDLRA software among the `FILES_RA` files: the one zip with `ra_automation` `.pl` files. The other two are the GI and DB gold images, in their `FILES_RA` order (normally GI, DB, software; another position only gives a warning). No such zip, or more than one, stops staging |
+| record | Writes `/radump/patches/ZDLRA_STAGED.txt` on every node, last. It includes `ra_release=` (the ZDLRA software) and `ra_gold_images=` (GI, DB) for the RA upgrade. If any step above fails, the node isn't marked as staged, and the next run starts over |
 
 **Before touching any node**, the jump server reads `patch.conf_<SR>` from the zip and checks that every file its `FILES_*` settings name (plus `STAGE_FILE` and `FRAMEWORK_FILE`) is in `patches/patches/`. It then works out each appliance's component settings and shows them as old → new:
 
@@ -270,7 +271,7 @@ Running the same archive again is safe, because nodes that are already staged ar
   - [ ] Step 1, pre-install: `racli run preinstall --zdlra_release_file=/raacfs/raadmin/tmp/<zip>`.
     - Success: the output reaches `End: ra_preinstall post cleanup`, every `CHECK:`/`HOST:` line says PASS, and it writes `/root/.ra_preinstall.install`.
     - The precheck rolls back the RPM that pre-install installs. So pre-install must run after the precheck, in the window, never ahead of it. Any later precheck run (for example a recheck before continuing) undoes it again, and pre-install must then run again before `alter`.
-    - Still to check: which `FILES_RA` file is the release zip (probably the first).
+    - The release zip is the ZDLRA software, which staging finds and records as `ra_release=` (see "identify" above).
   - [ ] Step 2, alter: `racli alter appliance --online_updates --gold_images_path=/radump/`.
     - It validates the gold images and installs the new grid and DB homes (about 13 min in one sample).
     - Success: the output reaches `End: Alter Appliance`, prints the new home paths, and ends with "Please run 'racli update appliance' to finish patch process".
@@ -280,7 +281,7 @@ Running the same archive again is safe, because nodes that are already staged ar
     - If step 2 wasn't run first, `update` runs Alter Appliance itself.
   - All three run in the maintenance window. Step 2 doesn't need to run ahead of it.
   - Still to look into:
-    - the gold images in `/radump/` versus the RA patch files in `FILES_RA`: which is which, and where the gold images come from
+    - `FILES_RA` is the GI gold image, the DB gold image and the ZDLRA software, in that order. Staging moves all three to `/raacfs/raadmin/tmp`, but `alter` was given `--gold_images_path=/radump/`: which folder should it point at?
   - [ ] Continue after a failure (build together with the three steps):
     - The node records each finished phase, and `zdlra_patch.sh --continue --run-id <id>` skips them, reruns the one that failed, and carries on. For `update`, `racli` resumes on its own.
     - `zdlra_patch_run.sh --continue <run id>` does the same from the jump server. It reuses the blackout and the suspended OEM jobs from the first attempt, then watches, resumes jobs and ends the blackout as usual.

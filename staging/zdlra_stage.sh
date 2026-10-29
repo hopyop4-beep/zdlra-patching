@@ -30,6 +30,8 @@
 #               FILES_RA (3 files) -> /raacfs/raadmin/tmp. That is ACFS, shared by the
 #               compute nodes, so the move runs once on the first node and the other
 #               nodes only check the files are there
+#   identify    finds the ZDLRA software among the FILES_RA files (the zip with
+#               ra_automation .pl files); the other two are the GI and DB gold images
 #   record      writes /radump/patches/ZDLRA_STAGED.txt on every node, last, so a
 #               node only counts as staged once everything above has worked
 #
@@ -157,6 +159,13 @@ declare -A FILE_MOVE_SHARED=([FILES_RA]=1)
 
 # How many files a FILES_* setting must name (checked on the jump server).
 declare -A FILE_COUNT=([FILES_RA]=3 [FILES_YUM]=2)
+
+# FILES_RA is the GI gold image, the DB gold image and the ZDLRA software, normally in
+# that order. The ZDLRA software (the release zip for racli run preinstall) is found by
+# its contents: the one zip with ra_automation .pl files. The other two are the gold
+# images, in their FILES_RA order. All three are written to the staged record.
+RA_RELEASE_MARKER_RE='ra_automation[^[:space:]]*[.]pl$'
+RA_RELEASE_POSITION=3          # where it normally is; elsewhere only gives a warning
 
 # Patch files unpacked inside the unzipped folder:
 #   FILE_UNZIP_DIR    destination, relative to /radump/patches
@@ -971,6 +980,47 @@ step_move() {
     done
 }
 
+# Find the ZDLRA software among the FILES_RA files in their shared destination: the
+# one zip that holds ra_automation .pl files. Sets RA_RELEASE_FILE and RA_GOLD_IMAGES.
+RA_RELEASE_FILE=""
+RA_GOLD_IMAGES=""
+step_identify_ra() {
+    local z="$1" dir="${FILE_MOVE_DIR[FILES_RA]:-}" files=() f out line name result
+    local pos=0 found=() gold=() found_pos=0
+    RA_RELEASE_FILE=""; RA_GOLD_IMAGES=""
+    read -r -a files <<<"${FILES_BY_VAR[FILES_RA]:-}"
+    (( ${#files[@]} )) || { warn "${z}: no FILES_RA files; nothing to identify."; return 0; }
+    if (( DRY_RUN )); then
+        info "[dry-run] ${z}: would look for the ZDLRA software (ra_automation .pl files) among: ${files[*]} in $dir"
+        return 0
+    fi
+    # One line per file: "<name> <result>", result = release | other | notzip | missing.
+    out="$(on_node "${NODES[0]}" "cd '$dir' || exit 1
+for f in ${files[*]}; do
+  if [ ! -f \"\$f\" ]; then echo \"\$f missing\"
+  elif ! l=\$(unzip -l \"\$f\" 2>/dev/null); then echo \"\$f notzip\"
+  elif printf '%s\n' \"\$l\" | grep -Eq '$RA_RELEASE_MARKER_RE'; then echo \"\$f release\"
+  else echo \"\$f other\"; fi
+done")" || die "${z}/${NODES[0]}: cannot read the FILES_RA files in $dir"
+    for f in "${files[@]}"; do
+        pos=$(( pos + 1 ))
+        line="$(awk -v f="$f" '$1 == f { print; exit }' <<<"$out")"
+        read -r name result <<<"$line"
+        case "$result" in
+            release) found+=("$f"); found_pos=$pos ;;
+            other|notzip) gold+=("$f") ;;
+            missing) die "${z}/${NODES[0]}: $f is not in $dir" ;;
+            *) die "${z}/${NODES[0]}: could not check $f in $dir (got: ${line:-nothing})" ;;
+        esac
+    done
+    (( ${#found[@]} == 1 ))         || die "${z}: expected one FILES_RA zip with ra_automation .pl files (the ZDLRA software); found ${#found[@]}: ${found[*]-none}"
+    RA_RELEASE_FILE="${dir}/${found[0]}"
+    RA_GOLD_IMAGES="$(IFS=,; echo "${gold[*]/#/${dir}/}")"
+    info "${z}: ZDLRA software (release zip): $RA_RELEASE_FILE"
+    info "${z}: gold images (GI, DB):        $RA_GOLD_IMAGES"
+    (( found_pos == RA_RELEASE_POSITION ))         || warn "${z}: the ZDLRA software is file $found_pos of FILES_RA, not $RA_RELEASE_POSITION as usual; check that the gold images are GI then DB."
+}
+
 # Write the staged record on each node, last of all.
 step_record() {
     local z="$1" node key var f content
@@ -990,6 +1040,9 @@ sr_number=$SR_NUMBER_VALUE"
     for var in "${!FILE_MOVE_DIR[@]}"; do
         for f in ${FILES_BY_VAR[$var]}; do content+=$'\n'"moved=${var}:${f}:${FILE_MOVE_DIR[$var]}"; done
     done
+    [[ -z "$RA_RELEASE_FILE" ]] || content+=$'
+'"ra_release=${RA_RELEASE_FILE}"$'
+'"ra_gold_images=${RA_GOLD_IMAGES}"
     for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
         if (( DRY_RUN )); then
             info "[dry-run] ${node}: would write ${STAGE_DIR}/${STAGED_RECORD_NAME}"
@@ -1017,6 +1070,7 @@ stage_appliance() {
     info "== configure ==";  step_configure "$z"
     info "== unzip ==";      step_unzip "$z"
     info "== move ==";       step_move "$z"
+    info "== identify ==";   step_identify_ra "$z"
     info "== record ==";     step_record "$z"
     if (( DRY_RUN )); then
         info "${z}: dry run passed; would stage on ${TODO_NODES[*]}"
