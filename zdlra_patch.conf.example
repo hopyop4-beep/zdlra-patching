@@ -57,17 +57,23 @@ POSTCHECK_RERUN_PRECHECK=1
 SQLPLUS="sqlplus"
 RA_SQL_CONNECT=""                    # TODO(site): e.g. "/@raadmin"
 
-# TODO(site): fill these in. While any is empty, quiesce is skipped in a dry run and
-# a real run stops before patching (unless QUIESCE_ALLOW_UNCONFIGURED=1).
-#   REPLICATION_SERVERS_SQL  prints the replication servers to pause, one per line
-#                            (from ra_replication_config; pause process to be confirmed)
-#   REPLICATION_PAUSE_SQL    statement run for each server; {server} is replaced
-#   REPLICATION_RESUME_SQL   statement run for each server this run paused
+# While any of these is empty, quiesce is skipped in a dry run and a real run stops
+# before patching (unless QUIESCE_ALLOW_UNCONFIGURED=1).
+#   REPLICATION_SERVERS_SQL  prints the replication to pause, one remote_ra_dbname per
+#                            line: running servers whose role is upstream or paired
+#   REPLICATION_STATUS_SQL   shown in the precheck review (read only): every server
+#                            with its state and role
+#   REPLICATION_PAUSE_SQL    statement run for each of them; {server} is the name
+#   REPLICATION_RESUME_SQL   statement run for each one this run paused
 #   ACTIVE_REPLICATION_SQL   prints one number: replication still in flight
 #   ACTIVE_BACKUPS_SQL       prints one number: incoming backups still running
-REPLICATION_SERVERS_SQL=""
-REPLICATION_PAUSE_SQL=""             # e.g. "begin dbms_ra.pause_replication_server('{server}'); end;"
-REPLICATION_RESUME_SQL=""            # e.g. "begin dbms_ra.resume_replication_server('{server}'); end;"
+REPLICATION_SERVERS_SQL="select remote_ra_dbname from ra_replication_pair where upper(replication_server_state) = 'RUNNING' and upper(replication_server_role) in ('UPSTREAM','PAIRED');"
+REPLICATION_STATUS_SQL="select remote_ra_dbname || '  state=' || replication_server_state || '  role=' || replication_server_role from ra_replication_pair;"
+# Pause/resume each one by its remote_ra_dbname.
+# TODO(site): confirm the procedure and parameter names.
+REPLICATION_PAUSE_SQL="begin dbms_ra.pause_replication_server(replication_server_name => '{server}'); end;"
+REPLICATION_RESUME_SQL="begin dbms_ra.resume_replication_server(replication_server_name => '{server}'); end;"
+# TODO(site): the two count queries.
 ACTIVE_REPLICATION_SQL=""
 ACTIVE_BACKUPS_SQL=""
 

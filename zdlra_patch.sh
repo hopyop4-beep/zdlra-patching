@@ -92,11 +92,17 @@ POSTCHECK_RERUN_PRECHECK=1      # 1 = run the same script again after patching
 # SQL on the appliance, as the raadmin account (see the config example).
 SQLPLUS="sqlplus"
 RA_SQL_CONNECT=""               # e.g. /@raadmin (wallet alias); empty = SQL steps not set up
-# TODO(site): queries and statements, to be provided. Each query prints one value per
-# line; the count queries print a single number. {server} is replaced in the statements.
-REPLICATION_SERVERS_SQL=""      # active replication servers to pause (from ra_replication_config)
-REPLICATION_PAUSE_SQL=""        # e.g. begin dbms_ra.pause_replication_server('{server}'); end;
-REPLICATION_RESUME_SQL=""       # e.g. begin dbms_ra.resume_replication_server('{server}'); end;
+# Each query prints one value per line; the count queries print a single number.
+# {server} in the statements is a remote_ra_dbname from REPLICATION_SERVERS_SQL.
+# Replication to pause: every running upstream or paired replication server.
+REPLICATION_SERVERS_SQL="select remote_ra_dbname from ra_replication_pair where upper(replication_server_state) = 'RUNNING' and upper(replication_server_role) in ('UPSTREAM','PAIRED');"
+# Shown in the precheck review: every replication server with its state and role.
+REPLICATION_STATUS_SQL="select remote_ra_dbname || '  state=' || replication_server_state || '  role=' || replication_server_role from ra_replication_pair;"
+# Pause/resume each one by its remote_ra_dbname.
+# TODO(site): confirm the procedure and parameter names. If they are wrong, the first
+# pause fails with an SQL error and the run stops before patching.
+REPLICATION_PAUSE_SQL="begin dbms_ra.pause_replication_server(replication_server_name => '{server}'); end;"
+REPLICATION_RESUME_SQL="begin dbms_ra.resume_replication_server(replication_server_name => '{server}'); end;"
 ACTIVE_REPLICATION_SQL=""       # count of replication still in flight
 ACTIVE_BACKUPS_SQL=""           # count of incoming backups still running
 QUIESCE_POLL_SECONDS=60
@@ -570,9 +576,14 @@ report_activity() {
         warn "Replication/backup checks not set up yet (TODO in config: $missing)."
         return 0
     fi
-    local servers n
+    local servers n line
+    if [[ -n "${REPLICATION_STATUS_SQL:-}" ]]; then
+        servers="$(sql_rows "$REPLICATION_STATUS_SQL")" || die "Could not read the replication configuration."
+        info "Replication pairs (ra_replication_pair):"
+        while IFS= read -r line; do info "    $line"; done <<<"${servers:-(no replication servers)}"
+    fi
     servers="$(sql_rows "$REPLICATION_SERVERS_SQL")" || die "Could not list replication servers."
-    info "Replication servers to pause: $(tr '\n' ' ' <<<"${servers:-none}")"
+    info "Replication servers to pause (running, upstream or paired): $(tr '\n' ' ' <<<"${servers:-none}")"
     n="$(sql_count "$ACTIVE_REPLICATION_SQL")" || die "Could not count active replication."
     info "Replication in flight now: $n"
     n="$(sql_count "$ACTIVE_BACKUPS_SQL")" || die "Could not count incoming backups."

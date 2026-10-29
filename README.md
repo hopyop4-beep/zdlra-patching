@@ -48,12 +48,13 @@ The patches must be staged first with `staging/zdlra_stage.sh` (see [Staging the
 
 ## Replication and incoming backups
 
-The `precheck`, `quiesce` and `resume` phases run SQL with `sqlplus` as the raadmin account. `RA_SQL_CONNECT` sets the connection; use a wallet alias, so no password goes in the config. The queries and statements are settings in `zdlra_patch.conf`, and for now they are `TODO` placeholders:
+The `precheck`, `quiesce` and `resume` phases run SQL with `sqlplus` as the raadmin account. `RA_SQL_CONNECT` sets the connection; use a wallet alias, so no password goes in the config. The queries and statements are settings in `zdlra_patch.conf`. The replication ones have defaults; the connection and the two count queries are still `TODO` placeholders:
 
 | Setting | What it must do |
 |---|---|
-| `REPLICATION_SERVERS_SQL` | Print the replication servers to pause, one per line (from `ra_replication_config`) |
-| `REPLICATION_PAUSE_SQL` / `REPLICATION_RESUME_SQL` | Statement to run for each server; `{server}` is replaced |
+| `REPLICATION_SERVERS_SQL` | Print the replication to pause, one `remote_ra_dbname` per line. Default: from `ra_replication_pair`, every server whose state is running and whose role is upstream or paired |
+| `REPLICATION_STATUS_SQL` | Shown in the precheck review: every pair with its state and role (read only) |
+| `REPLICATION_PAUSE_SQL` / `REPLICATION_RESUME_SQL` | Statement to run for each one; `{server}` is the `remote_ra_dbname`. Default: `dbms_ra.pause_replication_server` / `resume_replication_server` (procedure name still to be confirmed) |
 | `ACTIVE_REPLICATION_SQL` | Print one number: replication still in progress |
 | `ACTIVE_BACKUPS_SQL` | Print one number: incoming backups still running |
 
