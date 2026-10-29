@@ -76,8 +76,6 @@ OEM_JOBS_FAIL_RE='zdlra db values must be|ksh -z <zdlra db>'
 # The script sr_jobs_new.ksh writes, which is then run here ({action} = suspend or
 # resume, {jobs_db} as above). Empty = only run the command itself.
 OEM_JOBS_GENERATED='{jobs_db}_{action}_job_*.ksh'
-# Lines in the generated script's log that mean an emcli command failed.
-OEM_JOBS_ERROR_RE='^[[:space:]]*Error'
 SSH_OPTS=(-n -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30)   # -n: never read this terminal
 
 # Compute nodes (the "compute" phase, run from here). Paths are on the compute nodes.
@@ -227,7 +225,7 @@ run_jobs_cmd() {
 # sr_jobs_new.ksh only writes a script (<jobs_db>_<suspend|resume>_job_<stamp>.ksh) with
 # one emcli command per job; this runs it. Exactly one such file must be newer than the
 # marker, so an older one is never run. Its output goes to <same name>.log (as when run
-# by hand) and to the screen. emcli errors in the log (OEM_JOBS_ERROR_RE) count as failed.
+# by hand) and to the screen; then each job is checked for its success line (see below).
 # $1 = suspend | resume, $2 = marker file made before sr_jobs_new.ksh ran
 run_generated_jobs_script() {
     local label="$1" marker="$2" dir="${OEM_JOBS_DIR:-.}" pattern found=() f log rc n
@@ -243,16 +241,24 @@ run_generated_jobs_script() {
     ( cd "$dir" || exit 1; if [[ -x "$f" ]]; then "./$f"; else ksh "./$f"; fi ) 2>&1 | tee "$dir/$log"
     rc=${PIPESTATUS[0]}
     # The script runs every emcli command even if some fail, so its exit status says
-    # little. Failed commands are listed as warnings and the run carries on; jobs that
-    # are still running are caught by the wait for incoming backups before patching.
-    n=0
-    [[ -z "$OEM_JOBS_ERROR_RE" ]] || n="$(grep -cE "$OEM_JOBS_ERROR_RE" "$dir/$log" || true)"
-    if (( n > 0 )); then
-        warn "$label OEM jobs: $n emcli error line(s) in $dir/$log (carrying on):"
-        grep -E "$OEM_JOBS_ERROR_RE" "$dir/$log" | head -20 | sed 's/^/  /' >&2
+    # little. Instead, every job it names (-name="...") must have a line
+    # Job "<name>" <suspended|resumed> successfully in the log. Jobs without one are
+    # listed as warnings and the run carries on; jobs that are still running are
+    # caught by the wait for incoming backups before patching.
+    local jobs=() missing=() j total
+    mapfile -t jobs < <(sed -n 's/.*-name="\([^"]*\)".*/\1/p' "$dir/$f")
+    total=${#jobs[@]}
+    for j in ${jobs[@]+"${jobs[@]}"}; do
+        grep -qF "Job \"$j\" " "$dir/$log" && grep -F "Job \"$j\" " "$dir/$log" | grep -q 'successfully' \
+            || missing+=("$j")
+    done
+    if (( ${#missing[@]} )); then
+        warn "$label OEM jobs: ${#missing[@]} of $total job(s) not reported 'successfully' in $dir/$log (carrying on):"
+        printf '  %s\n' "${missing[@]:0:20}" >&2
+        (( ${#missing[@]} <= 20 )) || warn "  ... and $(( ${#missing[@]} - 20 )) more (see the log)"
     fi
     (( rc == 0 )) || warn "$label OEM jobs: $f exited with status $rc (see $dir/$log)."
-    info "$label OEM jobs: $f finished; log $dir/$log"
+    info "$label OEM jobs: $f finished, $(( total - ${#missing[@]} )) of $total job(s) ${label%e}ed successfully; log $dir/$log"
 }
 
 jobs_cmd_text() {
