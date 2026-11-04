@@ -112,7 +112,7 @@ LOG_DIR="${HOME}/zdlra_jump_logs"
 
 NODE=""
 RUN_ID=""
-STAGE="precheck"                 # what is running on the node: precheck or patch
+WATCHING="precheck"                 # what is running on the node: precheck or patch
 BLACKOUT_ACTIVE=0
 JOBS_SUSPENDED=0
 
@@ -123,7 +123,7 @@ err()  { log ERROR "$@"; }
 die()  {
     err "$@"
     # During compute, say how to pick up again and what is still on.
-    if [[ "${STAGE:-}" == compute ]]; then
+    if [[ "${WATCHING:-}" == compute ]]; then
         err "Fix the problem, then pick up again: $0 -z $ZDLRA --watch $RUN_ID$(xflag)"
         err "(a failed patchmgr step is started again; finished passes are skipped)"
         print_undo
@@ -181,7 +181,7 @@ pick_node() {
     [[ "$NODE" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "Bad node name: $NODE"
 }
 
-on_node() { ssh "${SSH_OPTS[@]}" "${SSH_USER}@${NODE}" "$@"; }
+on_node() { on "$NODE" "$@"; }
 
 remote_cmd() {
     local cmd="$REMOTE_SCRIPT -c $REMOTE_CONFIG $*"
@@ -287,7 +287,7 @@ run_generated_jobs_script() {
     mapfile -t jobs < <(sed -n 's/.*-name="\([^"]*\)".*/\1/p' "$dir/$f")
     total=${#jobs[@]}
     for j in ${jobs[@]+"${jobs[@]}"}; do
-        grep -qF "Job \"$j\" " "$dir/$log" && grep -F "Job \"$j\" " "$dir/$log" | grep -q 'successfully' \
+        grep -F "Job \"$j\" " "$dir/$log" | grep -q 'successfully' \
             || missing+=("$j")
     done
     if (( ${#missing[@]} )); then
@@ -324,7 +324,7 @@ jobs_resume_text() {
 # What to undo by hand after a failure or interruption, once the work has started.
 print_undo() {
     # The node records which replication servers this run paused; its resume phase undoes only those.
-    [[ "$STAGE" == patch || "$STAGE" == compute ]] && err "Resume replication (if quiesce paused it): ssh ${SSH_USER}@${NODE} $(remote_cmd --run-id "$RUN_ID" resume)"
+    [[ "$WATCHING" == patch || "$WATCHING" == compute ]] && err "Resume replication (if quiesce paused it): ssh ${SSH_USER}@${NODE} $(remote_cmd --run-id "$RUN_ID" resume)"
     (( JOBS_SUSPENDED )) && err "Resume OEM jobs: $(jobs_resume_text)"
     (( BLACKOUT_ACTIVE )) && err "End blackout:    ${SCRIPT_DIR}/oem_blackout.sh stop -z $ZDLRA -x"
     return 0
@@ -609,7 +609,6 @@ compute_pass() {
     # Picking up a precheck that already failed: start it again.
     if [[ "$from" == precheck_wait ]] && [[ "$(job_rc "$runner" "precheck_${target}")" =~ ^[1-9][0-9]*$ ]]; then
         info "$runner: the previous patchmgr -precheck for $target failed; starting it again"
-        from=precheck
         compute_pass "$runner" "$target" precheck
         return
     fi
@@ -643,12 +642,12 @@ compute_pass() {
 
 step_compute() {
     info "== compute (from the jump server) =="
-    STAGE="compute"
+    WATCHING="compute"
     compute_gather
     info "Compute nodes: ${C_NODES[*]}; target $C_TARGET"
     info "ISO repo: $C_ISO"
     info "db_server_patch: $C_DIR"
-    local pass runner target
+    local runner target
     if (( DRY_RUN )); then
         while read -r runner target; do
             info "[dry-run] on $runner: db_nodes file with only $target; cd $C_DIR; unzip -q dbnodeupdate.zip"
@@ -740,15 +739,15 @@ step_precheck_start() {
 
 on_interrupt() {
     echo >&2
-    if [[ "$STAGE" == compute ]]; then
+    if [[ "$WATCHING" == compute ]]; then
         warn "Stopped watching. patchmgr keeps running on its compute node; nothing is stopped."
         warn "Watch again:     $0 -z $ZDLRA --watch $RUN_ID$(xflag)"
         warn "Watching again picks up the compute pass where it was, then carries on."
         print_undo
-    elif [[ "$STAGE" == verify ]]; then
+    elif [[ "$WATCHING" == verify ]]; then
         warn "Stopped watching. verify keeps running on $NODE; the patching is finished, OEM jobs are resumed and the blackout ended."
         warn "Watch again:     $0 -z $ZDLRA --watch $RUN_ID$(xflag)"
-    elif [[ "$STAGE" == precheck ]]; then
+    elif [[ "$WATCHING" == precheck ]]; then
         warn "Stopped watching. The precheck keeps running on $NODE; nothing has changed yet."
         warn "Continue later:  $0 -z $ZDLRA --resume $RUN_ID$(xflag)"
     else
@@ -766,7 +765,7 @@ on_interrupt() {
 #   precheck: "awaiting approval", "precheck approved" or "completed" are good
 #   patch:    "completed" is good
 watch_until_done() {
-    info "== watch $STAGE (every ${POLL_SECONDS}s; Ctrl-C stops watching only) =="
+    info "== watch $WATCHING (every ${POLL_SECONDS}s; Ctrl-C stops watching only) =="
     local status last="" misses=0
     while :; do
         status="$(run_status || true)"
@@ -776,7 +775,7 @@ watch_until_done() {
                 info "$NODE: $status"
                 last="$status"
             fi
-            case "$STAGE:$status" in
+            case "$WATCHING:$status" in
                 *:*failed*)                                 echo "$status"; return 1 ;;
                 precheck:*awaiting\ approval*|precheck:*precheck\ approved*|*:*completed*)
                                                             echo "$status"; return 0 ;;
@@ -835,7 +834,7 @@ step_patch() {
         print_undo
         exit 1
     fi
-    STAGE="patch"
+    WATCHING="patch"
 }
 
 # Start a stage's node phases. started=0 is recorded first, so if the start fails, the
@@ -908,7 +907,7 @@ main() {
     local stage="before"
     if [[ -n "$WATCH_RUN_ID" || -n "$CONTINUE_RUN_ID" ]]; then
         RUN_ID="${WATCH_RUN_ID:-$CONTINUE_RUN_ID}"
-        STAGE="patch"
+        WATCHING="patch"
         load_run_settings
         stage="$(state_get stage)"; stage="${stage:-before}"
         info "Picking up run $RUN_ID at: $stage"
@@ -955,7 +954,7 @@ main() {
             step_compute
             stage=after
             if [[ -n "$(phases_after)" ]]; then
-                STAGE="patch"
+                WATCHING="patch"
                 start_stage after "$(phases_after)"
             else
                 state_set stage=after started=1
@@ -963,7 +962,7 @@ main() {
         fi
     elif [[ "$stage" == compute ]]; then
         step_compute
-        STAGE="patch"
+        WATCHING="patch"
         if [[ -n "$(phases_after)" ]]; then
             start_stage after "$(phases_after)"
         else
@@ -988,7 +987,7 @@ main() {
         fi
     fi
     if [[ "$stage" == verify ]]; then
-        STAGE="verify"
+        WATCHING="verify"
         watch_until_done >/dev/null || {
             err "verify failed on $NODE. The patching itself completed; OEM jobs are resumed and the blackout ended."
             err "Details:         ssh ${SSH_USER}@${NODE} $REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID"

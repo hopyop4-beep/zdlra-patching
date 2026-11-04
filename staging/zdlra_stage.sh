@@ -49,7 +49,8 @@
 # is kept as <name>.<date>.bak. Once a backup exists, later older versions are
 # replaced without another backup, so only the oldest is kept.
 #
-# STATUS: skeleton. Commands that change something run only with --execute.
+# STATUS: not yet run on a real appliance. Commands that change something run only with
+# --execute.
 #
 # Usage:
 #   ./zdlra_stage.sh [options] -a patches.zip -z ZDLRA [-z ZDLRA ...]
@@ -455,7 +456,7 @@ verify_local() {
     # Files to unpack.
     local which list
     for var in "${!FILE_UNZIP_DIR[@]}"; do
-        list="$(unzip_files "$var")" || die "$(cat <<<"$list")"
+        list="$(unzip_files "$var")" || die "$list"
         [[ -n "$list" ]] || die "The conf file names no files in $var, but FILE_UNZIP_DIR has a destination for it."
         for f in $list; do
             case "$f" in *.zip|*.tar|*.tar.gz|*.tgz) ;; *) die "$var: $f is not a .zip or .tar file; cannot unpack it." ;; esac

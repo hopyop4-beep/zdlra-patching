@@ -4,7 +4,7 @@ From a code review of all the code on `main` (commit 59ab2d5), on 2026-11-03. No
 are fixed yet. Line numbers are from that commit. Almost all of this also applies to the
 `platinum` branch, which has its own list in `docs/platinum-known-bugs.md`.
 
-**Bugs 1-36 and 43-48 are fixed (2026-11-03), tested with stand-ins only.** The rest are still open. Even a dry run executes the real precheck, which changes the system.
+**Bugs 1-36 and 38-48 are fixed (2026-11-03), tested with stand-ins only.** Only item 37 is open. Even a dry run executes the real precheck, which changes the system.
 
 How far each finding was checked:
 
@@ -151,35 +151,23 @@ Each node's archive is now hashed once per run (half of bug 40).
 37. **Cell patching command** (`zdlra_patch.sh:1230`). The user confirmed on 2026-11-03 that ZDLRA cell
     patching is non-rolling, and will check the actual command during testing. The script's plain
     `-patch` with no `-rolling` should fit that, as far as I recall, but it hasn't been checked. The
-    README (line 321) is wrong to say "rolling is handled by `patchmgr`": correct it. The order of
-    the prep steps is settled: see bug 43.
+    README is corrected. The order of the prep steps is settled: see bug 43.
 
-## Bloat and stale docs
+## Fixed: bloat and stale docs (38-42)
 
-38. **Dead code:**
-    - `zdlra_patch.sh`: `run()` (`:220`) and `sql_ready` (`:646`) have no callers, and `phase_verify`
-      re-implements `sql_ready` (`:1474`). Also the `-ef` test (`:948`), the always-true `ALL_PHASES`
-      guard (`:1026`), the redundant `ps` probe (`:1153`) and the nested `note()` (`:1472`).
-    - `jump/zdlra_patch_run.sh`: `from=precheck` (`:483`), the unused `local pass` (`:522`), and the
-      repeated `grep` (`:266`).
-39. **Duplicates:**
-    - Conf parsing is repeated (`zdlra_patch.sh:485`, `:911`, `:1018`); use `conf_value`.
-    - The node and the jump server have separate detached-command code that has drifted apart (bugs
-      19 and 28).
-    - `on_node` is just `on "$NODE"` (`jump/zdlra_patch_run.sh:177`). `STAGE` and the local `stage`
-      are near-identical names with different meanings.
-    - `$(cat <<<"$list")` is just `"$list"` (`staging/zdlra_stage.sh:444`).
-40. **Wasted time:** `sha256sum` runs on one node at a time, on a very large archive
-    (`staging/zdlra_stage.sh`). Twice per node is fixed, as is the repeated `du -sb`.
+38. **Dead code:** removed `run()`, the `-ef` test, the always-true `ALL_PHASES` guard, the extra `ps` probe,
+    `from=precheck`, the unused `local pass` and the repeated `grep`. `phase_verify` uses `sql_ready`, and
+    `note()` is now `verify_note`.
+39. **Duplicates:** conf parsing uses `conf_value`; `on_node` calls `on`; the jump server's `STAGE` is now
+    `WATCHING`, as it was too close to the local `stage`.
+    **Left as it is:** the node and the jump server keep separate detached-command code. One runs locally
+    and one is sent over ssh to a node with no copy of the scripts, so sharing it would add more than it
+    saves.
+40. **Wasted time:** each node's archive is hashed once per run, and `du -sb` runs once.
+    **Left as it is:** hashing one node at a time. Doing it in parallel isn't worth the extra code.
 41. **Misleading output:**
-    - The advertised `tail -f` of the run log shows nothing during the longest steps
-      (`zdlra_patch.sh:1584`, `:1144`), because a step's log is only added once it finishes.
-    - Snapshot diffs always differ, because of a timestamped log line in each file
-      (`zdlra_patch.sh:854`, `:1342`).
-42. **Stale docs:**
-    - The "skeleton" status text (`zdlra_patch.sh:5`, `staging/zdlra_stage.sh:52`, `README.md:5`).
-    - Roadmap items that are already done (`README.md:288`, `:305`, `:313`).
-    - Switches are missing from the approval and overlap lists (`README.md:61`, `:62`, `:85`,
-      `zdlra_patch.conf.example:45`).
-    - An old precheck example that drops the SR argument (`README.md:126`,
-      `staging/manifests/example.txt:6`).
+    - `--status` now names a running step's own log and shows its last lines. `tail -f` on the run log still
+      only gets a step's output when it ends, and the script now says so.
+    - Snapshot files hold only the command's output, so the before/after diff shows real changes.
+42. **Stale docs:** the status text, roadmap items, switches in the approval and warning lists, and the old
+    precheck example are all corrected.

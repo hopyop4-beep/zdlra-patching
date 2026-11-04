@@ -2,7 +2,7 @@
 
 A phased Bash script to automate patching of the Oracle Zero Data Loss Recovery Appliance (ZDLRA).
 
-> **Status: early skeleton.** The structure, logging, dry run, locking and config handling work. Several checks are still `TODO`. Do not run it against a production appliance yet.
+> **Status: not yet run on a real appliance.** Everything has been tested with stand-ins only. See [docs/testing-notes.md](docs/testing-notes.md) for what to test, and [docs/known-bugs.md](docs/known-bugs.md) for what was found and fixed. Do not run it against a production appliance yet.
 
 ## How it works
 
@@ -60,7 +60,7 @@ The patches must be staged first with `staging/zdlra_stage.sh` (see [Staging the
 An interrupted `patchmgr` session or `racli` upgrade step can cause major problems. So the script runs each one in a session of its own (`setsid`, `nohup`, no terminal), with its output written straight to a log file:
 
 - **Nothing reaches it:** stopping the script, a dropped SSH session or a closed terminal doesn't affect the command. The script only waits for it, shows its log as it grows, and reads its exit status from a file.
-- **No time limit stops it:** past `CELL_PATCH_WARN_MINUTES` (or `RA_PREINSTALL_WARN_MINUTES`, `RA_ALTER_WARN_MINUTES`, `RA_UPDATE_WARN_MINUTES`), the script only logs a warning and keeps waiting.
+- **No time limit stops it:** past `CELL_PATCH_WARN_MINUTES` (or `SWITCH_PATCH_WARN_MINUTES`, `RA_PREINSTALL_WARN_MINUTES`, `RA_ALTER_WARN_MINUTES`, `RA_UPDATE_WARN_MINUTES`, `PRECHECK_WARN_MINUTES`), the script only logs a warning and keeps waiting.
 - **Nothing starts over it:** the `precheck`, `cells`, `switches` and `ra_*` phases refuse to start while the Oracle precheck, a `patchmgr` run or a `racli` upgrade step is still running on the node, and staging refuses to replace `/radump/patches` while one is, or while a run holds the lock.
 - **A finished command is not run again:** if the script stopped while a command ran on to the end, the next attempt (`--continue`) picks up that command's result rather than running it again. A cells `-patch` or switches `--upgrade` that has worked is never repeated in the same run. The log of an earlier attempt is kept, with a date on its name.
 - **If the script itself stops while the command runs,** it says so, and leaves the command running. The run's status becomes "… still running (pid …), do not start it again until it finishes". The lock passes to the command, so nothing can start over it until it ends.
@@ -85,7 +85,7 @@ If a run fails after `quiesce`, replication stays paused. Once the appliance is 
 
 After the precheck, the script shows the failures, warnings and exit code, then waits for you to type `APPROVE`. `--yes` does not skip this. The approval is saved in `<run id>/precheck_approval.txt` with who approved it, when, and a fingerprint of the results.
 
-`quiesce`, the `ra_*` phases and `cells` refuse to run unless the run has an approval that:
+`quiesce`, the `ra_*` phases, `cells` and `switches` refuse to run unless the run has an approval that:
 
 - belongs to the same run, either the current one or the one named with `--run-id`
 - is no older than `PRECHECK_APPROVAL_MAX_AGE_HOURS` (24 by default)
@@ -97,7 +97,8 @@ With `--background`, the precheck runs in your terminal. After you approve it, t
 # Precheck in the terminal; after approval, everything else in the background
 ./zdlra_patch.sh --execute --background all
 
-# Follow it
+# Follow it (a long step such as racli update has a log of its own: --status names it,
+# and shows its last lines; it reaches this log when the step ends)
 tail -f /radump/zdlra_patch_runs/<run id>/zdlra_patch.log
 
 # Check its state: phase, process, approval, recent log lines
@@ -128,8 +129,8 @@ From the jump server, `zdlra_patch_run.sh -z <appliance> --continue <run id> -x`
 The `precheck` phase calls a precheck script you provide, such as the one Oracle supplies to support customers. Set it in the config:
 
 ```bash
-PRECHECK_SCRIPT="/root/zdlra/precheck/<precheck-script>"
-PRECHECK_ARGS=()
+PRECHECK_SCRIPT="/radump/patches/bin/precheck"
+PRECHECK_ARGS=(-srnumber={sr_number})
 PRECHECK_WAIVERS=("a failure you have reviewed and accepted")
 ```
 
@@ -292,7 +293,7 @@ Running the same archive again is safe, because nodes that are already staged ar
 
 - [x] Call an external precheck script and fail on errors
 - [x] Replication and incoming-backup SQL (no wait for replication already in progress, by choice)
-- [ ] Verify the bundle checksum
+- [x] Verify the bundle checksum (in staging)
 - [x] Staging unzips `patches.zip` in `/radump` and rewrites `patch.conf_<SR>` for the appliance; the patch script relies on the staged record (the `stage` phase is gone)
 - [x] Unzip the compute, cell and switch patches into `tmp/`, and move the RA patches to `/raacfs/raadmin/tmp`
 - [ ] What to do with the `FILES_PATCHBASE`, `STAGE_FILE` and `FRAMEWORK_FILE` files, if anything
@@ -309,15 +310,14 @@ Running the same archive again is safe, because nodes that are already staged ar
     - On an error it stops; running it again carries on from where it failed. About 2h in one sample.
     - If step 2 wasn't run first, `update` runs Alter Appliance itself.
   - All three run in the maintenance window. Step 2 doesn't need to run ahead of it.
-  - Still to look into:
-    - `FILES_RA` is the GI gold image, the DB gold image and the ZDLRA software, in that order. Staging moves all three to `/raacfs/raadmin/tmp`; the precheck then moves the gold images to `/radump`, which is why `alter` uses `--gold_images_path=/radump/`. Before `alter`, check that both gold images (named in `ra_gold_images=`) are in `/radump`.
+  - `FILES_RA` is the GI gold image, the DB gold image and the ZDLRA software, in that order. Staging moves all three to `/raacfs/raadmin/tmp`; the precheck then moves the gold images to `/radump`, which is why `alter` uses `--gold_images_path=/radump/`. Before `alter`, check that both gold images (named in `ra_gold_images=`) are in `/radump`.
   - [x] Continue after a failure (see "Continuing after a failure" above):
     - The node records each finished phase, and `zdlra_patch.sh --continue --run-id <id>` skips them, reruns the one that failed, and carries on. For `update`, `racli` resumes on its own.
     - `zdlra_patch_run.sh --continue <run id>` does the same from the jump server. It reuses the blackout and the suspended OEM jobs from the first attempt, then watches, resumes jobs and ends the blackout as usual.
     - The approval must still be valid (today 24h), possibly with a separate limit for continuing.
     - All three `racli` steps (`preinstall`, `alter`, `update`) can be run again after a failure, so continuing simply reruns the failed one.
     - If continuing reruns the precheck, it also marks pre-install as not done, so pre-install runs again (the precheck rolled back its RPM).
-- [ ] Check success markers in the logs after each step
+- [x] Check success markers in the logs after each step
 - [ ] Wait for services after step 2, with a timeout
 - [ ] Wider before/after comparison (CRS resources, policies, replication)
 - [x] Operator approval of the precheck, and background runs
@@ -325,7 +325,7 @@ Running the same archive again is safe, because nodes that are already staged ar
 - [x] Version table after patching (`postcheck`), shown in the report
 - [ ] Backups and replication arrive after patching (`verify`): the two queries are still to be filled in
 - [x] Exadata infrastructure patching with `patchmgr`. The order in the window is: RA upgrade, cells, compute, switches. The node runs the RA upgrade, then `cells`; the jump server then runs `compute`; then the node runs `switches`:
-  - [x] Storage cells (`cells` phase; rolling is handled by `patchmgr` itself)
+  - [x] Storage cells (`cells` phase; non-rolling on ZDLRA, the command is still to be checked in testing)
   - [x] Compute nodes (`compute`, from the jump server; see "Compute nodes" above). Both passes are run from the jump server, with each `patchmgr` detached on the node so nothing can cut it short:
     - Pass 1: on node 1, `patchmgr -dbnodes` (the other nodes) `-precheck ... -nomodify_at_prereq`, then `-upgrade`. Node 2 reboots.
     - Pass 2: on node 2, the same against node 1. Node 1 reboots.

@@ -2,9 +2,9 @@
 #
 # zdlra_patch.sh - phased automation for Zero Data Loss Recovery Appliance (ZDLRA) patching
 #
-# STATUS: skeleton. Every phase logs what it would do; real commands run only with
-# --execute, and several phases are still TODO. Check each racli command against the
-# README that ships with your patch and the current Oracle patching note before use.
+# STATUS: not yet run on a real appliance (see docs/testing-notes.md). Real commands run
+# only with --execute. Check each racli command against the README that ships with your
+# patch and the current Oracle patching note before use.
 #
 # Usage:
 #   ./zdlra_patch.sh [options] <phase> [<phase> ...]
@@ -70,7 +70,7 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.7.3"
+VERSION="0.7.4"
 
 ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells switches postcheck resume report verify)
 
@@ -229,17 +229,6 @@ die()  { err "$@"; exit 1; }
 
 # Print the comment block at the top of this file.
 usage() { awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"; }
-
-# Run a command, or only log it in dry-run mode. Output goes to the run log.
-run() {
-    if (( DRY_RUN )); then
-        info "[dry-run] $*"
-        return 0
-    fi
-    info "[exec] $*"
-    "$@" 2>&1 | tee -a "$LOG_FILE"
-    return "${PIPESTATUS[0]}"
-}
 
 # Read-only commands run even in dry-run mode so prechecks give real answers.
 run_ro() {
@@ -475,8 +464,15 @@ show_status() {
         echo "Approval:"
         sed 's/^/  /' "${dir}/precheck_approval.txt"
     fi
+    # A long step writes to a log of its own, which reaches the run's log when it ends.
+    local log="${dir}/zdlra_patch.log" step_log
+    step_log="$(cat "${dir}/detached.log" 2>/dev/null || true)"
+    if [[ -f "$step_log" ]]; then
+        log="$step_log"
+        echo "Step log: $log"
+    fi
     echo "Last log lines:"
-    tail -n 15 "${dir}/zdlra_patch.log" 2>/dev/null | sed 's/^/  /'
+    tail -n 15 "$log" 2>/dev/null | sed 's/^/  /'
 }
 
 # ---------------------------------------------------------------------------
@@ -536,7 +532,7 @@ run_external_precheck() {
     if [[ " ${PRECHECK_ARGS[*]-} " == *"{sr_number}"* ]]; then
         [[ -n "$conf" ]] || die "PRECHECK_ARGS uses {sr_number}, but the staged record names no patch_conf."
         [[ -f "$conf" ]] || die "Conf file from the staged record not found: $conf"
-        sr="$(sed -n 's/^SR_NUMBER=//p' "$conf" | head -1 | tr -d '\r' | sed -E "s/^[\"']//; s/[\"']$//; s/[[:space:]]+$//")"
+        sr="$(conf_value SR_NUMBER || true)"
         [[ -n "$sr" ]] || die "No SR_NUMBER= in $conf."
         [[ "$sr" =~ ^[A-Za-z0-9-]+$ ]] || die "Unexpected SR_NUMBER in $conf: $sr"
     fi
@@ -754,7 +750,7 @@ sql_count() {
     echo "$n"
 }
 
-# Statements that change something go through dry-run handling like run().
+# Statements that change something are only logged in a dry run.
 sql_exec() {
     if (( DRY_RUN )); then
         info "[dry-run] SQL: $1"
@@ -944,8 +940,8 @@ phase_snapshot() {
     info "== snapshot =="
     local snap="${RUN_DIR}/snapshot_before"
     mkdir -p "$snap"
-    run_ro "$RACLI" version          > "${snap}/racli_version.txt"  2>&1 || true
-    run_ro "$RACLI" status appliance > "${snap}/racli_status.txt"   2>&1 || true
+    "$RACLI" version          > "${snap}/racli_version.txt"  2>&1 || true
+    "$RACLI" status appliance > "${snap}/racli_status.txt"   2>&1 || true
     # TODO: capture CRS resource state (crsctl stat res -t), listener status, DB parameters,
     #       storage locations, protection policies, and replication config.
     info "Snapshot saved to $snap"
@@ -1041,7 +1037,7 @@ phase_ra_preinstall() {
         die "racli preinstall reported failed checks. Log: $log"
     fi
     if [[ -n "$RA_PREINSTALL_DONE_FILE" ]]; then
-        [[ "$RA_PREINSTALL_DONE_FILE" -nt "$marker" || "$RA_PREINSTALL_DONE_FILE" -ef "$marker" ]] \
+        [[ "$RA_PREINSTALL_DONE_FILE" -nt "$marker" ]] \
             || die "racli preinstall did not write $RA_PREINSTALL_DONE_FILE. Log: $log"
     fi
     info "Pre-install passed all checks."
@@ -1106,27 +1102,18 @@ patch_location() {
 cell_patch_location()   { patch_location FILES_CELL "$CELL_PATCH_FILES_DIR" "$CELL_PATCH_TMP_DIR"; }
 switch_patch_location() { patch_location FILES_SWITCH "$SWITCH_PATCH_FILES_DIR" "$SWITCH_PATCH_TMP_DIR"; }
 
-# TARGET_CELL_VERSION from the conf file staging set up.
-target_cell_version() {
-    local conf
-    conf="$(staged_value patch_conf)"
-    [[ -f "$conf" ]] || return 0
-    sed -n 's/^TARGET_CELL_VERSION=//p' "$conf" | head -1 | tr -d '\r' | sed -E "s/^[\"']//; s/[\"']$//; s/[[:space:]]+$//"
-}
-
 # Current image version of every cell, as "cell: version" lines.
 cell_versions() { "$DCLI" -g "$CELL_GROUP_FILE" -l root 'imageinfo -ver' 2>&1; }
 
 # For the precheck review: what the cells phase will use. Read only; never fatal.
 report_cell_plan() {
-    [[ " ${ALL_PHASES[*]} " == *" cells "* ]] || return 0
     local loc target
     if loc="$(cell_patch_location)"; then
         info "Cell patch:   ${loc#* } (from $(basename "${loc%% *}"))"
     else
         warn "Cell patch:   not ready ($loc)"
     fi
-    target="$(target_cell_version)"
+    target="$(conf_value TARGET_CELL_VERSION || true)"
     info "Cell target:  ${target:-<TARGET_CELL_VERSION not set in the conf file>}"
     if command -v "$DCLI" >/dev/null 2>&1 && [[ -s "$CELL_GROUP_FILE" ]]; then
         local line
@@ -1201,13 +1188,14 @@ run_detached() {
     if (( ! DETACHED_FRESH )) && pending_result "$log"; then
         DETACHED_RC="$(tr -dc '0-9' < "$rcfile")"
         mv -f -- "$rcfile" "${rcfile}.collected"
-        rm -f -- "$pidfile"
+        rm -f -- "$pidfile" "${RUN_DIR}/detached.log"
         warn "$what already finished in an earlier attempt (exit $DETACHED_RC): using that result, not running it again. Log: $log"
         (( DETACHED_QUIET )) || cat "$log" >> "$LOG_FILE"
         (( DETACHED_RC != 97 )) || die "$what: cannot enter $dir. Log: $log"
         return 0
     fi
     rm -f -- "$rcfile" "$pidfile"
+    echo "$log" > "${RUN_DIR}/detached.log"
     # Keep the log of an earlier attempt: it may be the only record of what happened.
     [[ ! -s "$log" ]] || mv -f -- "$log" "${log}.$(date +%Y%m%d_%H%M%S)"
     : > "$log"
@@ -1270,7 +1258,7 @@ run_detached() {
     DETACHED_RC="$(tr -dc '0-9' < "$rcfile")"
     DETACHED_PID=""
     mv -f -- "$rcfile" "${rcfile}.collected"
-    rm -f -- "$pidfile"
+    rm -f -- "$pidfile" "${RUN_DIR}/detached.log"
     (( DETACHED_QUIET )) || cat "$log" >> "$LOG_FILE"
     (( DETACHED_RC != 97 )) || die "$what: cannot enter $dir. Log: $log"
 }
@@ -1293,10 +1281,8 @@ find_long_command() {
 long_command_running() {
     local line
     detached_running && return 0
-    if ps -eo pid=,args= >/dev/null 2>&1; then
-        line="$(ps -eo pid=,args= | find_long_command "$(basename "${PRECHECK_SCRIPT:-}")")"
-        [[ -n "$line" ]] && { echo "pid ${line# }"; return 0; }
-    fi
+    line="$(ps -eo pid=,args= 2>/dev/null | find_long_command "$(basename "${PRECHECK_SCRIPT:-}")" || true)"
+    [[ -n "$line" ]] && { echo "pid ${line# }"; return 0; }
     return 1
 }
 
@@ -1394,7 +1380,7 @@ phase_cells() {
     loc="$(cell_patch_location)" || die "Cell patch: $loc"
     dir="${loc#* }"
     [[ -s "$CELL_GROUP_FILE" ]] || die "$CELL_GROUP_FILE is missing or empty."
-    target="$(target_cell_version)"
+    target="$(conf_value TARGET_CELL_VERSION || true)"
     [[ -n "$target" ]] || die "TARGET_CELL_VERSION is not set in $(staged_value patch_conf)."
     info "Cell patch folder: $dir; cells: $(paste -sd' ' "$CELL_GROUP_FILE"); target: $target"
 
@@ -1546,8 +1532,8 @@ phase_postcheck() {
     info "== postcheck =="
     local snap="${RUN_DIR}/snapshot_after"
     mkdir -p "$snap"
-    run_ro "$RACLI" version          > "${snap}/racli_version.txt" 2>&1 || true
-    run_ro "$RACLI" status appliance > "${snap}/racli_status.txt"  2>&1 || true
+    "$RACLI" version          > "${snap}/racli_version.txt" 2>&1 || true
+    "$RACLI" status appliance > "${snap}/racli_status.txt"  2>&1 || true
     if [[ -d "${RUN_DIR}/snapshot_before" ]]; then
         diff -ru "${RUN_DIR}/snapshot_before" "$snap" > "${RUN_DIR}/snapshot.diff" || true
         info "Before/after diff: ${RUN_DIR}/snapshot.diff"
@@ -1621,7 +1607,7 @@ version_summary() {
         version_row compute "-" "" "$target" 0
     fi
 
-    target="$(target_cell_version)"
+    target="$(conf_value TARGET_CELL_VERSION || true)"
     mapfile -t names < <(sed '/^[[:space:]]*$/d' "$CELL_GROUP_FILE" 2>/dev/null)
     if (( ${#names[@]} )); then
         text="$(cell_versions || true)"
@@ -1675,32 +1661,34 @@ run_paused_replication() {
     grep -qs . "${RUN_DIR}"/replication_paused*.txt
 }
 
+# One line of the verify results.
+verify_note() { echo "  $*" >> "${RUN_DIR}/verify.txt"; }
+
 phase_verify() {
     info "== verify (backups and replication after patching) =="
     local out="${RUN_DIR}/verify.txt" since since_sql checks=() line
     since="$(cat "${RUN_DIR}/resumed_at" 2>/dev/null || date '+%F %T')"
     since_sql="to_date('${since}', 'YYYY-MM-DD HH24:MI:SS')"
     echo "Since $since (up to ${VERIFY_TIMEOUT_MINUTES} min):" > "$out"
-    note() { echo "  $*" >> "$out"; }
 
-    if [[ -z "$RA_SQL_CONNECT" || "$RA_SQL_CONNECT" == *"<password>"* ]]; then
+    if ! sql_ready; then
         warn "RA_SQL_CONNECT is not set up; backups and replication not checked."
-        note "not checked: RA_SQL_CONNECT is not set up"
+        verify_note "not checked: RA_SQL_CONNECT is not set up"
     else
         if [[ -n "$VERIFY_BACKUPS_SQL" ]]; then
             checks+=(backups)
         else
             warn "VERIFY_BACKUPS_SQL is not set (TODO in config); backups not checked."
-            note "backups: not checked (VERIFY_BACKUPS_SQL not set)"
+            verify_note "backups: not checked (VERIFY_BACKUPS_SQL not set)"
         fi
         if ! run_paused_replication; then
             info "This run paused no replication; replication not checked."
-            note "replication: not checked (this run paused none)"
+            verify_note "replication: not checked (this run paused none)"
         elif [[ -n "$VERIFY_REPLICATION_SQL" ]]; then
             checks+=(replication)
         else
             warn "VERIFY_REPLICATION_SQL is not set (TODO in config); replication not checked."
-            note "replication: not checked (VERIFY_REPLICATION_SQL not set)"
+            verify_note "replication: not checked (VERIFY_REPLICATION_SQL not set)"
         fi
     fi
 
@@ -1712,7 +1700,7 @@ phase_verify() {
             if n="$(sql_count "${q//\{since\}/$since_sql}")"; then
                 if (( n > 0 )); then
                     info "$c: $n since $since - OK"
-                    note "$c: OK ($n since $since, after $(( waited / 60 )) min)"
+                    verify_note "$c: OK ($n since $since, after $(( waited / 60 )) min)"
                     continue
                 fi
             else
@@ -1724,13 +1712,13 @@ phase_verify() {
         (( ${#pending[@]} )) || break
         if (( DRY_RUN )); then
             info "[dry-run] would wait up to ${VERIFY_TIMEOUT_MINUTES} min for: ${pending[*]}"
-            for c in "${pending[@]}"; do note "$c: none yet (dry run, no wait)"; done
+            for c in "${pending[@]}"; do verify_note "$c: none yet (dry run, no wait)"; done
             break
         fi
         if (( waited >= limit )); then
             for c in "${pending[@]}"; do
                 warn "No $c since $since after ${VERIFY_TIMEOUT_MINUTES} min. Check them by hand."
-                note "$c: WARNING - none since $since within ${VERIFY_TIMEOUT_MINUTES} min"
+                verify_note "$c: WARNING - none since $since within ${VERIFY_TIMEOUT_MINUTES} min"
             done
             break
         fi
@@ -1794,7 +1782,7 @@ start_background() {
     LOCK_HANDED_OFF=1
     set_status "running in background (pid $pid): ${BG_PHASES[*]}"
     info "Remaining phases started in the background as pid $pid: ${BG_PHASES[*]}"
-    info "Follow it with:  tail -f $LOG_FILE"
+    info "Follow it with:  tail -f $LOG_FILE  (a long step has a log of its own: --status names it)"
     info "Check it with:   $SCRIPT_PATH -c $CONFIG_FILE --status --run-id $RUN_ID"
 }
 

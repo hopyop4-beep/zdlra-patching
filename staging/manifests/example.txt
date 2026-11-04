@@ -3,4 +3,4 @@
 # Real manifests are not committed (see .gitignore).
 p00000000_000000_Linux-x86-64_1of2.zip
 p00000000_000000_Linux-x86-64_2of2.zip
-precheck/<precheck-script>
+bin/precheck
