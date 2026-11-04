@@ -31,6 +31,8 @@
 #               (--roceswitch-precheck, then --upgrade); InfiniBand racks are skipped
 #               with a warning (needs an approved precheck). The jump server upgrades
 #               the compute nodes between cells and switches
+#   admin_switches  upgrade the admin switches. TODO(site): placeholder, with copies of the
+#               RoCE commands; a real run skips it until ADMIN_SWITCH_ENABLED=1
 #   postcheck   rerun health checks, compare with the snapshot, and show a table of
 #               every component's version against its target (RA, compute nodes,
 #               cells, switches); a compute node, cell or switch on another version
@@ -70,9 +72,9 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.7.4"
+VERSION="0.7.5"
 
-ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells switches postcheck resume report verify)
+ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells switches admin_switches postcheck resume report verify)
 
 # ---------------------------------------------------------------------------
 # Defaults (override in the config file)
@@ -170,6 +172,17 @@ SWITCH_PATCH_WARN_MINUTES=180   # per patchmgr command; a warning only, never st
 # conf file. This command prints a switch's version; {switch} is its name. A switch
 # that cannot be read gives a warning; one that is read but not on the target fails.
 SWITCH_VERSION_CMD=(ssh -o BatchMode=yes -o ConnectTimeout=15 admin@{switch} "show version")
+
+# Admin switch (admin_switches phase, after switches). TODO(site): the commands below are
+# only copies of the RoCE ones, to be replaced with the real admin switch commands. A real
+# run skips this phase, with a warning, until ADMIN_SWITCH_ENABLED=1. {group} is the group
+# file. Each command runs as ./patchmgr <args> from the switch patch folder. If it no longer
+# uses --roceswitches, also add its option to find_long_command here and to
+# step_no_active_run in staging, so a running one is still detected.
+ADMIN_SWITCH_ENABLED=0
+ADMIN_SWITCH_GROUP_FILE="/root/admin_switch_group"   # the admin switches, one per line
+ADMIN_SWITCH_PRECHECK_ARGS=(--roceswitches {group} --upgrade --roceswitch-precheck)
+ADMIN_SWITCH_UPGRADE_ARGS=(--roceswitches {group} --upgrade)
 
 # SQL on the appliance, as the raAutomation account (see the config example).
 SQLPLUS="sqlplus"
@@ -869,6 +882,7 @@ phase_precheck() {
     report_ra_plan
     report_cell_plan
     report_switch_plan
+    report_admin_switch_plan
 
     # TODO: confirm the patch is valid for the current version (compare racli version with patch README).
 
@@ -1304,7 +1318,7 @@ step_mark_done() { step_done "$1" || echo "$1" >> "${RUN_DIR}/steps_done"; }
 # Run one patchmgr command from the patch folder, never cut short (run_detached).
 # Success: exit 0, "SUCCESS: Completed run of command", "Exit status:0", and no
 # FAILED lines. Stops the run if it fails.
-# $1 = cells | switches (log <prefix>_<name>.log), $2 = folder, $3 = log name, rest =
+# $1 = cells | switches | admin_switches (log <prefix>_<name>.log), $2 = folder, $3 = log name, rest =
 # patchmgr arguments.
 run_patchmgr() {
     patchmgr_attempt "$@" || die "$PATCHMGR_PROBLEM"
@@ -1315,7 +1329,7 @@ PATCHMGR_PROBLEM=""
 patchmgr_attempt() {
     local prefix="$1" dir="$2" name="$3"; shift 3
     local log="${RUN_DIR}/${prefix}_${name}.log" rc step="-$name" warn_min="$CELL_PATCH_WARN_MINUTES"
-    [[ "$prefix" == switches ]] && warn_min="$SWITCH_PATCH_WARN_MINUTES"
+    [[ "$prefix" == *switches ]] && warn_min="$SWITCH_PATCH_WARN_MINUTES"
     run_detached "$prefix patchmgr $step" "$dir" "$log" "$warn_min" ./patchmgr "$@"
     rc="$DETACHED_RC"
     local failed
@@ -1470,9 +1484,9 @@ switch_version_line() {
     sed -E 's/^[[:space:]]+//' <<<"$line"
 }
 
-# Every switch in SWITCH_GROUP_FILE must report TARGET_SWITCH_VERSION.
+# Every switch in the group file ($2, default SWITCH_GROUP_FILE) must report the version $1.
 check_switch_versions() {
-    local target="$1" sw out bad=0 unread=0
+    local target="$1" group="${2:-$SWITCH_GROUP_FILE}" sw out bad=0 unread=0
     while IFS= read -r sw; do
         [[ -n "$sw" ]] || continue
         if ! out="$(switch_version "$sw")"; then
@@ -1484,7 +1498,7 @@ check_switch_versions() {
             err "    $sw: $(switch_version_line "$out") (expected $target)"
             bad=$((bad + 1))
         fi
-    done < "$SWITCH_GROUP_FILE"
+    done < "$group"
     (( bad == 0 )) || die "$bad switch(es) not on $target."
     (( unread == 0 )) || warn "$unread switch(es) could not be checked; check them by hand (patchmgr reported success)."
 }
@@ -1526,6 +1540,76 @@ phase_switches() {
     info "Switch versions:"
     check_switch_versions "$target"
     info "RoCE switches upgraded to $target."
+}
+
+# ---------------------------------------------------------------------------
+# Admin switches. TODO(site): a copy of the RoCE phase, until the real commands are in
+# ---------------------------------------------------------------------------
+# The admin switch command arguments, with {group} filled in; one per line.
+admin_switch_args() {
+    local a
+    for a in "$@"; do printf '%s\n' "${a//\{group\}/$ADMIN_SWITCH_GROUP_FILE}"; done
+}
+
+# For the precheck review. Read only; never fatal.
+report_admin_switch_plan() {
+    if (( ! ADMIN_SWITCH_ENABLED )); then
+        warn "Admin switch: ADMIN_SWITCH_ENABLED=0: this run will NOT patch it; the commands are still placeholders"
+    elif [[ -s "$ADMIN_SWITCH_GROUP_FILE" ]]; then
+        info "Admin switch: $(paste -sd' ' "$ADMIN_SWITCH_GROUP_FILE") (from $ADMIN_SWITCH_GROUP_FILE), target $(conf_value TARGET_ADMIN_SWITCH_VERSION || true)"
+    else
+        warn "Admin switch: $ADMIN_SWITCH_GROUP_FILE is missing or empty"
+    fi
+}
+
+phase_admin_switches() {
+    info "== admin switches =="
+    local type loc dir target precheck_args=() upgrade_args=()
+    mapfile -t precheck_args < <(admin_switch_args "${ADMIN_SWITCH_PRECHECK_ARGS[@]}")
+    mapfile -t upgrade_args < <(admin_switch_args "${ADMIN_SWITCH_UPGRADE_ARGS[@]}")
+    if (( DRY_RUN && ! ADMIN_SWITCH_ENABLED )); then
+        warn "ADMIN_SWITCH_ENABLED=0: a real run skips this phase. The commands, still placeholders:"
+        info "[dry-run] ./patchmgr ${precheck_args[*]}"
+        info "[dry-run] ./patchmgr ${upgrade_args[*]}"
+        return 0
+    fi
+    if (( ! ADMIN_SWITCH_ENABLED )); then
+        warn "ADMIN_SWITCH_ENABLED=0: the admin switch commands are still placeholders. Admin switches NOT patched."
+        return 0
+    fi
+    type="$(switch_type || true)"
+    if [[ "$type" == ib ]]; then
+        warn "SWITCH_TYPE is IB: the admin switch on these racks needs manual changes. Admin switches NOT patched."
+        return 0
+    fi
+    [[ "$type" == roce ]] || die "SWITCH_TYPE is '${type:-not set}' in $(staged_value patch_conf), not roce or ib: cannot tell what to do with the admin switches."
+    loc="$(switch_patch_location)" || die "Switch patch: $loc"
+    dir="${loc#* }"
+    [[ -s "$ADMIN_SWITCH_GROUP_FILE" ]] || die "$ADMIN_SWITCH_GROUP_FILE is missing or empty."
+    target="$(conf_value TARGET_ADMIN_SWITCH_VERSION || true)"
+    [[ -n "$target" ]] || die "TARGET_ADMIN_SWITCH_VERSION is not set in $(staged_value patch_conf)."
+    info "Switch patch folder: $dir; admin switches: $(paste -sd' ' "$ADMIN_SWITCH_GROUP_FILE"); target: $target"
+    if (( DRY_RUN )); then
+        info "[dry-run] cd $dir && ./patchmgr ${precheck_args[*]}"
+        info "[dry-run] cd $dir && ./patchmgr ${upgrade_args[*]}"
+        info "[dry-run] ${SWITCH_VERSION_CMD[*]}  (on each admin switch; must show $target)"
+        return 0
+    fi
+    # An upgrade that already worked, or that finished after this script stopped, must not
+    # be repeated, and neither must the check before it.
+    if step_done admin_switches_upgrade; then
+        info "The admin switch upgrade already succeeded in this run; only checking the versions."
+    else
+        if ! pending_result "${RUN_DIR}/admin_switches_upgrade.log"; then
+            run_patchmgr admin_switches "$dir" precheck "${precheck_args[@]}"
+            confirm "Upgrade the admin switches now?"
+        fi
+        run_patchmgr admin_switches "$dir" upgrade "${upgrade_args[@]}"
+        step_mark_done admin_switches_upgrade
+    fi
+    info "Admin switch versions:"
+    check_switch_versions "$target" "$ADMIN_SWITCH_GROUP_FILE"
+    info "Admin switches upgraded to $target."
 }
 
 phase_postcheck() {
@@ -1632,6 +1716,22 @@ version_summary() {
         done < "$SWITCH_GROUP_FILE"
     else
         version_row switch "-" "" "$target" 0
+    fi
+
+    if (( ADMIN_SWITCH_ENABLED )) && [[ "$type" != ib ]]; then
+        target="$(conf_value TARGET_ADMIN_SWITCH_VERSION || true)"
+        if [[ -s "$ADMIN_SWITCH_GROUP_FILE" ]]; then
+            while IFS= read -r sw; do
+                [[ -n "$sw" ]] || continue
+                if text="$(switch_version "$sw")"; then
+                    version_row adminsw "$sw" "$(switch_version_line "$text")" "$target" "$([[ -n "$target" ]] && grep -qF -- "$target" <<<"$text" && echo 1 || echo 0)"
+                else
+                    version_row adminsw "$sw" "" "$target" 0
+                fi
+            done < "$ADMIN_SWITCH_GROUP_FILE"
+        else
+            version_row adminsw "-" "" "$target" 0
+        fi
     fi
 
     {
@@ -1841,7 +1941,7 @@ main() {
             [[ "$p" == precheck ]] && split=1
         done
         # Without precheck in this run, check the existing approval now, not after detaching.
-        if (( ! ${#fg_phases[@]} )) && [[ " ${BG_PHASES[*]} " == *" ra_"* || " ${BG_PHASES[*]} " == *" quiesce "* || " ${BG_PHASES[*]} " == *" cells "* || " ${BG_PHASES[*]} " == *" switches "* ]]; then
+        if (( ! ${#fg_phases[@]} )) && [[ " ${BG_PHASES[*]} " == *" ra_"* || " ${BG_PHASES[*]} " == *" quiesce "* || " ${BG_PHASES[*]} " == *" cells "* || " ${BG_PHASES[*]} " == *" switches "* || " ${BG_PHASES[*]} " == *" admin_switches "* ]]; then
             require_approval
         fi
     fi
@@ -1849,8 +1949,8 @@ main() {
     for p in ${fg_phases[@]+"${fg_phases[@]}"}; do
         # Check approval before marking a changing step as running, so a refusal leaves
         # the run's status as it was.
-        [[ "$p" == ra_* || "$p" == quiesce || "$p" == cells || "$p" == switches ]] && require_approval
-        [[ "$p" == precheck || "$p" == ra_* || "$p" == cells || "$p" == switches ]] && refuse_if_running "$p"
+        [[ "$p" == ra_* || "$p" == quiesce || "$p" == cells || "$p" == switches || "$p" == admin_switches ]] && require_approval
+        [[ "$p" == precheck || "$p" == ra_* || "$p" == cells || "$p" == switches || "$p" == admin_switches ]] && refuse_if_running "$p"
         CURRENT_PHASE="$p"
         set_status "running $p"
         "phase_${p}"
@@ -1860,7 +1960,7 @@ main() {
     if (( ${#BG_PHASES[@]} )); then
         # Refuse here, while there is someone to tell, not after detaching.
         for p in "${BG_PHASES[@]}"; do
-            if [[ "$p" == precheck || "$p" == ra_* || "$p" == cells || "$p" == switches ]]; then
+            if [[ "$p" == precheck || "$p" == ra_* || "$p" == cells || "$p" == switches || "$p" == admin_switches ]]; then
                 refuse_if_running "$p"
                 break
             fi

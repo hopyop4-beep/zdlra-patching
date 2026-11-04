@@ -98,6 +98,19 @@ SWITCH_PATCH_WARN_MINUTES=180
 # name. A switch that cannot be read gives a warning; one on another version fails.
 SWITCH_VERSION_CMD=(ssh -o BatchMode=yes -o ConnectTimeout=15 admin@{switch} "show version")
 
+# Admin switch (admin_switches phase, after switches). TODO(site): the commands below are
+# only copies of the RoCE ones, to be replaced with the real admin switch commands. A real
+# run skips this phase, with a warning, until ADMIN_SWITCH_ENABLED=1. {group} is the group
+# file. Each command runs as ./patchmgr <args> from the switch patch folder. If it no longer
+# uses --roceswitches, also add its option to find_long_command in zdlra_patch.sh and to
+# step_no_active_run in staging, so a running one is still detected.
+ADMIN_SWITCH_ENABLED=0
+ADMIN_SWITCH_GROUP_FILE="/root/admin_switch_group"   # the admin switches, one per line
+ADMIN_SWITCH_PRECHECK_ARGS=(--roceswitches {group} --upgrade --roceswitch-precheck)
+ADMIN_SWITCH_UPGRADE_ARGS=(--roceswitches {group} --upgrade)
+# Each admin switch must then show TARGET_ADMIN_SWITCH_VERSION from the patch conf file,
+# through SWITCH_VERSION_CMD.
+
 # --- Replication and incoming backups (quiesce / resume phases) -------------
 # SQL runs with sqlplus as the raAutomation account. For now the password is in this
 # file: zdlra_patch.conf is not in git, and the script warns unless it is chmod 600.

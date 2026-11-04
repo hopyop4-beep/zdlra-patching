@@ -18,6 +18,7 @@ The script breaks a patch into phases. You can run them one at a time or all tog
 | `ra_update` | Runs `racli update appliance --ignore_incidents`, which patches the appliance (about 2 hours). Success: `End: Patch Recovery Appliance - Step [Patch]`. Afterwards `racli version` should show `TARGET_RA_VERSION` from the conf file (a warning if not) |
 | `cells` | Patches the storage cells from the first compute node. Each `patchmgr` runs in a session of its own and is never stopped by the script (see below). In the cell patch folder (worked out from the `FILES_CELL` zip, because its name changes per release), it runs `patchmgr -cells /root/cell_group -patch_check_prereq`. Only if that fails does it run `-reset_force` and `-cleanup`, then the check again; a second failure stops for review. Then `-patch` (plus `CELL_PATCH_EXTRA_ARGS`). Each step must report a completed run with exit status 0 and no `FAILED` lines. Afterwards every cell must be on `TARGET_CELL_VERSION` from the conf file, according to both `patchmgr` and `dcli ... imageinfo -ver` |
 | `switches` | Upgrades the RoCE switches from the first compute node, in the switch patch folder (worked out from the `FILES_SWITCH` zip, e.g. `patch_switch_24.1.14.0.0.250706`): `patchmgr --roceswitches /root/switch_group --upgrade --roceswitch-precheck` (about 12 minutes in one sample), then `--upgrade`. Each runs in a session of its own and is never stopped by the script, and must report a completed run with exit status 0 and no `FAILED` lines. Afterwards each switch's version (`SWITCH_VERSION_CMD`, by default `ssh admin@<switch> show version`) must show `TARGET_SWITCH_VERSION` from the conf file; a switch that can't be read only gives a warning. On an InfiniBand rack (`SWITCH_TYPE` not `roce`) the phase only warns that the switches were not patched. From the jump server it runs after `compute` |
+| `admin_switches` | **Placeholder.** Upgrades the admin switches listed in `ADMIN_SWITCH_GROUP_FILE`, but its commands (`ADMIN_SWITCH_PRECHECK_ARGS`, `ADMIN_SWITCH_UPGRADE_ARGS`) are only copies of the RoCE ones, to be replaced. A real run skips it with a warning until `ADMIN_SWITCH_ENABLED=1`. Each switch must then show `TARGET_ADMIN_SWITCH_VERSION` from the conf file. From the jump server it runs after `switches` |
 | `postcheck` | Runs the checks again and compares the result with the snapshot. Then shows a table of every component's version against its target: RA (`racli version`, `TARGET_RA_VERSION`), each compute node and cell (`imageinfo -ver`, `TARGET_COMPUTE_VERSION` and `TARGET_CELL_VERSION`), and each RoCE switch (`TARGET_SWITCH_VERSION`). A compute node, cell or switch on another version fails the phase; the RA line and anything that can't be read are warnings. Saved to `versions.txt` |
 | `resume` | Resumes only the replication servers that this run paused |
 | `report` | Writes a summary of the run, with the version table. `zdlra_patch.sh --report --run-id <id>` shows it |
@@ -61,7 +62,7 @@ An interrupted `patchmgr` session or `racli` upgrade step can cause major proble
 
 - **Nothing reaches it:** stopping the script, a dropped SSH session or a closed terminal doesn't affect the command. The script only waits for it, shows its log as it grows, and reads its exit status from a file.
 - **No time limit stops it:** past `CELL_PATCH_WARN_MINUTES` (or `SWITCH_PATCH_WARN_MINUTES`, `RA_PREINSTALL_WARN_MINUTES`, `RA_ALTER_WARN_MINUTES`, `RA_UPDATE_WARN_MINUTES`, `PRECHECK_WARN_MINUTES`), the script only logs a warning and keeps waiting.
-- **Nothing starts over it:** the `precheck`, `cells`, `switches` and `ra_*` phases refuse to start while the Oracle precheck, a `patchmgr` run or a `racli` upgrade step is still running on the node, and staging refuses to replace `/radump/patches` while one is, or while a run holds the lock.
+- **Nothing starts over it:** the `precheck`, `cells`, `switches`, `admin_switches` and `ra_*` phases refuse to start while the Oracle precheck, a `patchmgr` run or a `racli` upgrade step is still running on the node, and staging refuses to replace `/radump/patches` while one is, or while a run holds the lock.
 - **A finished command is not run again:** if the script stopped while a command ran on to the end, the next attempt (`--continue`) picks up that command's result rather than running it again. A cells `-patch` or switches `--upgrade` that has worked is never repeated in the same run. The log of an earlier attempt is kept, with a date on its name.
 - **If the script itself stops while the command runs,** it says so, and leaves the command running. The run's status becomes "… still running (pid …), do not start it again until it finishes". The lock passes to the command, so nothing can start over it until it ends.
 
@@ -85,7 +86,7 @@ If a run fails after `quiesce`, replication stays paused. Once the appliance is 
 
 After the precheck, the script shows the failures, warnings and exit code, then waits for you to type `APPROVE`. `--yes` does not skip this. The approval is saved in `<run id>/precheck_approval.txt` with who approved it, when, and a fingerprint of the results.
 
-`quiesce`, the `ra_*` phases, `cells` and `switches` refuse to run unless the run has an approval that:
+`quiesce`, the `ra_*` phases, `cells`, `switches` and `admin_switches` refuse to run unless the run has an approval that:
 
 - belongs to the same run, either the current one or the one named with `--run-id`
 - is no older than `PRECHECK_APPROVAL_MAX_AGE_HOURS` (24 by default)
@@ -333,6 +334,7 @@ Running the same archive again is safe, because nodes that are already staged ar
     - Order: after the cells. `db_nodes`: a per-run file with only the node being patched. After node 1 is back, only the image version is checked.
     - To revisit: `SUCCESS WITH WARNING(S)` carries on for now (`COMPUTE_PAUSE_ON_WARNINGS=0`), since the prechecks were already reviewed
   - [x] RoCE switches (`switches` phase): `--roceswitch-precheck`, then `--upgrade`, with `/root/switch_group`
+  - [ ] Admin switches (`admin_switches` phase): placeholder, with copies of the RoCE commands; the real ones are still to be added
   - [ ] InfiniBand switches (X8 and below): not automated; the `switches` phase skips them with a warning
   - [x] Check each switch is on `TARGET_SWITCH_VERSION` after the upgrade
 

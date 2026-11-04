@@ -19,6 +19,11 @@ step 5.
 - [ ] Fill in `VERIFY_BACKUPS_SQL` and `VERIFY_REPLICATION_SQL`, or `verify` only warns. Each prints one
       number, with `{since}` where the start time goes.
 - [ ] Set `OEM_JOBS_DB` for the appliance, and `BLACKOUT_TARGETS`.
+- [ ] **Admin switch:** replace `ADMIN_SWITCH_PRECHECK_ARGS` and `ADMIN_SWITCH_UPGRADE_ARGS` with the real
+      commands, and check `ADMIN_SWITCH_GROUP_FILE` and `TARGET_ADMIN_SWITCH_VERSION`. Then set
+      `ADMIN_SWITCH_ENABLED=1`; until then, a real run does not patch the admin switch. If the commands no
+      longer use `--roceswitches`, add the new option to `find_long_command` and to `step_no_active_run`
+      in staging.
 - [ ] **`emcli` login:** the session is refreshed before suspending and resuming the jobs. If `EM_USER`
       asks for a password, the script waits at that prompt. Check how the login works on the OMS, as
       it could be hours into the window by then.
@@ -97,7 +102,8 @@ back an RPM and moves the gold images. Nothing else changes. No blackout is crea
   - `racli run preinstall`, `alter appliance`, `update appliance`.
   - Cells: **check the actual command.** It's plain `-patch`, and ZDLRA cell patching is non-rolling.
   - Compute: both passes, `-target_version`, `-iso_repo`.
-  - Switches. The admin switch needs separate commands, which you'll add later.
+  - Switches.
+  - Admin switch: the phase shows its commands, which are still copies of the RoCE ones.
 - [ ] Ctrl-C while watching, then `--watch <run id>` without `-x`: it picks up.
 - [ ] The same run with `-x` is refused, because it was started as a dry run.
 
