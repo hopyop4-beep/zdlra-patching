@@ -248,3 +248,46 @@ commands are in. The compute log polling still uses two ssh sessions per check.
     node's `phases_done` (root of 51 and 56).
 83. **Duplicates:** three "is a patch running" checks that have drifted apart. `phase_admin_switches` is a copy of
     `phase_switches`. The compute log polling uses two ssh sessions per check.
+
+## Third review of `main` (2026-11-04)
+
+Found by a third review of commit b67e044. Not reproduced by running the scripts when found.
+
+### Being fixed
+
+84. **The next compute pass doesn't wait for the node that just rebooted** (`jump/zdlra_patch_run.sh:719`), so both
+    instances can be down at once.
+85. **The readiness check after the last pass can look at the wrong node** (`:759`): `$NODE`, not the node rebooted.
+86. **The printed undo commands conflict with `--continue`** (`:331`): undo by hand, continue, and patching carries on
+    with backups arriving and no blackout.
+87. **`--continue` can loop** (`:887`): every phase finished, but the status says `failed`.
+88. **A good stage can read as failed** (`zdlra_patch.sh:1968`): the parent's status can overwrite the child's final one.
+89. **The pre-window check only reads one node** (`jump/zdlra_patch_run.sh:815`).
+90. **Enabling `admin_switches` later and using `--continue` doesn't run it** (`:863`).
+91. **Picking up after the job resume repeats it** (`:1009`), and can raise a false alarm.
+92. **A cells or switch patch that looks failed is repeated with no version check** (`zdlra_patch.sh:1491`).
+93. **An already-upgraded compute node still goes through `-precheck`** (`jump/zdlra_patch_run.sh:677`).
+94. **A stale `.unpacking` marker can delete a complete staged folder** (`staging/zdlra_stage.sh:1171`).
+95. **A half-finished folder can make the free-space check refuse every retry** (`staging/zdlra_stage.sh:774`), and a dry
+    run underestimates the space needed (`:765`).
+96. **A leftover `-cleanup` result can be reused out of order** (`zdlra_patch.sh:1459`).
+97. **A replication server paused just as the script stops isn't recorded** (`zdlra_patch.sh:950`).
+98. **A mistyped run id on `--resume` watches forever** (`jump/zdlra_patch_run.sh:201`).
+99. **On an IB rack, `switches` and `admin_switches` show as done** (`zdlra_patch.sh:1588`).
+100. **Stale docs:** the advice for an expired approval leaves out `--execute` (`README.md:122`), and lines 65 and 336.
+
+### Open, lower risk
+
+101. **A blackout created just as Ctrl-C lands isn't tracked** (`jump/zdlra_patch_run.sh:925`).
+102. **A dropped session during the job suspend prints no undo commands** (`:1037`). Only INT is trapped.
+103. **The `emcli` password prompt can wait indefinitely before the job resume** (`jump/oem_blackout.sh:79`). See the testing notes.
+104. **A reused pid can fool the run lock, staging's lock check, and the compute wait** (`jump/zdlra_patch_run.sh:377`, `:536`,
+     `staging/zdlra_stage.sh:630`).
+105. **A saved compute pass that no longer matches the node list is skipped as done** (`jump/zdlra_patch_run.sh:745`).
+106. **`--watch` prints the wrong message if interrupted during the job resume after compute** (`:1091`).
+107. **Printed blackout commands leave out `-c`** (`:333`).
+108. **Staging's free-space check doesn't credit a leftover `.part` or a backup about to be replaced** (`staging/zdlra_stage.sh:737`).
+109. **`Copy-ZdlraPatches.ps1`:** builds an archive staging will reject from an already staged folder (`:191`), and fails on
+     IPv6 hosts (`:303`) and UNC paths (`:265`).
+110. **Cleanup:** `running.pid` is never read (`jump/zdlra_patch_run.sh:511`), `check_compute_version` repeats `node_version`
+     (`:622`), and an unreachable branch in `step_continue` (`:1172`).
