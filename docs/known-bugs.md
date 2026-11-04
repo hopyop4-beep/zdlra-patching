@@ -55,9 +55,10 @@ How far each finding was checked:
 43. **The cell prep steps are wrong** (`zdlra_patch.sh:143`, `:1226`, `zdlra_patch.conf.example:75`,
     `README.md:19`). Confirmed by the user on 2026-11-03: `-reset_force` and `-cleanup` should only run
     if `-patch_check_prereq` fails. Today it's the opposite: they run every time after a passing
-    prereq, and a failing prereq stops the run before they can run (`run_patchmgr` dies on it). Still
-    to decide: after the cleanup, does the prereq run again before `-patch`, and does the run stop if
-    it fails a second time?
+    prereq, and a failing prereq stops the run before they can run (`run_patchmgr` dies on it). The
+    flow to build (user, 2026-11-03): run the prereq. If it passes, go to `-patch`. If it fails, run
+    `-reset_force` and `-cleanup`, then the prereq again. If that passes, go to `-patch`; if it fails
+    a second time, stop for review.
 
 ## Could finish wrongly or leave backups off
 
@@ -163,10 +164,11 @@ How far each finding was checked:
 
 ## To confirm, not necessarily a bug
 
-37. **Cell patching** (`zdlra_patch.sh:1230`). Cells are patched with `-patch` and no `-rolling`. As far
-    as I recall, that patches all cells at once, with the storage users down, but the README (line
-    321) says rolling is handled by `patchmgr`. Confirm which is wanted. The order of the prep steps
-    is settled: see bug 43.
+37. **Cell patching command** (`zdlra_patch.sh:1230`). The user confirmed on 2026-11-03 that ZDLRA cell
+    patching is non-rolling, and will check the actual command during testing. The script's plain
+    `-patch` with no `-rolling` should fit that, as far as I recall, but it hasn't been checked. The
+    README (line 321) is wrong to say "rolling is handled by `patchmgr`": correct it. The order of
+    the prep steps is settled: see bug 43.
 
 ## Bloat and stale docs
 
