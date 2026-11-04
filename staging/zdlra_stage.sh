@@ -96,7 +96,8 @@ RELAY=0
 KEEP_GOING=0
 DRY_RUN=1
 MIN_FREE_GB=20                  # free space needed beyond the unpacked size
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15)
+# ServerAliveInterval: sha256sum, cmp and unzip over ssh print nothing for a long time.
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30)
 LOG_DIR="${HOME}/zdlra_stage_logs"
 LOG_FILE=""
 
@@ -156,6 +157,10 @@ STAGED_RECORD_NAME="ZDLRA_STAGED.txt"   # written in the unzipped folder on each
 # is handled by OLD_VERSION_ACTION (keep the oldest backup, or overwrite).
 declare -A FILE_MOVE_DIR=([FILES_RA]="/raacfs/raadmin/tmp")
 declare -A FILE_MOVE_SHARED=([FILES_RA]=1)
+# Where the precheck moves such files afterwards (only on the first node, for FILES_RA:
+# the gold images go to /radump). Staging again for another node after a precheck must
+# not count them as missing. A FILES_RA file that stays behind is still required.
+declare -A FILE_ALT_DIR=([FILES_RA]="/radump")
 
 # How many files a FILES_* setting must name (checked on the jump server).
 declare -A FILE_COUNT=([FILES_RA]=3 [FILES_YUM]=2)
@@ -219,8 +224,15 @@ safe_host()  { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; }
 safe_name()  { [[ "$1" =~ ^[A-Za-z0-9._*-]+$ && "$1" != *..* ]]; }
 safe_value() { [[ "$1" =~ ^[A-Za-z0-9_.,:@-]*$ ]]; }
 
-# Run a command string on a node over ssh.
+# Run a command string on a node over ssh. -n: it must not read this script's input,
+# such as a list a loop is reading, or what the operator types.
 on_node() {
+    local node="$1"; shift
+    ssh -n "${SSH_OPTS[@]}" "${SSH_USER}@${node}" "$*"
+}
+
+# The same, for a command that reads what is fed to this function.
+on_node_stdin() {
     local node="$1"; shift
     ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" "$*"
 }
@@ -300,6 +312,7 @@ validate() {
     for v in "${!FILE_MOVE_DIR[@]}"; do
         [[ "$v" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "Bad setting name in FILE_MOVE_DIR: $v"
         safe_path "${FILE_MOVE_DIR[$v]}" || die "FILE_MOVE_DIR[$v] has unsupported characters: ${FILE_MOVE_DIR[$v]}"
+        [[ -z "${FILE_ALT_DIR[$v]:-}" ]] || safe_path "${FILE_ALT_DIR[$v]}" || die "FILE_ALT_DIR[$v] has unsupported characters: ${FILE_ALT_DIR[$v]}"
     done
     for v in "${!FILE_COUNT[@]}"; do
         [[ "${FILE_COUNT[$v]}" =~ ^[0-9]+$ ]] || die "FILE_COUNT[$v] must be a number"
@@ -385,7 +398,8 @@ verify_local() {
     # The conf file: exactly one conf/patch.conf_<SR>.
     local confs pattern
     pattern="^${ZIP_PREFIX}${CONF_SUBDIR}/${CONF_GLOB//\*/[^/]+}$"
-    confs="$(grep -E "$pattern" <<<"$list" || true)"
+    # patch.conf_<SR>.orig is what this script keeps when it sets up a conf file.
+    confs="$(grep -E "$pattern" <<<"$list" | grep -v '[.]orig$' || true)"
     [[ -n "$confs" ]] || die "No ${CONF_SUBDIR}/${CONF_GLOB} in the archive."
     [[ "$(grep -c . <<<"$confs")" == 1 ]] || die "More than one conf file in the archive: $(tr '\n' ' ' <<<"$confs")"
     CONF_NAME="$(basename "$confs")"
@@ -612,7 +626,7 @@ step_components() {
 step_no_active_run() {
     local node out
     for node in "${NODES[@]}"; do
-        out="$(on_node "$node" "bash -s" <<'REMOTE'
+        out="$(on_node_stdin "$node" "bash -s" <<'REMOTE'
 lock=/tmp/zdlra_patch.lock
 if [ -s "$lock" ] && kill -0 "$(cat "$lock")" 2>/dev/null; then echo "a patch run holds $lock (pid $(cat "$lock"))"; fi
 ps -eo pid=,args= | awk '{
@@ -662,17 +676,31 @@ set_aside_old() {
     change_on_node "$node" "rm -rf -- '$path'" || die "${node}: could not remove the old $what."
 }
 
-# Copy the archive to one node: from the jump server, or with --relay from the first node.
+# Nodes whose archive has been checked in this run: hashing it again takes a long time.
+declare -A SHA_OK=()
+
+# Copy the archive to one node: from the jump server, or with --relay from the first
+# node. It only gets its real name once its SHA-256 is right, so an interrupted copy
+# can't be taken for an older version and kept as a backup.
 copy_to_node() {
-    local node="$1" first="$2"
+    local node="$1" first="$2" part="${REMOTE_ARCHIVE}.part" sha
     if (( RELAY )) && [[ "$node" != "$first" ]]; then
-        change_on_node "$first" "scp -q -o BatchMode=yes '$REMOTE_ARCHIVE' '${SSH_USER}@${node}:$REMOTE_ARCHIVE'"
+        change_on_node "$first" "scp -q -o BatchMode=yes '$REMOTE_ARCHIVE' '${SSH_USER}@${node}:$part'" || return 1
     elif (( DRY_RUN )); then
-        info "[dry-run] scp $ARCHIVE ${SSH_USER}@${node}:$REMOTE_ARCHIVE"
+        info "[dry-run] scp $ARCHIVE ${SSH_USER}@${node}:$part"
     else
-        info "[exec] scp $ARCHIVE ${SSH_USER}@${node}:$REMOTE_ARCHIVE"
-        scp -q "${SSH_OPTS[@]}" "$ARCHIVE" "${SSH_USER}@${node}:$REMOTE_ARCHIVE"
+        info "[exec] scp $ARCHIVE ${SSH_USER}@${node}:$part"
+        scp -q "${SSH_OPTS[@]}" "$ARCHIVE" "${SSH_USER}@${node}:$part" || return 1
     fi
+    (( ! DRY_RUN )) || return 0
+    sha="$(on_node "$node" "sha256sum '$part' | cut -d' ' -f1" 2>/dev/null || true)"
+    if [[ "$sha" != "$EXPECTED_SHA" ]]; then
+        err "${node}: the copied archive has the wrong SHA-256 (${sha:-none}); removing it."
+        on_node "$node" "rm -f -- '$part'" || true
+        return 1
+    fi
+    on_node "$node" "mv -f -- '$part' '$REMOTE_ARCHIVE'" || return 1
+    SHA_OK[$node]=1
 }
 
 step_distribute() {
@@ -685,6 +713,7 @@ step_distribute() {
         sha="$(remote_sha "$node")"
         if [[ "$sha" == "$EXPECTED_SHA" ]]; then
             info "${z}/${node}: already has the archive (SHA-256 matches); not copying"
+            SHA_OK[$node]=1
             continue
         fi
         if [[ -n "$sha" ]]; then
@@ -708,7 +737,7 @@ step_check() {
             info "${z}/${node}: already staged with this archive ($STAGE_DIR/$STAGED_RECORD_NAME); skipping"
             continue
         fi
-        sha="$(remote_sha "$node")"
+        if [[ -n "${SHA_OK[$node]:-}" ]]; then sha="$EXPECTED_SHA"; else sha="$(remote_sha "$node")"; fi
         if [[ "$sha" != "$EXPECTED_SHA" ]] && (( DRY_RUN )); then
             info "[dry-run] ${z}/${node}: new archive not copied yet; skipping SHA-256 check"
         else
@@ -980,10 +1009,24 @@ step_unzip() {
 run_move() {
     local node="$1" mode="$2" var="$3" out rc=0 f args
     args="'$mode' '$DRY_RUN' '${STAGE_DIR}/${PATCHES_SUBDIR}' '${FILE_MOVE_DIR[$var]}' '$OLD_VERSION_ACTION' '$RUN_STAMP'"
-    for f in ${FILES_BY_VAR[$var]}; do args+=" '$f'"; done
+    for f in ${FILES_BY_VAR[$var]}; do
+        [[ " ${MOVE_SKIP:-} " != *" $f "* ]] && args+=" '$f'"
+    done
     out="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" "bash -s -- $args" <<<"$MOVE_SCRIPT" 2>&1)" || rc=$?
     printf '%s\n' "$out" | sed "s|^|  ${Z_CUR}/${node}: [$var] |" | tee -a "$LOG_FILE" >&2
     return "$rc"
+}
+
+# Sets MOVE_SKIP: the files of setting $1 that are no longer at the shared destination,
+# but are in FILE_ALT_DIR on the first node.
+moved_by_precheck() {
+    local var="$1" dest="${FILE_MOVE_DIR[$1]}" alt="${FILE_ALT_DIR[$1]:-}" f
+    MOVE_SKIP=""
+    [[ -n "$alt" ]] || return 0
+    for f in ${FILES_BY_VAR[$var]}; do
+        if on_node "${NODES[0]}" "[ ! -e '$dest/$f' ] && [ -e '$alt/$f' ]"; then MOVE_SKIP+="$f "; fi
+    done
+    MOVE_SKIP="${MOVE_SKIP% }"
 }
 
 # Move the files of each FILE_MOVE_DIR setting. A shared destination is filled once,
@@ -997,10 +1040,18 @@ step_move() {
             if (( first_todo )); then
                 run_move "$first" move "$var" || die "${z}/${first}: moving the $var files failed (see above)."
             fi
+            # With the first node not being staged now, a precheck may have moved files on from
+            # the shared destination: those can't be compared, so they aren't checked.
+            MOVE_SKIP=""
+            if (( ! first_todo && ! DRY_RUN )); then
+                moved_by_precheck "$var"
+                [[ -z "$MOVE_SKIP" ]] || warn "${z}: not checking $MOVE_SKIP: on ${first}, the precheck has moved them to ${FILE_ALT_DIR[$var]}."
+            fi
             for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
                 [[ "$node" == "$first" ]] && continue
                 run_move "$node" check "$var" || die "${z}/${node}: the $var files are not right in ${FILE_MOVE_DIR[$var]} (see above)."
             done
+            MOVE_SKIP=""
         else
             for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
                 run_move "$node" move "$var" || die "${z}/${node}: moving the $var files failed (see above)."
@@ -1023,10 +1074,12 @@ step_identify_ra() {
         info "[dry-run] ${z}: would look for the ZDLRA software (ra_automation .pl files) among: ${files[*]} in $dir"
         return 0
     fi
-    # One line per file: "<name> <result>", result = release | other | notzip | missing.
+    # One line per file: "<name> <result>", result = release | other | notzip | moved | missing.
+    # moved: not here, but in FILE_ALT_DIR, as the precheck moves the gold images there.
     out="$(on_node "${NODES[0]}" "cd '$dir' || exit 1
 for f in ${files[*]}; do
-  if [ ! -f \"\$f\" ]; then echo \"\$f missing\"
+  if [ ! -f \"\$f\" ]; then
+    if [ -n '${FILE_ALT_DIR[FILES_RA]:-}' ] && [ -f '${FILE_ALT_DIR[FILES_RA]:-}'/\"\$f\" ]; then echo \"\$f moved\"; else echo \"\$f missing\"; fi
   elif ! l=\$(unzip -l \"\$f\" 2>/dev/null); then echo \"\$f notzip\"
   elif printf '%s\n' \"\$l\" | grep -Eq '$RA_RELEASE_MARKER_RE'; then echo \"\$f release\"
   else echo \"\$f other\"; fi
@@ -1038,6 +1091,7 @@ done")" || die "${z}/${NODES[0]}: cannot read the FILES_RA files in $dir"
         case "$result" in
             release) found+=("$f"); found_pos=$pos ;;
             other|notzip) gold+=("$f") ;;
+            moved) gold+=("$f"); info "${z}: $f is already in ${FILE_ALT_DIR[FILES_RA]} (the precheck moved it): taken as a gold image." ;;
             missing) die "${z}/${NODES[0]}: $f is not in $dir" ;;
             *) die "${z}/${NODES[0]}: could not check $f in $dir (got: ${line:-nothing})" ;;
         esac
@@ -1077,7 +1131,7 @@ sr_number=$SR_NUMBER_VALUE"
             info "[dry-run] ${node}: would write ${STAGE_DIR}/${STAGED_RECORD_NAME}"
             continue
         fi
-        on_node "$node" "cat > '${STAGE_DIR}/${STAGED_RECORD_NAME}'" <<<"$content" \
+        on_node_stdin "$node" "cat > '${STAGE_DIR}/${STAGED_RECORD_NAME}'" <<<"$content" \
             || die "${z}/${node}: cannot write ${STAGE_DIR}/${STAGED_RECORD_NAME}"
         info "${z}/${node}: wrote ${STAGE_DIR}/${STAGED_RECORD_NAME}"
     done

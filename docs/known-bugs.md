@@ -4,7 +4,7 @@ From a code review of all the code on `main` (commit 59ab2d5), on 2026-11-03. No
 are fixed yet. Line numbers are from that commit. Almost all of this also applies to the
 `platinum` branch, which has its own list in `docs/platinum-known-bugs.md`.
 
-**Bugs 1-34 and 43-48 are fixed (2026-11-03), tested with stand-ins only.** The rest are still open. Even a dry run executes the real precheck, which changes the system.
+**Bugs 1-36 and 43-48 are fixed (2026-11-03), tested with stand-ins only.** The rest are still open. Even a dry run executes the real precheck, which changes the system.
 
 How far each finding was checked:
 
@@ -125,25 +125,26 @@ Fixed on `main`, tested with stand-ins on a PC only. The items marked "check" de
 34. **The OEM jobs check compared clocks across what may be a shared mount.** The marker is now created
     inside `OEM_JOBS_DIR`, so both timestamps come from the same clock.
 
-## Other bugs
+## Fixed: staging (35, 36)
+
+Fixed on `main`, tested with stand-ins on a PC only.
 
 35. **`staging/zdlra_stage.sh`:**
-    - a. `on_node` has no `ssh -n` (`:225`), so it swallows input, and only the first extra backup is
-      removed.
-      When fixing: `step_no_active_run` feeds its script to `on_node` on stdin, so it must keep working.
-    - b. An archive taken from an already staged appliance is rejected (`:387`), because
-      `CONF_GLOB` also matches `patch.conf_*.orig`. The archive also carries that appliance's record
-      and unpacked `tmp/`.
-    - c. Re-staging after a precheck fails (`:803`, `:1014`), because the gold images have moved to
-      `/radump`, though the README (line 276) says rerunning is safe.
-    - d. An interrupted copy can become the kept backup (`:663`). Copy to a temporary name and rename
-      after checking the SHA.
-    - e. Long `sha256sum`, `cmp` and `unzip` sessions have no keepalive (`:99`).
+    - a. `on_node` now uses `ssh -n`, so it can't swallow a list or what you type. All extra backups are
+      removed. `on_node_stdin` is for the two commands that do read their input.
+    - b. A folder's `patch.conf_*.orig` no longer counts as a second conf file. `Copy-ZdlraPatches.ps1` also
+      leaves out the record, `tmp/` and `conf/*.orig` from an already staged folder, and says so.
+    - c. Staging again after a precheck no longer fails on the gold images. If one has moved to
+      `FILE_ALT_DIR` (`/radump`), it's taken as a gold image and not compared. A file that isn't there
+      either is still a failure.
+    - d. The archive is copied as `patches.zip.part`, and only gets its name once its SHA-256 is right.
+    - e. `ServerAliveInterval=30` on ssh and scp.
 36. **`staging/Copy-ZdlraPatches.ps1`:**
-    - a. A mistyped `-Manifest` path is ignored (`:220`), so the required-file check never runs.
-    - b. Long silent ssh sessions have no keepalive (`:210`), and the archive may be left in `/radump`.
-    - c. PC free space is only checked after the archive is built (`:281`), and that failure doesn't
-      say the archive is still on the appliance.
+    - a. A `-Manifest` path that doesn't exist now stops the script.
+    - b. `ServerAliveInterval=30` on ssh and scp. A dropped session says an archive may be left, and where.
+    - c. The PC's free space is checked before the ZDLRA builds the archive.
+
+Each node's archive is now hashed once per run (half of bug 40).
 
 ## To confirm, not necessarily a bug
 
@@ -168,9 +169,8 @@ Fixed on `main`, tested with stand-ins on a PC only. The items marked "check" de
     - `on_node` is just `on "$NODE"` (`jump/zdlra_patch_run.sh:177`). `STAGE` and the local `stage`
       are near-identical names with different meanings.
     - `$(cat <<<"$list")` is just `"$list"` (`staging/zdlra_stage.sh:444`).
-40. **Wasted time:** `sha256sum` runs twice per node on a very large archive, one node at a time
-    (`staging/zdlra_stage.sh:658`). `du -sb` also runs twice (`staging/Copy-ZdlraPatches.ps1:172`,
-    `:175`).
+40. **Wasted time:** `sha256sum` runs on one node at a time, on a very large archive
+    (`staging/zdlra_stage.sh`). Twice per node is fixed, as is the repeated `du -sb`.
 41. **Misleading output:**
     - The advertised `tail -f` of the run log shows nothing during the longest steps
       (`zdlra_patch.sh:1584`, `:1144`), because a step's log is only added once it finishes.

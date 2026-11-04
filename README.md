@@ -280,7 +280,7 @@ If any value can't be found, the appliance is refused, so a conf file never keep
 
 **Older versions:** with `OLD_VERSION_ACTION=backup` (the default), the first older `patches.zip` and `/radump/patches/` are kept as `<name>.<date>.bak`. After that, only that oldest backup is kept.
 
-Running the same archive again is safe, because nodes that are already staged are skipped. At the end, the script prints a summary marking each appliance OK or FAILED. The jump server needs SSH access to the nodes without a password; the user is `root` by default and you can change it with `-u`. See `staging/appliances.conf.example` for the inventory format. Real inventories are in `.gitignore`.
+Running the same archive again is safe, because nodes that are already staged are skipped. That holds after a precheck too: gold images it has moved on to `/radump` (`FILE_ALT_DIR`) don't count as missing. Staging refuses to start on a node with a patch run active. The archive is copied as `patches.zip.part`, and only gets its name once its SHA-256 is right. At the end, the script prints a summary marking each appliance OK or FAILED. The jump server needs SSH access to the nodes without a password; the user is `root` by default and you can change it with `-u`. See `staging/appliances.conf.example` for the inventory format. Real inventories are in `.gitignore`.
 
 ## Before you use it
 

@@ -149,11 +149,11 @@ function Test-SafeRelativePath {
 # Runs on the ZDLRA (bash). Prints one tagged line per result:
 #   FOUND <bytes> <path> | MISSING <path> | NOTE <text> | ERROR <text>
 #   TOTAL <bytes> <files> | FREE <bytes> | ARCHIVE <bytes> <path> | SHA256 <hash>
-# Arguments: <src> <workdir> <name> <format> <stamp> [required paths...]
+# Arguments: <src> <workdir> <name> <format> <stamp> <free bytes on the PC> [required paths...]
 # ---------------------------------------------------------------------------
 $remoteScript = @'
 set -uo pipefail
-src="$1"; work="$2"; name="$3"; fmt="$4"; stamp="$5"; shift 5
+src="$1"; work="$2"; name="$3"; fmt="$4"; stamp="$5"; pcfree="$6"; shift 6
 [ -d "$src" ] || { echo "ERROR Folder not found on $(hostname): $src"; exit 2; }
 
 missing=0
@@ -169,10 +169,12 @@ done
 zips=$(find "$src" -type f -name '*.zip' | wc -l)
 [ "$zips" -gt 0 ] || { echo "ERROR No .zip files under $src"; exit 3; }
 echo "NOTE $zips .zip file(s) under $src"
-echo "TOTAL $(du -sb "$src" | cut -f1) $(find "$src" -type f | wc -l)"
-
-mkdir -p "$work" || { echo "ERROR Cannot create $work"; exit 4; }
 total=$(du -sb "$src" | cut -f1)
+echo "TOTAL $total $(find "$src" -type f | wc -l)"
+
+# Before building anything: the archive is about the size of the folder.
+[ "$pcfree" -gt $(( total + 1073741824 )) ] || { echo "ERROR Not enough free space on the PC for this folder ($total bytes, $pcfree free)"; exit 4; }
+mkdir -p "$work" || { echo "ERROR Cannot create $work"; exit 4; }
 free=$(df -B1 --output=avail "$work" | tail -1 | tr -dc '0-9')
 echo "FREE $free"
 [ "$free" -gt $(( total + 1073741824 )) ] || { echo "ERROR Not enough free space in $work"; exit 4; }
@@ -182,12 +184,20 @@ parent=$(dirname "$src")
 if [ "$fmt" = zip ] && ! command -v zip >/dev/null 2>&1; then
     echo "NOTE zip is not installed; using tar"; fmt=tar
 fi
+# A folder staging has already set up here holds this appliance's record, its unpacked
+# patches and the conf file's backup: leave those out.
+zipx=(); tarx=()
+if [ -f "$src/ZDLRA_STAGED.txt" ]; then
+    echo "NOTE $src was already staged on this appliance: leaving out its record, tmp/ and conf/*.orig. Files staging moved away, such as FILES_RA, will not be in the archive"
+    zipx=(-x "$base/ZDLRA_STAGED.txt" "$base/tmp/*" "$base/conf/*.orig")
+    tarx=(--exclude="$base/ZDLRA_STAGED.txt" --exclude="$base/tmp" --exclude="$base/conf/*.orig")
+fi
 if [ "$fmt" = zip ]; then
     archive="$work/${name}_${base}_${stamp}.zip"
-    ( cd "$parent" && zip -r -0 -q "$archive" "$base" ) || { echo "ERROR zip failed"; exit 5; }
+    ( cd "$parent" && zip -r -0 -q "$archive" "$base" ${zipx[@]+"${zipx[@]}"} ) || { echo "ERROR zip failed"; exit 5; }
 else
     archive="$work/${name}_${base}_${stamp}.tar"
-    ( cd "$parent" && tar -cf "$archive" "$base" ) || { echo "ERROR tar failed"; exit 5; }
+    ( cd "$parent" && tar -cf "$archive" ${tarx[@]+"${tarx[@]}"} "$base" ) || { echo "ERROR tar failed"; exit 5; }
 fi
 [ -s "$archive" ] || { echo "ERROR Archive was not created: $archive"; exit 5; }
 echo "ARCHIVE $(stat -c %s "$archive") $archive"
@@ -207,15 +217,22 @@ foreach ($tool in @($SshPath, $ScpPath)) {
     }
 }
 
-$sshOpts = @('-p', "$SshPort", '-o', 'ConnectTimeout=20')
-$scpOpts = @('-P', "$SshPort", '-o', 'ConnectTimeout=20')
+# ServerAliveInterval: zipping and hashing a large folder print nothing for a long time,
+# and a firewall can drop an idle session.
+$sshOpts = @('-p', "$SshPort", '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=30')
+$scpOpts = @('-P', "$SshPort", '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=30')
 if ($SshKey) {
     if (-not (Test-Path -LiteralPath $SshKey -PathType Leaf)) { Stop-WithError "SSH key not found: $SshKey" }
     $sshOpts += @('-i', $SshKey)
     $scpOpts += @('-i', $SshKey)
 }
 
-if (-not $Manifest) { $Manifest = Join-Path $PSScriptRoot "manifests\$ZdlraName.txt" }
+if ($Manifest) {
+    # Asked for by name: a mistyped path must not skip the required-file check.
+    if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { Stop-WithError "Manifest not found: $Manifest" }
+} else {
+    $Manifest = Join-Path $PSScriptRoot "manifests\$ZdlraName.txt"
+}
 $required = @()
 if (Test-Path -LiteralPath $Manifest -PathType Leaf) {
     $required = @(Get-Content -LiteralPath $Manifest | ForEach-Object { $_.Trim() } |
@@ -245,7 +262,9 @@ Write-Log "Connecting to $SshHost to check and archive $RemotePath ..."
 # Every argument has passed the validation patterns above, so single quotes are enough.
 $scriptBytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes(($remoteScript -replace "`r`n", "`n"))
 $b64 = [Convert]::ToBase64String($scriptBytes)
-$quoted = @($RemotePath, $RemoteWorkDir, $ZdlraName, $ArchiveFormat, $stamp) + $required | ForEach-Object { "'$_'" }
+$pcFree = (New-Object System.IO.DriveInfo((Split-Path ([System.IO.Path]::GetFullPath($destDir)) -Qualifier))).AvailableFreeSpace
+Write-Log ("Free on this PC: {0}" -f (Format-Size $pcFree))
+$quoted = @($RemotePath, $RemoteWorkDir, $ZdlraName, $ArchiveFormat, $stamp, "$pcFree") + $required | ForEach-Object { "'$_'" }
 $remoteCmd = "echo $b64 | base64 -d | bash -s -- " + ($quoted -join ' ')
 # stderr is not redirected, so ssh prompts and errors reach the console directly.
 $out = @(& $SshPath @sshOpts $target $remoteCmd)
@@ -266,7 +285,7 @@ foreach ($line in $out) {
         'SHA256'  { $remoteSha = $rest.Trim().ToLower() }
     }
 }
-if ($rc -eq 255) { Stop-WithError "SSH connection to $target failed." }
+if ($rc -eq 255) { Stop-WithError "SSH connection to $target failed. If it dropped during the zip, an archive may be left on the ZDLRA: $RemoteWorkDir/${ZdlraName}_*_$stamp.*" }
 if ($rc -ne 0)   { Stop-WithError "Checks on $SshHost failed (exit code $rc). Nothing was downloaded." }
 if (-not $archive -or -not $remoteSha) { Stop-WithError "The ZDLRA did not report an archive. See $script:LogFile" }
 if (-not $archive.StartsWith("$RemoteWorkDir/")) { Stop-WithError "Unexpected archive path from the ZDLRA: $archive" }
@@ -277,8 +296,7 @@ Write-Log ("  archive  {0} ({1})" -f $archive, (Format-Size $archiveSize))
 # ---------------------------------------------------------------------------
 $localFile = Join-Path $destDir (Split-Path $archive -Leaf)
 $free = (New-Object System.IO.DriveInfo((Split-Path ([System.IO.Path]::GetFullPath($destDir)) -Qualifier))).AvailableFreeSpace
-Write-Log ("Free on this PC: {0}" -f (Format-Size $free))
-if ($free -lt ($archiveSize + 1GB)) { Stop-WithError "Not enough free space on this PC for $(Format-Size $archiveSize)." }
+if ($free -lt ($archiveSize + 1GB)) { Stop-WithError "Not enough free space on this PC for $(Format-Size $archiveSize). The archive is still on the ZDLRA: $archive" }
 
 Write-Log "Downloading to $localFile ..."
 $started = Get-Date
