@@ -52,6 +52,13 @@ How far each finding was checked:
    record and the precheck, without checking the lock or for running commands. Fix: refuse when a
    run is active on that node.
 
+43. **The cell prep steps are wrong** (`zdlra_patch.sh:143`, `:1226`, `zdlra_patch.conf.example:75`,
+    `README.md:19`). Confirmed by the user on 2026-11-03: `-reset_force` and `-cleanup` should only run
+    if `-patch_check_prereq` fails. Today it's the opposite: they run every time after a passing
+    prereq, and a failing prereq stops the run before they can run (`run_patchmgr` dies on it). Still
+    to decide: after the cleanup, does the prereq run again before `-patch`, and does the run stop if
+    it fails a second time?
+
 ## Could finish wrongly or leave backups off
 
 8. **The printed "Resume OEM jobs" command doesn't resume anything** (`jump/zdlra_patch_run.sh:287`,
@@ -158,9 +165,8 @@ How far each finding was checked:
 
 37. **Cell patching** (`zdlra_patch.sh:1230`). Cells are patched with `-patch` and no `-rolling`. As far
     as I recall, that patches all cells at once, with the storage users down, but the README (line
-    321) says rolling is handled by `patchmgr`. The prereq check also runs before `-reset_force` and
-    `-cleanup`; the usual order may be the reverse. These steps came from the site's procedure, so
-    confirm them.
+    321) says rolling is handled by `patchmgr`. Confirm which is wanted. The order of the prep steps
+    is settled: see bug 43.
 
 ## Bloat and stale docs
 
