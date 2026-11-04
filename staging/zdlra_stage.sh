@@ -256,8 +256,10 @@ remote_sha() {
 }
 
 # SHA-256 in the node's staged record, or empty if it has none.
+# A node that doesn't answer must not read as "not staged": that would replace its folder.
 staged_sha() {
-    on_node "$1" "sed -n 's/^sha256=//p' '${STAGE_DIR}/${STAGED_RECORD_NAME}' 2>/dev/null" 2>/dev/null || true
+    on_node "$1" "sed -n 's/^sha256=//p' '${STAGE_DIR}/${STAGED_RECORD_NAME}' 2>/dev/null; true" 2>/dev/null \
+        || die "${1}: not answering; can't tell if it's already staged."
 }
 
 # Value of KEY in conf text ($1 = text, $2 = key), without surrounding quotes.
@@ -616,10 +618,6 @@ step_components() {
     done
 }
 
-# Deal with an older file or folder at $2 on node $1, per OLD_VERSION_ACTION.
-# backup: keep it as <path>.<date>.bak, unless a backup already exists - then only
-# the oldest backup is kept and the current old version is replaced.
-# $3 = what it is, for messages.
 # Staging replaces /radump/patches, which holds the patchmgr working folders, the
 # staged record and the precheck. So refuse on a node with a patch run holding its lock,
 # or with the Oracle precheck, a patchmgr run or a racli upgrade step going. Read only;
@@ -647,6 +645,10 @@ REMOTE
     info "No patch run active on: ${NODES[*]}"
 }
 
+# Deal with an older file or folder at $2 on node $1, per OLD_VERSION_ACTION.
+# backup: keep it as <path>.<date>.bak, unless a backup already exists - then only
+# the oldest backup is kept and the current old version is replaced.
+# $3 = what it is, for messages.
 set_aside_old() {
     local node="$1" path="$2" what="$3" baks oldest
     if [[ "$OLD_VERSION_ACTION" == overwrite ]]; then
@@ -686,7 +688,7 @@ declare -A SHA_OK=()
 copy_to_node() {
     local node="$1" first="$2" part="${REMOTE_ARCHIVE}.part" sha
     if (( RELAY )) && [[ "$node" != "$first" ]]; then
-        change_on_node "$first" "scp -q -o BatchMode=yes '$REMOTE_ARCHIVE' '${SSH_USER}@${node}:$part'" || return 1
+        change_on_node "$first" "scp -q -o BatchMode=yes -o ServerAliveInterval=30 '$REMOTE_ARCHIVE' '${SSH_USER}@${node}:$part'" || return 1
     elif (( DRY_RUN )); then
         info "[dry-run] scp $ARCHIVE ${SSH_USER}@${node}:$part"
     else
@@ -704,10 +706,17 @@ copy_to_node() {
     SHA_OK[$node]=1
 }
 
+# Free KB for a path on a node, from the nearest folder that exists. $1 = node, $2 = path
+free_kb_on() {
+    on_node "$1" "d='$2'; while [ ! -d \"\$d\" ]; do d=\$(dirname \"\$d\"); done; df -Pk \"\$d\"" | awk 'NR == 2 { print $4 }'
+}
+
 step_distribute() {
     local z="$1" node first="${NODES[0]}" sha
+    local staged
     for node in "${NODES[@]}"; do
-        if [[ "$(staged_sha "$node")" == "$EXPECTED_SHA" ]]; then
+        staged="$(staged_sha "$node")" || exit 1
+        if [[ "$staged" == "$EXPECTED_SHA" ]]; then
             info "${z}/${node}: already staged with this archive; not copying"
             continue
         fi
@@ -717,12 +726,24 @@ step_distribute() {
             SHA_OK[$node]=1
             continue
         fi
+        # Enough room for the copy? Before anything is removed. The old archive's space counts.
+        local need_kb free_kb old_kb=0
+        need_kb=$(du -k "$ARCHIVE" | cut -f1)
+        free_kb="$(free_kb_on "$node" "$REMOTE_DIR")"
+        [[ "$free_kb" =~ ^[0-9]+$ ]] || die "${z}/${node}: cannot read free space for $REMOTE_DIR"
+        if [[ -n "$sha" && "$OLD_VERSION_ACTION" != backup ]]; then
+            old_kb="$(on_node "$node" "du -k '$REMOTE_ARCHIVE' | cut -f1" 2>/dev/null || echo 0)"
+        fi
+        (( free_kb + old_kb >= need_kb )) || die "${z}/${node}: not enough free space in $REMOTE_DIR for the archive ($(( need_kb / 1024 )) MB needed, $(( free_kb / 1024 )) MB free)."
         if [[ -n "$sha" ]]; then
             info "${z}/${node}: $REMOTE_ARCHIVE is an older version (SHA-256 ${sha:0:12}...)"
             set_aside_old "$node" "$REMOTE_ARCHIVE" "$REMOTE_ARCHIVE_NAME"
         fi
         change_on_node "$node" "mkdir -p '$REMOTE_DIR'"
-        copy_to_node "$node" "$first" || die "${z}/${node}: copy failed."
+        if ! copy_to_node "$node" "$first"; then
+            (( DRY_RUN )) || on_node "$node" "rm -f -- '${REMOTE_ARCHIVE}.part'" || true
+            die "${z}/${node}: copy failed."
+        fi
     done
 }
 
@@ -733,8 +754,10 @@ step_check() {
     # Unpacked size is about the archive size, because the archive is stored (not compressed).
     local need_kb=$(( $(du -k "$ARCHIVE" | cut -f1) + MIN_FREE_GB * 1024 * 1024 ))
     TODO_NODES=()
+    local staged
     for node in "${NODES[@]}"; do
-        if [[ "$(staged_sha "$node")" == "$EXPECTED_SHA" ]]; then
+        staged="$(staged_sha "$node")" || exit 1
+        if [[ "$staged" == "$EXPECTED_SHA" ]]; then
             info "${z}/${node}: already staged with this archive ($STAGE_DIR/$STAGED_RECORD_NAME); skipping"
             continue
         fi
@@ -745,7 +768,7 @@ step_check() {
             [[ "$sha" == "$EXPECTED_SHA" ]] || die "${z}/${node}: SHA-256 mismatch or archive missing (${sha:-none})"
             info "${z}/${node}: SHA-256 OK"
         fi
-        free_kb="$(on_node "$node" "d='$EXTRACT_ROOT'; while [ ! -d \"\$d\" ]; do d=\$(dirname \"\$d\"); done; df -Pk \"\$d\"" | awk 'NR == 2 { print $4 }')"
+        free_kb="$(free_kb_on "$node" "$EXTRACT_ROOT")"
         [[ "$free_kb" =~ ^[0-9]+$ ]] || die "${z}/${node}: cannot read free space for $EXTRACT_ROOT"
         info "${z}/${node}: $(( free_kb / 1024 / 1024 ))G free for $EXTRACT_ROOT (need $(( need_kb / 1024 / 1024 ))G)"
         (( free_kb >= need_kb )) || die "${z}/${node}: not enough free space in $EXTRACT_ROOT"
@@ -760,12 +783,20 @@ step_extract() {
         *.tar) unpack="tar -xf '$REMOTE_ARCHIVE' -C '$UNPACK_INTO'" ;;
     esac
     for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
-        # An older (or half-finished) unzipped folder from an earlier staging.
-        if on_node "$node" "[ -e '$STAGE_DIR' ]"; then
-            info "${z}/${node}: $STAGE_DIR is from an earlier staging"
-            set_aside_old "$node" "$STAGE_DIR" "unzipped folder"
-        fi
-        change_on_node "$node" "mkdir -p '$UNPACK_INTO' && $unpack" || die "${z}/${node}: unpack failed."
+        # An older unzipped folder from an earlier staging is set aside. A half-finished one
+        # (its marker is still there; the record step removes it) isn't worth keeping.
+        local there
+        there="$(on_node "$node" "if [ -e '${STAGE_DIR}.unpacking' ]; then echo half; elif [ -e '$STAGE_DIR' ]; then echo yes; else echo no; fi")" \
+            || die "${z}/${node}: not answering; can't tell what's in $STAGE_DIR."
+        case "$there" in
+            half)
+                info "${z}/${node}: $STAGE_DIR is from a staging that didn't finish; replacing it"
+                change_on_node "$node" "rm -rf -- '$STAGE_DIR'" || die "${z}/${node}: could not remove $STAGE_DIR." ;;
+            yes)
+                info "${z}/${node}: $STAGE_DIR is from an earlier staging"
+                set_aside_old "$node" "$STAGE_DIR" "unzipped folder" ;;
+        esac
+        change_on_node "$node" "mkdir -p '$UNPACK_INTO' && touch '${STAGE_DIR}.unpacking' && $unpack" || die "${z}/${node}: unpack failed."
         if (( ! DRY_RUN )); then
             info "${z}/${node}: $(on_node "$node" "find '$STAGE_DIR' -type f | wc -l") file(s) in $STAGE_DIR"
         fi
@@ -903,8 +934,11 @@ for f in "$@"; do
         fi
     fi
     size=$(stat -c %s "$src/$f")
-    mv "$src/$f" "$dest/$f" || fail "cannot move $f to $dest"
-    [ "$(stat -c %s "$dest/$f")" = "$size" ] || fail "check: $dest/$f has the wrong size after the move"
+    # Under another name until it's all there: across filesystems a move is a long copy, and
+    # an interrupted one must not look like an older version of the file.
+    mv "$src/$f" "$dest/$f.part" || fail "cannot move $f to $dest"
+    [ "$(stat -c %s "$dest/$f.part")" = "$size" ] || fail "check: $dest/$f.part has the wrong size after the move"
+    mv "$dest/$f.part" "$dest/$f" || fail "cannot rename $dest/$f.part"
     echo "OK moved $f -> $dest/"
 done
 REMOTE
@@ -1134,6 +1168,7 @@ sr_number=$SR_NUMBER_VALUE"
         fi
         on_node_stdin "$node" "cat > '${STAGE_DIR}/${STAGED_RECORD_NAME}'" <<<"$content" \
             || die "${z}/${node}: cannot write ${STAGE_DIR}/${STAGED_RECORD_NAME}"
+        on_node "$node" "rm -f -- '${STAGE_DIR}.unpacking'" || warn "${z}/${node}: could not remove ${STAGE_DIR}.unpacking"
         info "${z}/${node}: wrote ${STAGE_DIR}/${STAGED_RECORD_NAME}"
     done
 }

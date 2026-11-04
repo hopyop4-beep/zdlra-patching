@@ -103,6 +103,10 @@ NODE_DCLI="dcli"
 COMPUTE_WARN_MINUTES=240        # past this, a warning only; patchmgr is never stopped
 COMPUTE_POLL_SECONDS=60
 COMPUTE_VERSION_WAIT_MINUTES=60 # a patched node not answering after this long stops the run (patchmgr has ended)
+# After the last pass, before the next phases start, this must succeed on the patch node:
+# the database is back up there, not just ssh. Past NODE_READY_MINUTES the run stops.
+NODE_READY_CMD="ps -eo args= | grep -q '[o]ra_pmon_'"
+NODE_READY_MINUTES=30
 # "SUCCESS WITH WARNING(S)" from patchmgr: 0 = carry on (the warnings are listed),
 # 1 = stop for review before going on. Decided for now: carry on, because the
 # prechecks have already been reviewed. To revisit.
@@ -349,7 +353,7 @@ state_set()  {
     mkdir -p "$STATE_DIR"
     local f k v keep=()
     f="$(state_file)"
-    for k in phases keep_blackout skip_backup_wait dry_run; do
+    for k in phases keep_blackout skip_backup_wait dry_run compute_nodes resume_problem; do
         [[ " $* " == *" $k="* ]] && continue
         v="$(state_get "$k")"
         [[ -n "$v" ]] && keep+=("$k=$v")
@@ -357,9 +361,30 @@ state_set()  {
     printf '%s\n' "$@" ${keep[@]+"${keep[@]}"} > "$f.tmp" && mv "$f.tmp" "$f"
 }
 
+# Set one key in the state file, leaving the others as they are.
+state_put() {
+    local f
+    f="$(state_file)"
+    mkdir -p "$STATE_DIR"
+    { grep -v "^${1%%=*}=" "$f" 2>/dev/null || true; echo "$1"; } > "$f.tmp" && mv "$f.tmp" "$f"
+}
+
+# Only one zdlra_patch_run.sh at a time for a run: two would both resume the jobs.
+take_run_lock() {
+    local f="${STATE_DIR}/${ZDLRA}_${RUN_ID}.lock" pid
+    mkdir -p "$STATE_DIR"
+    pid="$(cat "$f" 2>/dev/null || true)"
+    if [[ -n "$pid" && "$pid" != "$$" ]] && kill -0 "$pid" 2>/dev/null; then
+        die "Another zdlra_patch_run.sh (pid $pid) is already handling run $RUN_ID. If you can't reach it, stop it first."
+    fi
+    echo $$ > "$f"
+    # shellcheck disable=SC2064
+    trap "rm -f '$f'" EXIT
+}
+
 # Save how this run was started, for picking it up later.
 save_run_settings() {
-    state_set stage=precheck "phases=$PHASES" "keep_blackout=$KEEP_BLACKOUT" "skip_backup_wait=$SKIP_BACKUP_WAIT" "dry_run=$DRY_RUN"
+    state_set stage=precheck "phases=$PHASES" "keep_blackout=$KEEP_BLACKOUT" "skip_backup_wait=$SKIP_BACKUP_WAIT" "dry_run=$DRY_RUN" "compute_nodes=$(IFS=,; echo "${C_NODES[*]-}")"
 }
 
 # Picking up a run: use how it was started, not this command's defaults, so phases the
@@ -376,8 +401,12 @@ load_run_settings() {
         PHASES="$saved"
     fi
     info "Phases of run $RUN_ID: $PHASES"
+    # Either way round: saved here and added now both stay for later pickups.
     [[ "$(state_get keep_blackout)" != 1 ]] || KEEP_BLACKOUT=1
     [[ "$(state_get skip_backup_wait)" != 1 ]] || SKIP_BACKUP_WAIT=1
+    (( ! KEEP_BLACKOUT )) || state_put keep_blackout=1
+    (( ! SKIP_BACKUP_WAIT )) || state_put skip_backup_wait=1
+    JOBS_RESUME_PROBLEM="$(state_get resume_problem)"
     dry="$(state_get dry_run)"
     if [[ -n "$dry" && "$dry" != "$DRY_RUN" ]]; then
         if (( dry )); then
@@ -401,8 +430,22 @@ on_script() { local n="$1"; shift; ssh "${SSH_OPTS[@]/#-n/-T}" "${SSH_USER}@${n}
 # the conf file staging set up. Sets C_NODES (in order), C_TARGET, C_ISO, C_DIR.
 C_NODES=(); C_TARGET=""; C_ISO=""; C_DIR=""
 compute_gather() {
-    local out
-    out="$(on_script "$NODE" "bash -s -- '$NODE_STAGED_RECORD' '$COMPUTE_FILES_DIR' '$COMPUTE_TMP_DIR'" <<'REMOTE'
+    local out="" host hosts=("$NODE") saved=()
+    # During a pass, the first node may be rebooting: any node has its own copy.
+    IFS=',' read -r -a saved <<<"$( [[ -z "$RUN_ID" ]] || state_get compute_nodes )"
+    for host in ${saved[@]+"${saved[@]}"}; do [[ "$host" == "$NODE" ]] || hosts+=("$host"); done
+    for host in "${hosts[@]}"; do
+        if out="$(compute_read_details "$host" 2>&1)"; then break; fi
+        warn "Could not read the compute patch details on $host; trying the next node."
+    done
+    [[ "$out" == *"NODES="* ]] || die "Could not read the compute patch details on ${hosts[*]}: $out"
+    compute_parse_details "$out"
+    [[ -z "$RUN_ID" ]] || state_put "compute_nodes=$(IFS=,; echo "${C_NODES[*]}")"
+}
+
+# Prints the compute details from one node's staged record. $1 = node
+compute_read_details() {
+    on_script "$1" "bash -s -- '$NODE_STAGED_RECORD' '$COMPUTE_FILES_DIR' '$COMPUTE_TMP_DIR'" <<'REMOTE'
 rec=$1 files=$2 tmp=$3
 val() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -1 | tr -d '\r' | sed -E "s/^[\"']//; s/[\"']$//; s/[[:space:]]+$//"; }
 [ -f "$rec" ] || { echo "ERROR no staged record at $rec"; exit 1; }
@@ -418,7 +461,11 @@ top=$(unzip -Z1 "$files/$dbs" 2>/dev/null | sed 's#^\./##; s#/.*##' | grep -v '^
 echo "DIR=$top"
 [ -x "$tmp/$top/patchmgr" ] || echo "ERROR no patchmgr in $tmp/$top"
 REMOTE
-)" || die "Could not read the compute patch details on $NODE: $out"
+}
+
+# Sets C_NODES and the rest from compute_read_details's output, or stops. $1 = that output
+compute_parse_details() {
+    local out="$1"
     if grep -q '^ERROR' <<<"$out"; then
         grep '^ERROR' <<<"$out" | sed 's/^ERROR /  /' | while IFS= read -r l; do err "$l"; done
         die "Compute patch details are not ready on $NODE (see above)."
@@ -453,19 +500,20 @@ start_remote_patchmgr() {
     on_script "$runner" "bash -s -- '$C_DIR' '$work' '$job' $args" <<'REMOTE'
 dir=$1 work=$2 job=$3; shift 3
 log=$work/$job.log rc=$work/$job.rc pidf=$work/$job.pid
-if [ -s "$work/running.pid" ] && kill -0 "$(cat "$work/running.pid")" 2>/dev/null; then
-    echo "ERROR a patchmgr is already running on $(hostname) (pid $(cat "$work/running.pid"))"; exit 3
-fi
-if ps -eo args= 2>/dev/null | grep -q '[p]atchmgr .*-dbnodes'; then
-    echo "ERROR a patchmgr -dbnodes is already running on $(hostname)"; exit 3
+if ps -eo args= 2>/dev/null | grep -Eq '[p]atchmgr .*(-dbnodes|-cells|--roceswitches)'; then
+    echo "ERROR a patchmgr is already running on $(hostname)"; exit 3
 fi
 mkdir -p "$work" || { echo "ERROR cannot create $work"; exit 1; }
+# Keep the log of an earlier attempt: it may be the only record of what happened.
+[ ! -s "$log" ] || mv -f "$log" "$log.$(date +%Y%m%d_%H%M%S)"
 : > "$log"; rm -f "$rc" "$pidf"
 L="nohup"; command -v setsid >/dev/null 2>&1 && L="setsid nohup"
 $L bash -c 'echo $$ > "$1"; cp "$1" "$(dirname "$1")/running.pid"; cd "$2" || { echo 97 > "$0"; exit; }; shift 3; ./patchmgr "$@"; echo $? > "$0"' \
     "$rc" "$pidf" "$dir" _ "$@" >> "$log" 2>&1 < /dev/null &
-for i in $(seq 1 30); do [ -s "$pidf" ] && break; sleep 1; done
-[ -s "$pidf" ] || { echo "ERROR patchmgr did not start"; exit 1; }
+# However slow the start, wait for its own record of its pid while it is alive.
+p=$!
+while [ ! -s "$pidf" ] && [ ! -s "$rc" ] && kill -0 "$p" 2>/dev/null; do sleep 1; done
+[ -s "$pidf" ] || [ -s "$rc" ] || { echo "ERROR patchmgr did not start"; exit 1; }
 echo "STARTED pid $(cat "$pidf")"
 REMOTE
 }
@@ -475,7 +523,9 @@ REMOTE
 # answers, and neither the wrapper nor any patchmgr is running, with no exit status, it
 # was killed: that is recorded on the node as exit 99, so picking up starts the step
 # again. A patchmgr still running after its wrapper died is waited for, never restarted.
-# Copies the full log here; prints its local path. $1 = runner, $2 = job.
+# Copies the full log here; prints "<exit status> <local path>". If the log can't be copied,
+# this stops with nothing recorded: a log that couldn't be read says nothing about the
+# result, and picking up simply reads it again. $1 = runner, $2 = job.
 wait_remote_patchmgr() {
     local runner="$1" job="$2" work="${COMPUTE_WORK_DIR}/${RUN_ID}"
     local local_log
@@ -509,7 +559,14 @@ wait_remote_patchmgr() {
         fi
         sleep "$COMPUTE_POLL_SECONDS"
     done
-    on "$runner" "cat '$work/$job.log'" > "$local_log" 2>/dev/null || true
+    [[ ! -s "$local_log" ]] || mv -f "$local_log" "${local_log}.$(date +%Y%m%d_%H%M%S)"
+    local tries=0
+    until on "$runner" "cat '$work/$job.log'" > "$local_log" 2>/dev/null; do
+        tries=$((tries + 1))
+        (( tries < 5 )) || die "patchmgr $job on $runner finished (exit $rc), but its log can't be read from here. Nothing is lost."
+        warn "Could not read the log of $job from $runner; trying again."
+        sleep "$COMPUTE_POLL_SECONDS"
+    done
     on "$runner" "rm -f '$work/running.pid'" 2>/dev/null || true
     echo "$rc $local_log"
 }
@@ -550,7 +607,9 @@ check_compute_job() {
     local rc=0
     ( check_patchmgr_log "${3%% *}" "${3#* }" "$4" ) || rc=$?
     (( rc != 0 )) || return 0
-    (( rc == 3 )) || on "$1" "echo 98 > '${COMPUTE_WORK_DIR}/${RUN_ID}/$2.rc'" 2>/dev/null || true
+    if (( rc != 3 )) && [[ "${3%% *}" == 0 ]]; then
+        on "$1" "echo 98 > '${COMPUTE_WORK_DIR}/${RUN_ID}/$2.rc'" 2>/dev/null || true
+    fi
     exit 1
 }
 
@@ -575,66 +634,86 @@ check_compute_version() {
     info "$target is on $C_TARGET."
 }
 
-# Exit status of a finished job on a node, or empty. $1 = runner, $2 = job.
-job_rc() { on "$1" "cat '${COMPUTE_WORK_DIR}/${RUN_ID}/$2.rc' 2>/dev/null" 2>/dev/null | tr -dc '0-9'; }
+# Where a job stands on a node: "rc <N>", "started" or "none". A node that doesn't answer
+# must never read as "not started", so this retries, then returns 1.
+# $1 = runner, $2 = job
+job_state() {
+    local work="${COMPUTE_WORK_DIR}/${RUN_ID}" out i
+    for (( i = 0; i < 5; i++ )); do
+        if out="$(on "$1" "if [ -s '$work/$2.rc' ]; then echo rc \$(tr -dc 0-9 < '$work/$2.rc'); elif [ -f '$work/$2.pid' ]; then echo started; else echo none; fi" 2>/dev/null)" && [[ -n "$out" ]]; then
+            echo "$out"
+            return 0
+        fi
+        warn "Could not reach $1 to check $2; trying again."
+        sleep "$COMPUTE_POLL_SECONDS"
+    done
+    return 1
+}
 
-# One pass: on runner, upgrade target. $3 = step to start from (precheck, upgrade,
-# verify), so --watch can pick up a pass where it was.
+# A node's image version now, read once from the runner; empty if it can't be read.
+# $1 = runner, $2 = node
+node_version() {
+    local out
+    out="$(on "$1" "$NODE_DCLI -g '${COMPUTE_WORK_DIR}/${RUN_ID}/db_nodes_$2' -l root 'imageinfo -ver'" 2>/dev/null || true)"
+    sed -n "s/^$2:[[:space:]]*//p" <<<"$out" | head -1 | tr -d '[:space:]'
+}
+
+# One pass: on runner, upgrade target. $3 = step to start from (precheck, precheck_wait,
+# upgrade, verify), so --watch can pick up a pass where it was.
 compute_pass() {
     local runner="$1" target="$2" from="${3:-precheck}" work="${COMPUTE_WORK_DIR}/${RUN_ID}"
     local common=(-dbnodes "$work/db_nodes_${target}" -log_dir auto -target_version "$C_TARGET" -iso_repo "$C_ISO")
+    local st out res
     info "-- pass: $runner upgrades $target (to $C_TARGET) --"
+    # Picking up a precheck: if it never started or it failed, start it again.
+    if [[ "$from" == precheck_wait ]]; then
+        st="$(job_state "$runner" "precheck_${target}")" || die "$runner is not answering; can't tell how its patchmgr -precheck went."
+        case "$st" in
+            none)     info "$runner: patchmgr -precheck for $target never started; starting it"; from=precheck ;;
+            "rc 0"|started) ;;
+            *)        info "$runner: the previous patchmgr -precheck for $target failed ($st); starting it again"; from=precheck ;;
+        esac
+    fi
     if [[ "$from" == precheck ]]; then
         state_set stage=compute "runner=$runner" "target=$target" step=precheck
         on "$runner" "[ -f '$C_ISO' ] && [ -x '$C_DIR/patchmgr' ]" \
             || die "$runner: the ISO repo $C_ISO or $C_DIR/patchmgr is missing on this node."
         on "$runner" "mkdir -p '$work' && echo '$target' > '$work/db_nodes_${target}' && cd '$C_DIR' && { [ ! -f dbnodeupdate.zip ] || unzip -q -o dbnodeupdate.zip; }" \
             || die "$runner: could not prepare $work/db_nodes_${target} or unzip dbnodeupdate.zip in $C_DIR"
-        local out
         out="$(start_remote_patchmgr "$runner" "precheck_${target}" "${common[@]}" -precheck -nomodify_at_prereq)" || die "$runner: $out"
         info "$runner: patchmgr -precheck ${out#STARTED }"
-        from=precheck_wait
-    fi
-    # Picking up a precheck that never started (a failure just before it): start it.
-    # Exit 1 is "the node answered, and no pid file"; a failed ssh only means "try waiting".
-    if [[ "$from" == precheck_wait ]]; then
-        local started=0
-        on "$runner" "[ -f '$work/precheck_${target}.pid' ]" 2>/dev/null || started=$?
-        if (( started == 1 )); then
-            info "$runner: patchmgr -precheck for $target never started; starting it"
-            compute_pass "$runner" "$target" precheck
-            return
-        fi
-    fi
-    # Picking up a precheck that already failed: start it again.
-    if [[ "$from" == precheck_wait ]] && [[ "$(job_rc "$runner" "precheck_${target}")" =~ ^[1-9][0-9]*$ ]]; then
-        info "$runner: the previous patchmgr -precheck for $target failed; starting it again"
-        compute_pass "$runner" "$target" precheck
-        return
     fi
     if [[ "$from" == precheck || "$from" == precheck_wait ]]; then
-        local res
-        res="$(wait_remote_patchmgr "$runner" "precheck_${target}")"
+        res="$(wait_remote_patchmgr "$runner" "precheck_${target}")" || exit 1
         check_compute_job "$runner" "precheck_${target}" "$res" "patchmgr -precheck on $runner for $target"
         from=upgrade
     fi
     if [[ "$from" == upgrade ]]; then
         state_set stage=compute "runner=$runner" "target=$target" step=upgrade
-        local out
-        if [[ "$(job_rc "$runner" "upgrade_${target}")" =~ ^[1-9][0-9]*$ ]]; then
-            info "$runner: the previous patchmgr -upgrade for $target failed; starting it again"
-            on "$runner" "rm -f '$work/upgrade_${target}.pid' '$work/upgrade_${target}.rc'" || true
-        fi
-        if ! on "$runner" "[ -f '$work/upgrade_${target}.pid' ]" 2>/dev/null; then
-            out="$(start_remote_patchmgr "$runner" "upgrade_${target}" "${common[@]}" -upgrade)" || die "$runner: $out"
-            info "$runner: patchmgr -upgrade ${out#STARTED } ($target reboots)"
-        else
-            info "$runner: patchmgr -upgrade for $target was already started; waiting for it"
-        fi
-        local res
-        res="$(wait_remote_patchmgr "$runner" "upgrade_${target}")"
+        st="$(job_state "$runner" "upgrade_${target}")" || die "$runner is not answering; can't tell how its patchmgr -upgrade went."
+        case "$st" in
+            started|"rc 0")
+                info "$runner: patchmgr -upgrade for $target was already started; waiting for it" ;;
+            *)
+                # Never upgrade a node twice: look before starting, or starting again.
+                local ver
+                ver="$(node_version "$runner" "$target")"
+                if [[ "$ver" == "$C_TARGET" ]]; then
+                    info "$target is already on $C_TARGET: not running patchmgr -upgrade."
+                    from=verify
+                elif [[ "$st" != none && -z "$ver" ]]; then
+                    die "The last patchmgr -upgrade for $target failed ($st), and its version can't be read now. Check $target before picking up."
+                else
+                    [[ "$st" == none ]] || info "$runner: the previous patchmgr -upgrade for $target failed ($st); starting it again"
+                    [[ -n "$ver" ]] || warn "Could not read the version of $target before starting."
+                    out="$(start_remote_patchmgr "$runner" "upgrade_${target}" "${common[@]}" -upgrade)" || die "$runner: $out"
+                    info "$runner: patchmgr -upgrade ${out#STARTED } ($target reboots)"
+                fi ;;
+        esac
+    fi
+    if [[ "$from" == upgrade ]]; then
+        res="$(wait_remote_patchmgr "$runner" "upgrade_${target}")" || exit 1
         check_compute_job "$runner" "upgrade_${target}" "$res" "patchmgr -upgrade on $runner for $target"
-        from=verify
     fi
     state_set stage=compute "runner=$runner" "target=$target" step=verify
     check_compute_version "$runner" "$target"
@@ -674,9 +753,14 @@ step_compute() {
             compute_pass "$runner" "$target"
         fi
     done < <(compute_passes)
-    # The first node rebooted in the last pass: wait until it answers before going on.
-    while ! on "$NODE" true 2>/dev/null; do
-        warn "$NODE is not answering yet after its upgrade; trying again."
+    # The first node rebooted in the last pass: wait until it's back up, database included,
+    # before going on.
+    local start=$(date +%s)
+    until on "$NODE" "$NODE_READY_CMD" 2>/dev/null; do
+        if (( $(date +%s) - start > NODE_READY_MINUTES * 60 )); then
+            die "$NODE isn't ready after its upgrade: after ${NODE_READY_MINUTES} min, this still fails there: $NODE_READY_CMD"
+        fi
+        warn "$NODE isn't ready yet after its upgrade; trying again."
         sleep "$COMPUTE_POLL_SECONDS"
     done
     info "All compute nodes are on $C_TARGET."
@@ -726,6 +810,11 @@ check_phase_list() {
     done
     (( node_phases )) || has_compute || die "The phase list has nothing to run: $PHASES"
     info "Phases: $PHASES"
+    # Not hours into the window: is what compute needs there?
+    if has_compute; then
+        compute_gather
+        info "Compute: ${C_NODES[*]}, to $C_TARGET"
+    fi
 }
 
 step_precheck_start() {
@@ -733,6 +822,7 @@ step_precheck_start() {
     on_node "$(remote_cmd --detach precheck)" || die "Could not start the precheck on $NODE."
     RUN_ID="$(on_node "$REMOTE_SCRIPT -c $REMOTE_CONFIG --status" | status_field Run)"
     [[ "$RUN_ID" =~ ^[0-9_]+$ ]] || die "Could not read the run id from $NODE."
+    take_run_lock
     save_run_settings
     info "Precheck running in run $RUN_ID"
 }
@@ -747,6 +837,10 @@ on_interrupt() {
     elif [[ "$WATCHING" == verify ]]; then
         warn "Stopped watching. verify keeps running on $NODE; the patching is finished, OEM jobs are resumed and the blackout ended."
         warn "Watch again:     $0 -z $ZDLRA --watch $RUN_ID$(xflag)"
+    elif [[ "$WATCHING" == jobs ]]; then
+        warn "Stopped during the blackout start or the OEM job suspend, so patching has not started. Both may be partly done."
+        warn "Undo them with the commands below, then continue later: $0 -z $ZDLRA --resume $RUN_ID$(xflag)"
+        print_undo
     elif [[ "$WATCHING" == precheck ]]; then
         warn "Stopped watching. The precheck keeps running on $NODE; nothing has changed yet."
         warn "Continue later:  $0 -z $ZDLRA --resume $RUN_ID$(xflag)"
@@ -759,11 +853,25 @@ on_interrupt() {
     exit 130
 }
 
-# Poll the run's status until it reaches an end state for the current stage.
-# Prints the final status; returns 0 for a good end state, 1 for a failure.
-# Runs in a subshell when its output is captured, so the Ctrl-C trap is set in main.
+# Of the phases in $1, those the node has not finished, space-separated. Fails if the node
+# doesn't answer. phases_done is what counts, not the status: any by-hand command that
+# works writes "completed". A dry run records nothing, so there the status has to do.
+phases_remaining() {
+    (( ! DRY_RUN )) || return 0
+    local out finished p
+    out="$(on_node "$REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID" 2>/dev/null)" || return 1
+    finished=" $(status_field Done <<<"$out") $(status_field Skipped <<<"$out") "
+    for p in $1; do
+        [[ "$finished" == *" $p "* ]] || printf '%s ' "$p"
+    done
+}
+
+# Poll the run until it reaches an end state for the current stage. Prints the final status;
+# returns 0 for a good end state, 1 for a failure. Runs in a subshell when its output is
+# captured, so the Ctrl-C trap is set in main.
 #   precheck: "awaiting approval", "precheck approved" or "completed" are good
-#   patch:    "completed" is good
+#   others:   nothing running on the node, and every phase of WATCH_PHASES finished
+WATCH_PHASES=""
 watch_until_done() {
     info "== watch $WATCHING (every ${POLL_SECONDS}s; Ctrl-C stops watching only) =="
     local status last="" misses=0
@@ -776,9 +884,18 @@ watch_until_done() {
                 last="$status"
             fi
             case "$WATCHING:$status" in
-                *:*failed*)                                 echo "$status"; return 1 ;;
-                precheck:*awaiting\ approval*|precheck:*precheck\ approved*|*:*completed*)
-                                                            echo "$status"; return 0 ;;
+                *:*failed*)  echo "$status"; return 1 ;;
+                precheck:*awaiting\ approval*|precheck:*precheck\ approved*|precheck:*completed*)
+                             echo "$status"; return 0 ;;
+                precheck:*|*:*running*) ;;
+                *)
+                    local left
+                    if left="$(phases_remaining "$WATCH_PHASES")"; then
+                        if [[ -z "$left" ]]; then echo "$status"; return 0; fi
+                        err "Nothing is running on $NODE, but these phases aren't finished: $left"
+                        echo "$status"
+                        return 1
+                    fi ;;
             esac
         else
             misses=$((misses + 1))
@@ -810,13 +927,13 @@ step_blackout_start() {
 
 step_jobs_suspend() {
     info "== suspend OEM backup jobs =="
+    (( DRY_RUN || ${#OEM_JOBS_SUSPEND_CMD[@]} == 0 )) || JOBS_SUSPENDED=1
     if ! run_jobs_cmd suspend ${OEM_JOBS_SUSPEND_CMD[@]+"${OEM_JOBS_SUSPEND_CMD[@]}"}; then
         err "Suspending OEM jobs failed; patching not started. Some jobs may already be suspended."
         JOBS_SUSPENDED=1
         print_undo
         exit 1
     fi
-    (( DRY_RUN || ${#OEM_JOBS_SUSPEND_CMD[@]} == 0 )) || JOBS_SUSPENDED=1
 }
 
 # Start node phases ($1, space-separated) in the background on the patch node.
@@ -868,8 +985,15 @@ step_pickup_unstarted() {
             info "The $stage phases did start, and failed ($status)."
             state_set "stage=$stage" started=1 ;;
         *)
-            info "The $stage phases never started (status: $status). Starting them now."
-            start_stage "$stage" "$(stage_phases "$stage")" continue ;;
+            local left=""
+            (( DRY_RUN )) || left="$(phases_remaining "$(stage_phases "$stage")")" || die "Could not read run $RUN_ID's finished phases from $NODE. Try again."
+            if (( ! DRY_RUN )) && [[ -z "$(xargs <<<"$left")" ]]; then
+                info "The $stage phases have all finished."
+                state_set "stage=$stage" started=1
+            else
+                info "The $stage phases never started (status: $status). Starting them now."
+                start_stage "$stage" "$(stage_phases "$stage")" continue
+            fi ;;
     esac
 }
 
@@ -882,7 +1006,15 @@ step_jobs_resume() {
     if ! run_jobs_cmd resume ${OEM_JOBS_RESUME_CMD[@]+"${OEM_JOBS_RESUME_CMD[@]}"}; then
         JOBS_RESUME_PROBLEM="resuming them failed. Resume them with: $(jobs_resume_text)"
     fi
-    [[ -z "$JOBS_RESUME_PROBLEM" ]] || err "OEM backup jobs: $JOBS_RESUME_PROBLEM"
+    if [[ -n "$JOBS_RESUME_PROBLEM" ]]; then
+        err "OEM backup jobs: $JOBS_RESUME_PROBLEM"
+        state_put "resume_problem=$JOBS_RESUME_PROBLEM"
+    fi
+}
+
+# The last thing anyone sees, whichever way the run ends.
+report_resume_problem() {
+    [[ -z "$JOBS_RESUME_PROBLEM" ]] || err "NOT ALL BACKUPS ARE BACK ON. OEM backup jobs: $JOBS_RESUME_PROBLEM"
 }
 
 step_blackout_stop() {
@@ -908,6 +1040,7 @@ main() {
     if [[ -n "$WATCH_RUN_ID" || -n "$CONTINUE_RUN_ID" ]]; then
         RUN_ID="${WATCH_RUN_ID:-$CONTINUE_RUN_ID}"
         WATCHING="patch"
+        take_run_lock
         load_run_settings
         stage="$(state_get stage)"; stage="${stage:-before}"
         info "Picking up run $RUN_ID at: $stage"
@@ -923,6 +1056,7 @@ main() {
         step_preflight
         if [[ -n "$RESUME_RUN_ID" ]]; then
             RUN_ID="$RESUME_RUN_ID"
+            take_run_lock
             local saved_stage
             saved_stage="$(state_get stage)"
             [[ -z "$saved_stage" || "$saved_stage" == precheck ]] \
@@ -937,6 +1071,10 @@ main() {
         local status
         status="$(watch_until_done)" || die "Precheck failed in run $RUN_ID ($status). Nothing was changed and no blackout was created."
         step_approve "$status"
+        # Still good? Refuse now, not after the blackout and 30 minutes of job suspend.
+        on_node "$(remote_cmd --check-approval --run-id "$RUN_ID")" \
+            || die "Run $RUN_ID's approval isn't good any more (see above). Nothing was changed and no blackout was created. Run the precheck again."
+        WATCHING="jobs"
         step_blackout_start
         step_jobs_suspend
         if [[ -n "$(phases_before)" ]]; then
@@ -948,7 +1086,8 @@ main() {
 
     # The node phases before compute, then compute from here, then the rest.
     if [[ "$stage" == before ]]; then
-        [[ -z "$(phases_before)" ]] || watch_until_done >/dev/null || patch_failed
+        WATCH_PHASES="$(phases_before)"
+        [[ -z "$WATCH_PHASES" ]] || watch_until_done >/dev/null || patch_failed
         if has_compute; then
             state_set stage=compute
             step_compute
@@ -972,13 +1111,16 @@ main() {
 
     if [[ "$stage" != verify ]]; then
         # With only compute in the list, there is nothing on the node to wait for.
-        [[ -z "$(phases_before)$(phases_after)" ]] || watch_until_done >/dev/null || patch_failed
+        WATCH_PHASES="$(phases_before) $(phases_after)"
+        [[ -z "$(xargs <<<"$WATCH_PHASES")" ]] || watch_until_done >/dev/null || patch_failed
         info "Run $RUN_ID completed on $NODE."
         step_jobs_resume
         step_blackout_stop
         JOBS_SUSPENDED=0; BLACKOUT_ACTIVE=0
         if has_verify; then
-            if (( KEEP_BLACKOUT )); then
+            if [[ -n "$JOBS_RESUME_PROBLEM" ]]; then
+                warn "verify not run: with the OEM jobs not all resumed, it can't tell you anything. Once they are: ssh ${SSH_USER}@${NODE} $(remote_cmd --run-id "$RUN_ID" verify)"
+            elif (( KEEP_BLACKOUT )); then
                 warn "verify not run: the OEM jobs are still suspended (--keep-blackout). Once they are resumed: ssh ${SSH_USER}@${NODE} $(remote_cmd --run-id "$RUN_ID" verify)"
             else
                 start_stage verify verify
@@ -988,17 +1130,19 @@ main() {
     fi
     if [[ "$stage" == verify ]]; then
         WATCHING="verify"
+        WATCH_PHASES="verify"
         watch_until_done >/dev/null || {
             err "verify failed on $NODE. The patching itself completed; OEM jobs are resumed and the blackout ended."
             err "Details:         ssh ${SSH_USER}@${NODE} $REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID"
             err "Run it again:    $0 -z $ZDLRA --continue $RUN_ID$(xflag)"
+            report_resume_problem
             exit 1
         }
     fi
     state_set stage=done
     step_show_report
     info "Done. Report on $NODE: $REMOTE_SCRIPT -c $REMOTE_CONFIG --report --run-id $RUN_ID"
-    [[ -z "$JOBS_RESUME_PROBLEM" ]] || err "NOT ALL BACKUPS ARE BACK ON. OEM backup jobs: $JOBS_RESUME_PROBLEM"
+    report_resume_problem
 }
 
 # The run's report from the node: summary, version table, backup/replication check.
@@ -1018,31 +1162,34 @@ patch_failed() {
     exit 1
 }
 
-# --continue: if the node phases of this stage failed, start them again; the node skips
-# the ones it already finished. A run that is still going is only watched. Compute
-# passes pick up by themselves (a failed patchmgr step is started again).
+# --continue: if nothing is running on the node and this stage's phases aren't all finished,
+# start them again; the node skips the finished ones. A run that is still going is only
+# watched. Compute passes pick up by themselves (a failed patchmgr step is started again).
 step_continue() {
-    local stage="$1" status
-    status="$(run_status || true)"
-    info "Status on $NODE: ${status:-unknown}"
-    case "$stage:$status" in
-        before:*failed*)
-            info "Continuing the node phases before compute."
-            start_stage before "$(phases_before)" continue ;;
-        after:*failed*)
-            [[ -n "$(phases_after)" ]] || die "Nothing to continue after compute."
-            info "Continuing the node phases after compute."
-            start_stage after "$(phases_after)" continue ;;
-        verify:*failed*)
-            info "Running verify again."
-            start_stage verify verify continue ;;
-        compute:*)
-            info "Continuing the compute passes." ;;
-        done:*)
-            die "Run $RUN_ID is already done." ;;
-        *)
-            info "The run has not failed; watching it." ;;
+    local stage="$1" status left=""
+    case "$stage" in
+        compute) info "Continuing the compute passes."; return 0 ;;
+        done)    die "Run $RUN_ID is already done." ;;
     esac
+    status="$(run_status || true)"
+    [[ -n "$status" ]] || die "Could not read the status of run $RUN_ID from $NODE. Try again."
+    info "Status on $NODE: $status"
+    if [[ "$status" != *failed* && "$status" == *running* ]]; then
+        info "The run is still going; watching it."
+        return 0
+    fi
+    if (( DRY_RUN )); then
+        [[ "$status" == *failed* ]] || { info "The run has not failed; watching it."; return 0; }
+        left="$(stage_phases "$stage")"
+    else
+        left="$(phases_remaining "$(stage_phases "$stage")")" || die "Could not read run $RUN_ID's finished phases from $NODE. Try again."
+    fi
+    if [[ -z "$(xargs <<<"$left")" ]]; then
+        info "Every phase of this stage is finished."
+        return 0
+    fi
+    info "Not finished on the node: $left. Continuing."
+    start_stage "$stage" "$(stage_phases "$stage")" continue
 }
 
 main "$@"

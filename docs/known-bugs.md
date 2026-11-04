@@ -1,10 +1,11 @@
 # Known bugs: automated run (`main`)
 
-From a code review of all the code on `main` (commit 59ab2d5), on 2026-11-03. None of these
-are fixed yet. Line numbers are from that commit. Almost all of this also applies to the
-`platinum` branch, which has its own list in `docs/platinum-known-bugs.md`.
+From two code reviews of all the code on `main`: the first on 2026-11-03 (commit 59ab2d5), the
+second on 2026-11-04 (commit 20097c2). Line numbers are from those commits, so they may have
+shifted. The `platinum` branch has none of these fixes, and its own list in
+`docs/platinum-known-bugs.md` on that branch.
 
-**Bugs 1-36 and 38-48 are fixed (2026-11-03), tested with stand-ins only.** Only item 37 is open. Even a dry run executes the real precheck, which changes the system.
+**Bugs 1-36 and 38-83 are fixed (2026-11-04), tested with stand-ins only.** Only item 37 is open. Even a dry run executes the real precheck, which changes the system.
 
 How far each finding was checked:
 
@@ -172,10 +173,21 @@ Each node's archive is now hashed once per run (half of bug 40).
 42. **Stale docs:** the status text, roadmap items, switches in the approval and warning lists, and the old
     precheck example are all corrected.
 
-## Second review of `main` (2026-11-04): open
+## Second review of `main` (2026-11-04): fixed
 
-Found by a second review of commit 20097c2. Items 49-54 and 57 were confirmed by reading the code, and 79
-by running it. The others are the review's findings. None has run on a real appliance. Line numbers are from that commit.
+Found by a second review of commit 20097c2, and fixed the same day, tested with stand-ins on a PC only. Line
+numbers are from that commit. The descriptions below are of the bugs as found. How the main ones were fixed:
+
+- **A stage is finished when its phases are in `phases_done`,** not when the status says `completed` (51, 56, 82).
+- **A node is never upgraded twice.** A log that can't be read says nothing about the result. A node that doesn't
+  answer never reads as "not started". Before starting or restarting `-upgrade`, its version is read: already on
+  target means it isn't run (49, 50). A precheck that fails fast stops (52).
+- **A result is only marked as acted on once it's recorded** (54), and a rerun precheck discards a pre-install
+  result (53). A skipped phase is listed as `Skipped`, not done (65).
+
+Left as they are (83): the three "is a patch running" checks still differ, though the compute start now also
+refuses over a cells or switch `patchmgr`. `phase_admin_switches` stays a copy of `phase_switches` until the real
+commands are in. The compute log polling still uses two ssh sessions per check.
 
 ### Could repeat a patch, or do the wrong thing
 

@@ -61,6 +61,7 @@
 #   -s, --status        show the state of the latest run, or of --run-id ID
 #       --report        show the report of the latest run, or of --run-id ID
 #       --list-phases   print the phase names, in order (for the jump server's checks)
+#       --check-approval  with --run-id: exit 0 only if the run's approval is still good
 #       --skip-backup-wait  quiesce does not wait for incoming backups to finish
 #       --expect-compute    this run upgrades the compute nodes (the jump server passes
 #                       it), so one off target fails the version table; without it,
@@ -72,7 +73,7 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.7.5"
+VERSION="0.7.6"
 
 ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells switches admin_switches postcheck resume report verify)
 
@@ -87,6 +88,8 @@ DETACH=0
 APPROVE_MODE=0
 BG_CHILD=0                      # set internally on the detached process
 STATUS_MODE=0
+APPROVAL_CHECK_MODE=0
+PHASE_SKIPPED=0                 # set by a phase that did nothing this time, so it isn't recorded as done
 RUN_NEW=0                       # 1 = this invocation created the run's folder
 EXPECT_COMPUTE=0
 REPORT_MODE=0
@@ -257,6 +260,16 @@ confirm() {
     [[ "$reply" == "YES" ]] || die "Aborted by operator."
 }
 
+# Is this pid alive and one of ours? After a reboot, a saved pid may belong to something
+# else. Where its command line can't be read, being alive has to do.
+pid_is_ours() {
+    local pid="$1" cmd
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || return 1
+    cmd="$(tr '\0' ' ' 2>/dev/null < "/proc/${pid}/cmdline" || true)"
+    [[ -z "$cmd" ]] && return 0
+    [[ "$cmd" == *"$SCRIPT_NAME"* || "$cmd" == *patchmgr* || "$cmd" == *racli* || "$cmd" == *precheck* ]]
+}
+
 # One-line state of the run in <run dir>/status, read by --status.
 set_status() {
     [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]] || return 0
@@ -307,7 +320,7 @@ acquire_lock() {
         owner="$(cat "$LOCK_FILE" 2>/dev/null || true)"
         if [[ -n "${ZDLRA_LOCK_FROM:-}" && ( "$owner" == "$ZDLRA_LOCK_FROM" || "$owner" == "$$" ) ]]; then
             info "Taking over the lock from pid $owner."
-        elif [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
+        elif pid_is_ours "$owner"; then
             die "Lock file $LOCK_FILE is held by running pid $owner. Is another run active?"
         else
             warn "Removing stale lock file $LOCK_FILE (pid ${owner:-?} is not running)."
@@ -324,6 +337,11 @@ phase_done() { [[ -f "${RUN_DIR}/phases_done" ]] && grep -qxF "$1" "${RUN_DIR}/p
 phase_mark_done() {
     (( DRY_RUN )) && return 0
     phase_done "$1" || echo "$1" >> "${RUN_DIR}/phases_done"
+}
+# A phase that ran but did nothing, this time: not done, so --continue looks at it again.
+phase_mark_skipped() {
+    (( DRY_RUN )) && return 0
+    grep -qxsF "$1" "${RUN_DIR}/phases_skipped" || echo "$1" >> "${RUN_DIR}/phases_skipped"
 }
 phase_undone() {
     phase_done "$1" || return 0
@@ -358,6 +376,7 @@ parse_args() {
             --continue)      CONTINUE=1; shift ;;
             -s|--status)     STATUS_MODE=1; shift ;;
             --report)        STATUS_MODE=1; REPORT_MODE=1; shift ;;
+            --check-approval) STATUS_MODE=1; APPROVAL_CHECK_MODE=1; shift ;;
             --list-phases)   printf '%s\n' "${ALL_PHASES[@]}"; exit 0 ;;
             --bg-child)      BG_CHILD=1; ASSUME_YES=1; shift ;;
             -h|--help)       usage; exit 0 ;;
@@ -437,7 +456,7 @@ effective_status() {
     [[ "$status" == *running* ]] || { echo "$status"; return 0; }
     for f in owner.pid detached.pid; do
         pid="$(cat "${dir}/${f}" 2>/dev/null || true)"
-        [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && { echo "$status"; return 0; }
+        pid_is_ours "$pid" && { echo "$status"; return 0; }
     done
     # Read it again: the run writes its last status before it exits, so it may have
     # finished just now. With the process gone, this reading is final.
@@ -455,7 +474,7 @@ show_status() {
     if [[ -n "$RUN_ID" ]]; then
         dir="${WORK_DIR}/${RUN_ID}"
     else
-        dir="$(ls -1d "${WORK_DIR}"/*/ 2>/dev/null | sort | tail -1)"
+        dir="$(ls -1d "${WORK_DIR}"/*/ 2>/dev/null | sort | tail -1 || true)"
         dir="${dir%/}"
     fi
     [[ -n "$dir" && -d "$dir" ]] || die "No runs found in $WORK_DIR"
@@ -468,6 +487,7 @@ show_status() {
     echo "Folder:  $dir"
     echo "Status:  $(effective_status "$dir")"
     [[ -s "${dir}/phases_done" ]] && echo "Done:    $(paste -sd' ' "${dir}/phases_done")"
+    [[ -s "${dir}/phases_skipped" ]] && echo "Skipped: $(paste -sd' ' "${dir}/phases_skipped")"
     if [[ -f "${dir}/background.pid" ]]; then
         local pid
         pid="$(cat "${dir}/background.pid")"
@@ -869,13 +889,22 @@ phase_precheck() {
 
     # The precheck rolls back the RPM ra_preinstall installs, so preinstall must run
     # again, unless the upgrade has already finished (ra_update done).
-    phase_done ra_update || phase_undone ra_preinstall
-    run_external_precheck before
+    # A pre-install result left by an earlier attempt no longer counts either.
+    if ! phase_done ra_update; then
+        phase_undone ra_preinstall
+        collect_result "${RUN_DIR}/ra_preinstall.log"
+    fi
 
+    # What takes seconds to find comes first: the precheck can take an hour.
     local free_gb
     free_gb=$(df -BG --output=avail "$WORK_DIR" | tail -1 | tr -dc '0-9')
     info "Free space for $WORK_DIR: ${free_gb}G (need ${MIN_FREE_GB}G)"
     (( free_gb >= MIN_FREE_GB )) || die "Not enough free space."
+    if sql_ready; then
+        sql_count "select count(*) from dual;" >/dev/null || die "Cannot run SQL as raAutomation (RA_SQL_CONNECT); see above."
+    fi
+
+    run_external_precheck before
 
     # Read-only look at what quiesce will deal with, so it is part of the review.
     report_activity
@@ -942,12 +971,18 @@ phase_resume() {
         return 0
     fi
     [[ -n "$REPLICATION_RESUME_SQL" ]] || die "REPLICATION_RESUME_SQL is not set; resume these by hand: $(tr '\n' ' ' < "$paused")"
-    while IFS= read -r server; do
+    # Each one comes off the list as it resumes, so another attempt only retries the rest.
+    local servers=()
+    mapfile -t servers < "$paused"
+    for server in "${servers[@]}"; do
         [[ -n "$server" ]] || continue
         sql_exec "${REPLICATION_RESUME_SQL//\{server\}/$server}" || die "Could not resume replication server $server."
         info "Resumed replication server $server"
-    done < "$paused"
-    (( DRY_RUN )) || mv "$paused" "${paused%.txt}_resumed_$(date +%Y%m%d_%H%M%S).txt"
+        if (( ! DRY_RUN )); then
+            echo "$server" >> "${paused%.txt}_resumed.txt"
+            { grep -vxF "$server" "$paused" || true; } > "${paused}.tmp" && mv -f "${paused}.tmp" "$paused"
+        fi
+    done
 }
 
 phase_snapshot() {
@@ -1020,8 +1055,14 @@ run_racli_step() {
     local name="$1" warn_min="$2" success="$3"; shift 3
     local log="${RUN_DIR}/ra_${name}.log"
     run_detached "racli $name" "$RUN_DIR" "$log" "$warn_min" "$RACLI" "$@"
-    (( DETACHED_RC == 0 )) || die "racli $name exited with code $DETACHED_RC. Log: $log"
-    grep -qF "$success" "$log" || die "racli $name did not report '$success'. Log: $log"
+    if (( DETACHED_RC != 0 )); then
+        collect_result "$log"
+        die "racli $name exited with code $DETACHED_RC. Log: $log"
+    fi
+    if ! grep -qF "$success" "$log"; then
+        collect_result "$log"
+        die "racli $name did not report '$success'. Log: $log"
+    fi
     info "racli $name: completed ('$success')."
 }
 
@@ -1036,7 +1077,7 @@ phase_ra_preinstall() {
         info "[dry-run] $RACLI ${args[*]}  (success: '$RA_PREINSTALL_SUCCESS', no lines matching '$RA_PREINSTALL_FAIL_RE')"
         return 0
     fi
-    [[ -f "$rel" ]] || die "ZDLRA software zip not found: $rel"
+    pending_result "${RUN_DIR}/ra_preinstall.log" || [[ -f "$rel" ]] || die "ZDLRA software zip not found: $rel"
     # With a result left by an earlier attempt, nothing runs: keep that attempt's marker.
     local marker="${RUN_DIR}/.ra_preinstall.start"
     if ! pending_result "${RUN_DIR}/ra_preinstall.log"; then
@@ -1048,11 +1089,12 @@ phase_ra_preinstall() {
     failed="$(grep -E "$RA_PREINSTALL_FAIL_RE" "$log" | head -20 || true)"
     if [[ -n "$failed" ]]; then
         while IFS= read -r line; do err "  $line"; done <<<"$failed"
+        collect_result "$log"
         die "racli preinstall reported failed checks. Log: $log"
     fi
-    if [[ -n "$RA_PREINSTALL_DONE_FILE" ]]; then
-        [[ "$RA_PREINSTALL_DONE_FILE" -nt "$marker" ]] \
-            || die "racli preinstall did not write $RA_PREINSTALL_DONE_FILE. Log: $log"
+    if [[ -n "$RA_PREINSTALL_DONE_FILE" && ! "$RA_PREINSTALL_DONE_FILE" -nt "$marker" ]]; then
+        collect_result "$log"
+        die "racli preinstall did not write $RA_PREINSTALL_DONE_FILE. Log: $log"
     fi
     info "Pre-install passed all checks."
 }
@@ -1067,9 +1109,12 @@ phase_ra_alter() {
         info "[dry-run] $RACLI ${args[*]}  (success: '$RA_ALTER_SUCCESS')"
         return 0
     fi
-    [[ -n "$(ra_gold_image_names)" ]] || die "The staged record names no gold images (ra_gold_images). Stage again with the current staging script."
-    [[ -z "$missing" ]] || die "Gold images not in ${RA_GOLD_IMAGES_PATH}: $missing. The precheck moves them there; check its output."
-    pending_result "${RUN_DIR}/ra_alter.log" || confirm "Run '$RACLI ${args[*]}'?"
+    # With a result left by an earlier attempt, nothing runs, so its files don't matter.
+    if ! pending_result "${RUN_DIR}/ra_alter.log"; then
+        [[ -n "$(ra_gold_image_names)" ]] || die "The staged record names no gold images (ra_gold_images). Stage again with the current staging script."
+        [[ -z "$missing" ]] || die "Gold images not in ${RA_GOLD_IMAGES_PATH}: $missing. The precheck moves them there; check its output."
+        confirm "Run '$RACLI ${args[*]}'?"
+    fi
     run_racli_step alter "$RA_ALTER_WARN_MINUTES" "$RA_ALTER_SUCCESS" "${args[@]}"
 }
 
@@ -1161,13 +1206,15 @@ detached_running() {
     f="$(detached_pidfile)"
     [[ -f "$f" ]] || return 1
     pid="$(cat "$f")"
-    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && { echo "pid $pid"; return 0; }
+    pid_is_ours "$pid" && { echo "pid $pid"; return 0; }
     return 1
 }
 
 # Called when this script stops (exit trap, or INT/TERM/HUP) while the command runs:
 # leave it alone, say so in the status, and hand it the lock.
 detached_leave_running() {
+    # A signal just as it started: its own record of its pid may be all there is.
+    [[ -z "$DETACHED_WHAT" || -n "$DETACHED_PID" ]] || DETACHED_PID="$(cat "$(detached_pidfile)" 2>/dev/null || true)"
     [[ -n "$DETACHED_PID" ]] && kill -0 "$DETACHED_PID" 2>/dev/null || return 1
     err "Stopping the script, NOT ${DETACHED_WHAT}: it keeps running (pid $DETACHED_PID). Log: $DETACHED_LOG"
     err "Do not start it again until it has finished."
@@ -1183,14 +1230,19 @@ detached_on_signal() {
     exit 1
 }
 
-# Did an earlier attempt leave this command's result, not yet picked up? That happens
-# when this script stopped while the command ran on to the end.
+# Did an earlier attempt leave this command's result, not yet acted on? That happens when
+# this script stopped while the command ran on to the end, or just after it finished.
 pending_result() { [[ -s "${1}.rc" ]]; }
+
+# Mark a command's result as acted on: next time, the command runs again. The caller does
+# this only once the result is safely recorded (step_mark_done, phase_mark_done) or has
+# failed, so a stop at any moment before that can't lose it.
+collect_result() { [[ ! -f "${1}.rc" ]] || mv -f -- "${1}.rc" "${1}.rc.collected"; }
 
 # run_detached WHAT DIR LOG WARN_MINUTES COMMAND [ARGS...]
 # Runs COMMAND in DIR, detached as above; sets DETACHED_RC to its exit status. If an
 # earlier attempt left a result (pending_result), that is used and the command is NOT
-# run again. Each result is picked up once: a failed step does run again next time.
+# run again. The caller collects the result (collect_result).
 run_detached() {
     local what="$1" dir="$2" log="$3" warn_min="$4"; shift 4
     local rcfile="${log}.rc" pidfile running
@@ -1201,11 +1253,13 @@ run_detached() {
     fi
     if (( ! DETACHED_FRESH )) && pending_result "$log"; then
         DETACHED_RC="$(tr -dc '0-9' < "$rcfile")"
-        mv -f -- "$rcfile" "${rcfile}.collected"
         rm -f -- "$pidfile" "${RUN_DIR}/detached.log"
         warn "$what already finished in an earlier attempt (exit $DETACHED_RC): using that result, not running it again. Log: $log"
         (( DETACHED_QUIET )) || cat "$log" >> "$LOG_FILE"
-        (( DETACHED_RC != 97 )) || die "$what: cannot enter $dir. Log: $log"
+        if (( DETACHED_RC == 97 )); then
+            collect_result "$log"
+            die "$what: cannot enter $dir. Log: $log"
+        fi
         return 0
     fi
     rm -f -- "$rcfile" "$pidfile"
@@ -1271,10 +1325,12 @@ run_detached() {
     script_signal_traps
     DETACHED_RC="$(tr -dc '0-9' < "$rcfile")"
     DETACHED_PID=""
-    mv -f -- "$rcfile" "${rcfile}.collected"
     rm -f -- "$pidfile" "${RUN_DIR}/detached.log"
     (( DETACHED_QUIET )) || cat "$log" >> "$LOG_FILE"
-    (( DETACHED_RC != 97 )) || die "$what: cannot enter $dir. Log: $log"
+    if (( DETACHED_RC == 97 )); then
+        collect_result "$log"
+        die "$what: cannot enter $dir. Log: $log"
+    fi
 }
 
 # Reads "pid args" lines (ps -eo pid=,args=); prints the first that is a patchmgr run,
@@ -1300,7 +1356,19 @@ long_command_running() {
     return 1
 }
 
-# Called before a precheck, cells, switches or RA phase is marked as running, so a refusal leaves the
+# Phases that change the appliance need an approved precheck.
+phase_needs_approval() {
+    case "$1" in ra_*|quiesce|cells|switches|admin_switches) return 0 ;; esac
+    return 1
+}
+
+# Phases that start a long command (postcheck reruns the precheck) must not start over one.
+phase_is_guarded() {
+    case "$1" in precheck|postcheck|ra_*|cells|switches|admin_switches) return 0 ;; esac
+    return 1
+}
+
+# Called before such a phase is marked as running, so a refusal leaves the
 # run's status as it is.
 refuse_if_running() {
     local running
@@ -1313,7 +1381,10 @@ refuse_if_running() {
 # The steps that must not run twice once they have worked (cells -patch, switches
 # --upgrade), one per line in <run dir>/steps_done, so --continue skips them.
 step_done() { [[ -f "${RUN_DIR}/steps_done" ]] && grep -qxF "$1" "${RUN_DIR}/steps_done"; }
-step_mark_done() { step_done "$1" || echo "$1" >> "${RUN_DIR}/steps_done"; }
+step_mark_done() {
+    step_done "$1" || echo "$1" >> "${RUN_DIR}/steps_done"
+    collect_result "${RUN_DIR}/$1.log"
+}
 
 # Run one patchmgr command from the patch folder, never cut short (run_detached).
 # Success: exit 0, "SUCCESS: Completed run of command", "Exit status:0", and no
@@ -1337,16 +1408,21 @@ patchmgr_attempt() {
     if [[ -n "$failed" ]]; then
         while IFS= read -r line; do err "  $line"; done <<<"$failed"
         PATCHMGR_PROBLEM="patchmgr $step reported failures. Log: $log"
+        collect_result "$log"
         return 1
     fi
     if (( rc != 0 )); then
         PATCHMGR_PROBLEM="patchmgr $step exited with code $rc. Log: $log"
+        collect_result "$log"
         return 1
     fi
     if ! { grep -q 'SUCCESS: Completed run of command' "$log" && grep -q 'Exit status:0' "$log"; }; then
         PATCHMGR_PROBLEM="patchmgr $step did not report a completed run (no 'SUCCESS: Completed run of command' / 'Exit status:0'). Log: $log"
+        collect_result "$log"
         return 1
     fi
+    # The steps recorded in steps_done keep their result until step_mark_done has run.
+    [[ "$name" == patch || "$name" == upgrade ]] || collect_result "$log"
     info "patchmgr $step: completed."
 }
 
@@ -1575,6 +1651,7 @@ phase_admin_switches() {
     fi
     if (( ! ADMIN_SWITCH_ENABLED )); then
         warn "ADMIN_SWITCH_ENABLED=0: the admin switch commands are still placeholders. Admin switches NOT patched."
+        PHASE_SKIPPED=1
         return 0
     fi
     type="$(switch_type || true)"
@@ -1665,13 +1742,13 @@ image_rows() {
 }
 
 # Every component's version against its target, shown and saved to versions.txt.
-# A cell or switch on another version fails, and so does a compute node if this run
-# upgrades them (--expect-compute); dry run: a warning, as nothing has been patched.
-# The RA line is a warning only, like after ra_update.
+# A component this run patched and that is on another version fails: cells, switches and
+# admin switches once their phase is done, compute nodes with --expect-compute. Anything
+# else is marked CHECK, as is the RA line, like after ra_update. Dry run: a warning.
 version_summary() {
     info "Versions after patching:"
     VERSION_ROWS=(); VERSION_BAD=0; VERSION_SOFT=0; VERSION_UNREAD=0
-    local target text line names=() sw
+    local target text line names=() sw mode
 
     target="$(conf_value TARGET_RA_VERSION || true)"
     text="$("$RACLI" version 2>&1 || true)"
@@ -1684,18 +1761,21 @@ version_summary() {
     IFS=',' read -r -a names <<<"$(staged_value component_COMPUTE_NODE | tr -d ' ')"
     if (( ${#names[@]} )); then
         text="$("$DCLI" -l root -c "$(IFS=,; echo "${names[*]}")" 'imageinfo -ver' 2>&1 || true)"
-        local mode=soft
+        mode=soft
         [[ ! -f "${RUN_DIR}/expect_compute" ]] || mode=""
         image_rows compute "$target" "$text" "$mode" "${names[@]}"
     else
         version_row compute "-" "" "$target" 0
     fi
 
+    # Only what this run patched has to be on target; anything else is marked CHECK.
     target="$(conf_value TARGET_CELL_VERSION || true)"
+    mode=soft
+    ! phase_done cells || mode=""
     mapfile -t names < <(sed '/^[[:space:]]*$/d' "$CELL_GROUP_FILE" 2>/dev/null)
     if (( ${#names[@]} )); then
         text="$(cell_versions || true)"
-        image_rows cell "$target" "$text" "" "${names[@]}"
+        image_rows cell "$target" "$text" "$mode" "${names[@]}"
     else
         version_row cell "-" "" "$target" 0
     fi
@@ -1706,10 +1786,12 @@ version_summary() {
     if [[ "$type" == ib ]]; then
         VERSION_ROWS+=("$(printf '%-9s %-20s %-34s %-24s %s' switch "-" "(InfiniBand: not patched here)" "${target:-<not set>}" "SKIPPED")")
     elif [[ "$type" == roce && -s "$SWITCH_GROUP_FILE" ]]; then
+        mode=soft
+        ! phase_done switches || mode=""
         while IFS= read -r sw; do
             [[ -n "$sw" ]] || continue
             if text="$(switch_version "$sw")"; then
-                version_row switch "$sw" "$(switch_version_line "$text")" "$target" "$([[ -n "$target" ]] && grep -qF -- "$target" <<<"$text" && echo 1 || echo 0)"
+                version_row switch "$sw" "$(switch_version_line "$text")" "$target" "$([[ -n "$target" ]] && grep -qF -- "$target" <<<"$text" && echo 1 || echo 0)" "$mode"
             else
                 version_row switch "$sw" "" "$target" 0
             fi
@@ -1721,10 +1803,12 @@ version_summary() {
     if (( ADMIN_SWITCH_ENABLED )) && [[ "$type" != ib ]]; then
         target="$(conf_value TARGET_ADMIN_SWITCH_VERSION || true)"
         if [[ -s "$ADMIN_SWITCH_GROUP_FILE" ]]; then
+            mode=soft
+            ! phase_done admin_switches || mode=""
             while IFS= read -r sw; do
                 [[ -n "$sw" ]] || continue
                 if text="$(switch_version "$sw")"; then
-                    version_row adminsw "$sw" "$(switch_version_line "$text")" "$target" "$([[ -n "$target" ]] && grep -qF -- "$target" <<<"$text" && echo 1 || echo 0)"
+                    version_row adminsw "$sw" "$(switch_version_line "$text")" "$target" "$([[ -n "$target" ]] && grep -qF -- "$target" <<<"$text" && echo 1 || echo 0)" "$mode"
                 else
                     version_row adminsw "$sw" "" "$target" 0
                 fi
@@ -1741,7 +1825,7 @@ version_summary() {
     while IFS= read -r line; do info "  $line"; done < "${RUN_DIR}/versions.txt"
 
     (( VERSION_UNREAD == 0 )) || warn "$VERSION_UNREAD version(s) could not be read or have no target; check them by hand."
-    (( VERSION_SOFT == 0 )) || warn "$VERSION_SOFT component(s) marked CHECK are off target or unconfirmed: racli version not showing TARGET_RA_VERSION, or compute nodes in a run that does not upgrade them (the jump server does that)."
+    (( VERSION_SOFT == 0 )) || warn "$VERSION_SOFT component(s) marked CHECK are off target or unconfirmed: racli version not showing TARGET_RA_VERSION, or components this run didn't patch."
     if (( VERSION_BAD )); then
         if (( DRY_RUN )); then
             warn "[dry-run] $VERSION_BAD component(s) not on target yet (nothing was patched)."
@@ -1842,6 +1926,7 @@ phase_report() {
         echo "ZDLRA patch run $RUN_ID"
         echo "Host:      $(hostname)"
         echo "Done:      $(paste -sd' ' "${RUN_DIR}/phases_done" 2>/dev/null || true)"
+        [[ ! -s "${RUN_DIR}/phases_skipped" ]] || echo "SKIPPED:   $(paste -sd' ' "${RUN_DIR}/phases_skipped") (nothing was done in these)"
         echo "Staged:    $(staged_value archive) (SHA-256 $(staged_value sha256))"
         echo "Dry run:   $DRY_RUN"
         echo "Phases:    ${PHASES[*]}"
@@ -1889,6 +1974,12 @@ start_background() {
 main() {
     parse_args "$@"
     load_config
+    if (( APPROVAL_CHECK_MODE )); then
+        [[ -n "$RUN_ID" ]] || die "--check-approval needs --run-id ID"
+        RUN_DIR="${WORK_DIR}/${RUN_ID}"
+        require_approval
+        exit 0
+    fi
     if (( STATUS_MODE )); then
         show_status
         exit 0
@@ -1941,26 +2032,35 @@ main() {
             [[ "$p" == precheck ]] && split=1
         done
         # Without precheck in this run, check the existing approval now, not after detaching.
-        if (( ! ${#fg_phases[@]} )) && [[ " ${BG_PHASES[*]} " == *" ra_"* || " ${BG_PHASES[*]} " == *" quiesce "* || " ${BG_PHASES[*]} " == *" cells "* || " ${BG_PHASES[*]} " == *" switches "* || " ${BG_PHASES[*]} " == *" admin_switches "* ]]; then
-            require_approval
+        if (( ! ${#fg_phases[@]} )); then
+            for p in "${BG_PHASES[@]}"; do
+                if phase_needs_approval "$p"; then require_approval; break; fi
+            done
         fi
     fi
 
     for p in ${fg_phases[@]+"${fg_phases[@]}"}; do
         # Check approval before marking a changing step as running, so a refusal leaves
         # the run's status as it was.
-        [[ "$p" == ra_* || "$p" == quiesce || "$p" == cells || "$p" == switches || "$p" == admin_switches ]] && require_approval
-        [[ "$p" == precheck || "$p" == ra_* || "$p" == cells || "$p" == switches || "$p" == admin_switches ]] && refuse_if_running "$p"
+        phase_needs_approval "$p" && require_approval
+        phase_is_guarded "$p" && refuse_if_running "$p"
         CURRENT_PHASE="$p"
         set_status "running $p"
+        PHASE_SKIPPED=0
         "phase_${p}"
-        phase_mark_done "$p"
+        if (( PHASE_SKIPPED )); then
+            phase_mark_skipped "$p"
+        else
+            phase_mark_done "$p"
+            # Recorded as done, so its result has been used. (Other steps collect theirs.)
+            [[ "$p" != ra_* ]] || collect_result "${RUN_DIR}/${p}.log"
+        fi
     done
 
     if (( ${#BG_PHASES[@]} )); then
         # Refuse here, while there is someone to tell, not after detaching.
         for p in "${BG_PHASES[@]}"; do
-            if [[ "$p" == precheck || "$p" == ra_* || "$p" == cells || "$p" == switches || "$p" == admin_switches ]]; then
+            if phase_is_guarded "$p"; then
                 refuse_if_running "$p"
                 break
             fi

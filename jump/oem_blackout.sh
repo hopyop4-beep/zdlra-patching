@@ -90,11 +90,11 @@ current_blackout() {
 }
 
 # Has this blackout ended (BLACKOUT_HOURS passed, or stopped elsewhere)? Only a clear
-# answer counts: if in doubt, it is still on. $1 = name.
+# answer from emcli counts: if it fails, or in any doubt, it is still on. $1 = name.
 blackout_over() {
     local out
-    out="$("$EMCLI" get_blackout_details -name="$1" 2>&1 || true)"
-    grep -qiE '(^|[^a-z])(ended|stopped|expired)([^a-z]|$)|not found|does not exist' <<<"$out"
+    out="$("$EMCLI" get_blackout_details -name="$1" 2>/dev/null)" || return 1
+    grep -qiE '(^|[^a-z])(ended|stopped|expired)([^a-z]|$)' <<<"$out"
 }
 
 retire_record() { mv "$(state_file)" "$(state_file).stopped_$(date +%Y%m%d_%H%M%S)"; }
@@ -114,7 +114,8 @@ do_start() {
     ensure_login
     local reasons
     reasons="$("$EMCLI" get_blackout_reasons)" || die "emcli get_blackout_reasons failed."
-    sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$reasons" | grep -Fxq -- "$BLACKOUT_REASON" \
+    reasons="$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$reasons")"
+    grep -Fxq -- "$BLACKOUT_REASON" <<<"$reasons" \
         || die "BLACKOUT_REASON '$BLACKOUT_REASON' is not a known reason. See: emcli get_blackout_reasons"
 
     local f

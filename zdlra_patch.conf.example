@@ -18,7 +18,7 @@ REQUIRED_USER="root"
 #   ***********************************
 #   <date> [FAIL] <failure name>
 #   <date> [WARN] <warning name>
-# The phase fails on any failure that is not waived, on a timeout, or on a
+# The phase fails on any failure that is not waived, if the script is killed, or on a
 # non-zero exit code with no summary. Warnings are logged but do not stop the
 # run unless PRECHECK_FAIL_ON_WARN=1.
 # Oracle's precheck, run as ./precheck -srnumber=<SR> from its own folder.
@@ -42,7 +42,7 @@ PRECHECK_WAIVERS=(
 PRECHECK_REQUIRED=1
 
 # After the precheck, the operator must type APPROVE. --yes does not skip this.
-# quiesce, the ra_* phases, cells and switches refuse to run without an approval for the same run that is
+# quiesce, the ra_* phases, cells, switches and admin_switches refuse to run without an approval for the same run that is
 # younger than PRECHECK_APPROVAL_MAX_AGE_HOURS and matches the results reviewed.
 PRECHECK_REQUIRE_APPROVAL=1
 PRECHECK_APPROVAL_MAX_AGE_HOURS=24
@@ -85,7 +85,8 @@ CELL_PATCH_WARN_MINUTES=360          # per patchmgr command; about 2 hours for 1
 # --- RoCE switches (switches phase) -----------------------------------------
 # Runs on the first compute node, in the folder the switch patch (FILES_SWITCH)
 # unzipped to under /radump/patches/tmp (e.g. patch_switch_24.1.14.0.0.250706). Only
-# RoCE switches: if SWITCH_TYPE in the conf file is not roce, the phase warns and skips.
+# RoCE switches: SWITCH_TYPE in the conf file must be roce; IB warns and skips, and
+# anything else stops the phase.
 SWITCH_GROUP_FILE="/root/switch_group"          # the RoCE switches, one per line
 SWITCH_PATCH_TMP_DIR="/radump/patches/tmp"
 SWITCH_PATCH_FILES_DIR="/radump/patches/patches"
