@@ -432,15 +432,19 @@ init_run() {
 effective_status() {
     local dir="$1" status f pid
     status="$(cat "${dir}/status" 2>/dev/null || echo unknown)"
+    [[ "$status" == *running* ]] || { echo "$status"; return 0; }
+    for f in owner.pid detached.pid; do
+        pid="$(cat "${dir}/${f}" 2>/dev/null || true)"
+        [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && { echo "$status"; return 0; }
+    done
+    # Read it again: the run writes its last status before it exits, so it may have
+    # finished just now. With the process gone, this reading is final.
+    status="$(cat "${dir}/status" 2>/dev/null || echo unknown)"
     if [[ "$status" == *running* ]]; then
-        for f in owner.pid detached.pid; do
-            pid="$(cat "${dir}/${f}" 2>/dev/null || true)"
-            [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && { echo "$status"; return 0; }
-        done
         echo "failed: the run's process is gone (last status: $status)"
-        return 0
+    else
+        echo "$status"
     fi
-    echo "$status"
 }
 
 # --status: show the state, background process and recent log of a run.

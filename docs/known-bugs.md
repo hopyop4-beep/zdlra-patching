@@ -4,7 +4,7 @@ From a code review of all the code on `main` (commit 59ab2d5), on 2026-11-03. No
 are fixed yet. Line numbers are from that commit. Almost all of this also applies to the
 `platinum` branch, which has its own list in `docs/platinum-known-bugs.md`.
 
-**Bugs 1-33 and 43-47 are fixed (2026-11-03), tested with stand-ins only.** The rest are still open. Even a dry run executes the real precheck, which changes the system.
+**Bugs 1-33 and 43-48 are fixed (2026-11-03), tested with stand-ins only.** The rest are still open. Even a dry run executes the real precheck, which changes the system.
 
 How far each finding was checked:
 
@@ -95,6 +95,10 @@ Fixed on `main`, tested with stand-ins on a PC only.
 
 Found and fixed while testing these:
 
+48. **`--status` could report a good run as failed.** The fix for 17 read the status, then checked the
+    process, so a run finishing between the two looked gone. The jump server would stop at the end of a
+    phase with the jobs and blackout left on. It now reads the status again once the process is gone.
+    This was in `c98f5fe` and is fixed in the commit after `2f6d19e`.
 47. **`--watch` could start a second `patchmgr` on a compute node.** If the wrapper was killed while
     `patchmgr` itself ran on, it looked finished. The check and the start guard now look for
     `patchmgr -dbnodes` too. A surviving one is waited for, and a new start is refused.
