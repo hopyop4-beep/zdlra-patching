@@ -328,7 +328,8 @@ jobs_resume_text() {
 
 # What to undo by hand after a failure or interruption, once the work has started.
 print_undo() {
-    (( ! JOBS_SUSPENDED && ! BLACKOUT_ACTIVE )) || err "Only to abandon this run (then start a new one, as --continue will refuse):"
+    [[ "$WATCHING" == jobs ]] || (( ! JOBS_SUSPENDED && ! BLACKOUT_ACTIVE )) \
+        || err "Only to abandon this run (then start a new one: a pickup will refuse):"
     # The node records which replication servers this run paused; its resume phase undoes only those.
     [[ "$WATCHING" == patch || "$WATCHING" == compute ]] && err "Resume replication (if quiesce paused it): ssh ${SSH_USER}@${NODE} $(remote_cmd --run-id "$RUN_ID" resume)"
     (( JOBS_SUSPENDED )) && err "Resume OEM jobs: $(jobs_resume_text)"
@@ -355,7 +356,7 @@ state_set()  {
     mkdir -p "$STATE_DIR"
     local f k v keep=()
     f="$(state_file)"
-    for k in phases keep_blackout skip_backup_wait dry_run compute_nodes resume_problem jobs_resumed blackout_ended; do
+    for k in phases keep_blackout skip_backup_wait dry_run compute_nodes resume_problem jobs_resumed blackout_ended blackout_name; do
         [[ " $* " == *" $k="* ]] && continue
         v="$(state_get "$k")"
         [[ -n "$v" ]] && keep+=("$k=$v")
@@ -680,12 +681,15 @@ compute_pass() {
         state_set stage=compute "runner=$runner" "target=$target" step=precheck
         on "$runner" "[ -f '$C_ISO' ] && [ -x '$C_DIR/patchmgr' ]" \
             || die "$runner: the ISO repo $C_ISO or $C_DIR/patchmgr is missing on this node."
-        on "$runner" "mkdir -p '$work' && echo '$target' > '$work/db_nodes_${target}' && cd '$C_DIR' && { [ ! -f dbnodeupdate.zip ] || unzip -q -o dbnodeupdate.zip; }" \
-            || die "$runner: could not prepare $work/db_nodes_${target} or unzip dbnodeupdate.zip in $C_DIR"
+        on "$runner" "mkdir -p '$work' && echo '$target' > '$work/db_nodes_${target}'" \
+            || die "$runner: could not write $work/db_nodes_${target}"
         if [[ "$(node_version "$runner" "$target")" == "$C_TARGET" ]]; then
             info "$target is already on $C_TARGET: not running patchmgr."
             from=verify
         else
+            # Unzipping over a running patchmgr would change its files underneath it.
+            on "$runner" "if ps -eo args= 2>/dev/null | grep -Eq '[p]atchmgr .*(-dbnodes|-cells|--roceswitches)'; then exit 3; fi; cd '$C_DIR' && { [ ! -f dbnodeupdate.zip ] || unzip -q -o dbnodeupdate.zip; }" \
+                || die "$runner: a patchmgr is running there, or dbnodeupdate.zip could not be unzipped in $C_DIR"
             out="$(start_remote_patchmgr "$runner" "precheck_${target}" "${common[@]}" -precheck -nomodify_at_prereq)" || die "$runner: $out"
             info "$runner: patchmgr -precheck ${out#STARTED }"
         fi
@@ -884,22 +888,30 @@ on_interrupt() {
 }
 
 # Where the node stands with the phases in $1. The one place this is decided. Sets NODE_STATE:
-#   finished    every phase is done (whatever the status says)
-#   running     something is running there
+#   running     something is running there, so nothing else may start
+#   finished    nothing is running and every phase is done, whatever the status says
 #   failed      the status says failed, and phases are left
 #   unfinished  nothing is running, no failure, and phases are left
-# and NODE_STATUS and NODE_LEFT. Returns 1 if the node doesn't answer. phases_done is what
+# and NODE_STATUS and NODE_LEFT. Returns 1 if the node doesn't answer, 2 if the run isn't
+# there. phases_done is what
 # counts, not the status: any by-hand command that works writes "completed". A dry run
 # records nothing, so there the status has to do.
 NODE_STATE=""
 NODE_STATUS=""
 NODE_LEFT=""
 node_state() {
-    local out finished p
-    out="$(on_node "$REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID" 2>/dev/null)" || return 1
+    local out finished p rc=0
+    out="$(on_node "$REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID" 2>/dev/null)" || rc=$?
+    # The script itself said no: the run isn't there. (ssh's own failures are 255.)
+    (( rc != 1 )) || return 2
+    (( rc == 0 )) || return 1
     NODE_STATUS="$(status_field Status <<<"$out")"
     [[ -n "$NODE_STATUS" ]] || return 1
     NODE_LEFT=""
+    if [[ -z "$(xargs <<<"$1")" ]]; then
+        NODE_STATE=finished
+        return 0
+    fi
     if (( DRY_RUN )); then
         case "$NODE_STATUS" in
             *failed*)    NODE_STATE=failed ;;
@@ -913,9 +925,9 @@ node_state() {
     for p in $1; do
         [[ "$finished" == *" $p "* ]] || NODE_LEFT+="$p "
     done
-    if [[ -z "$NODE_LEFT" ]]; then NODE_STATE=finished
+    if [[ "$NODE_STATUS" != *failed* && "$NODE_STATUS" == *running* ]]; then NODE_STATE=running
+    elif [[ -z "$NODE_LEFT" ]]; then NODE_STATE=finished
     elif [[ "$NODE_STATUS" == *failed* ]]; then NODE_STATE=failed
-    elif [[ "$NODE_STATUS" == *running* ]]; then NODE_STATE=running
     else NODE_STATE=unfinished
     fi
 }
@@ -931,7 +943,14 @@ watch_until_done() {
     local status last="" misses=0
     while :; do
         if [[ "$WATCHING" != precheck ]]; then
-            if node_state "$WATCH_PHASES"; then
+            local rc=0
+            node_state "$WATCH_PHASES" || rc=$?
+            if (( rc == 2 )); then
+                err "There's no run $RUN_ID on $NODE."
+                echo "no such run"
+                return 1
+            fi
+            if (( rc == 0 )); then
                 misses=0
                 if [[ "$NODE_STATUS" != "$last" ]]; then
                     info "$NODE: $NODE_STATUS"
@@ -989,7 +1008,10 @@ step_approve() {
 step_blackout_start() {
     info "== blackout =="
     blackout start || die "Blackout was not created; patching not started. Continue later: $0 -z $ZDLRA --resume $RUN_ID$(xflag)"
-    (( DRY_RUN )) || BLACKOUT_ACTIVE=1
+    if (( ! DRY_RUN )); then
+        BLACKOUT_ACTIVE=1
+        state_put "blackout_name=$(cat "${STATE_DIR}/${ZDLRA}.blackout" 2>/dev/null || true)"
+    fi
 }
 
 step_jobs_suspend() {
@@ -1043,6 +1065,8 @@ stage_phases() {
 step_pickup_unstarted() {
     local stage="$1"
     node_state "$(stage_phases "$stage")" || die "Could not read run $RUN_ID from $NODE, so cannot tell if the $stage phases started. Try again."
+    # A dry run has no phases_done: the 'completed' it sees is the stage before's.
+    (( ! DRY_RUN )) || [[ "$NODE_STATE" != finished ]] || NODE_STATE=unfinished
     case "$NODE_STATE" in
         unfinished)
             info "The $stage phases never started (status: $NODE_STATUS). Starting them now."
@@ -1120,6 +1144,7 @@ main() {
             [[ "$(state_get blackout_ended)" == 1 ]] || BLACKOUT_ACTIVE=1
             (( ${#OEM_JOBS_SUSPEND_CMD[@]} == 0 )) || [[ "$(state_get jobs_resumed)" == 1 ]] || JOBS_SUSPENDED=1
         fi
+        refuse_if_abandoned "$stage"
         [[ "$(state_get started)" != 0 ]] || step_pickup_unstarted "$stage"
         [[ -z "$CONTINUE_RUN_ID" ]] || step_continue "$stage"
     else
@@ -1211,7 +1236,12 @@ main() {
             exit 1
         }
     fi
-    state_set stage=done
+    # A job resume that failed outright can still be retried by picking the run up.
+    if (( ! DRY_RUN )) && [[ -n "$JOBS_RESUME_PROBLEM" && "$(state_get jobs_resumed)" != 1 ]]; then
+        err "To try the job resume again: $0 -z $ZDLRA --continue $RUN_ID$(xflag)"
+    else
+        state_set stage=done
+    fi
     step_show_report
     info "Done. Report on $NODE: $REMOTE_SCRIPT -c $REMOTE_CONFIG --report --run-id $RUN_ID"
     report_resume_problem
@@ -1224,6 +1254,27 @@ step_show_report() {
         || { warn "Could not read the report from $NODE."; return 0; }
     info "== report (run $RUN_ID on $NODE) =="
     printf '%s\n' "$report"
+}
+
+# A pickup must not carry on patching after someone undid things by hand: the printed undo
+# commands are for abandoning a run. $1 = stage
+refuse_if_abandoned() {
+    (( ! DRY_RUN )) || return 0
+    local stage="$1" record="${STATE_DIR}/${ZDLRA}.blackout" name out
+    [[ "$stage" != verify && "$(state_get blackout_ended)" != 1 ]] || return 0
+    [[ -f "$record" ]] \
+        || die "No blackout is recorded for $ZDLRA, so run $RUN_ID looks abandoned. Not continuing it: start a new run."
+    name="$(state_get blackout_name)"
+    [[ -z "$name" || "$(cat "$record")" == "$name" ]] \
+        || die "The blackout recorded for $ZDLRA is $(cat "$record"), not this run's ($name). Not continuing run $RUN_ID: it would end that one."
+    # Replication running again matters until the patching is over. A run with no compute has
+    # resume in its 'before' stage, so there it's just that stage's own work.
+    if [[ "$stage" == compute || ( "$stage" == before && " $(stage_phases before) " != *" resume "* ) ]]; then
+        out="$(on_node "$REMOTE_SCRIPT -c $REMOTE_CONFIG --status --run-id $RUN_ID" 2>/dev/null || true)"
+        if [[ -n "$(status_field Resumed <<<"$out")" ]]; then
+            die "Run $RUN_ID's resume has already run, so replication isn't paused, and patching is not finished. Not continuing it: start a new run."
+        fi
+    fi
 }
 
 patch_failed() {
@@ -1239,11 +1290,6 @@ patch_failed() {
 # watched. Compute passes pick up by themselves (a failed patchmgr step is started again).
 step_continue() {
     local stage="$1"
-    # A pickup must not carry on patching after the blackout was ended by hand: that means
-    # the run was abandoned, and the jobs were probably resumed too.
-    if (( ! DRY_RUN )) && [[ "$stage" != verify && "$(state_get blackout_ended)" != 1 && ! -f "${STATE_DIR}/${ZDLRA}.blackout" ]]; then
-        die "No blackout is recorded for $ZDLRA, so run $RUN_ID looks abandoned. Not continuing it: start a new run."
-    fi
     if [[ "$stage" == compute ]]; then
         info "Continuing the compute passes."
         return 0

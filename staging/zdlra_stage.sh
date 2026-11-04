@@ -1176,7 +1176,8 @@ sr_number=$SR_NUMBER_VALUE"
             info "[dry-run] ${node}: would write ${STAGE_DIR}/${STAGED_RECORD_NAME}"
             continue
         fi
-        on_node_stdin "$node" "cat > '${STAGE_DIR}/${STAGED_RECORD_NAME}'" <<<"$content" \
+        # Whole or not at all: a partly written record must not make a folder look finished.
+        on_node_stdin "$node" "cat > '${STAGE_DIR}/${STAGED_RECORD_NAME}.tmp' && mv -f '${STAGE_DIR}/${STAGED_RECORD_NAME}.tmp' '${STAGE_DIR}/${STAGED_RECORD_NAME}'" <<<"$content" \
             || die "${z}/${node}: cannot write ${STAGE_DIR}/${STAGED_RECORD_NAME}"
         on_node "$node" "rm -f -- '${STAGE_DIR}.unpacking'" || warn "${z}/${node}: could not remove ${STAGE_DIR}.unpacking"
         info "${z}/${node}: wrote ${STAGE_DIR}/${STAGED_RECORD_NAME}"

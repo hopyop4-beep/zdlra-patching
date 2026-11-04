@@ -191,6 +191,8 @@ Picking up a run uses how it was started: its phase list, `--keep-blackout` and 
 
 What decides that a stage has finished is the node's `phases_done`, not its status word, because any command run by hand that works writes `completed`. So if nothing is running on the node and a stage's phases aren't all finished, `--watch` reports that and stops, and `--continue` starts them. A phase that was skipped, such as `admin_switches` with `ADMIN_SWITCH_ENABLED=0`, is listed as `Skipped` in `--status` and the report, not as done. If it wouldn't be skipped any more, for example once enabled, `--continue` runs it.
 
+A pickup, by `--watch` or `--continue`, refuses a run that looks abandoned: no blackout recorded (or another run's), or replication resumed while patching is unfinished. Start a new run instead. If a cell or switch version can't be read and an earlier attempt left a log, patching stops rather than risk patching twice, until they can all be read. If resuming the OEM jobs fails outright, the run stays open and `--continue` tries again.
+
 **Don't mix undoing and continuing.** After a failure, the script prints both `--continue` and the commands to put things back. Those are for abandoning the run, so use one or the other. Once the blackout is ended, `--continue` refuses; and once `resume` has run, the patch phases refuse.
 
 On the node itself, the same split is available as `zdlra_patch.sh --detach precheck`, followed by `zdlra_patch.sh --approve --run-id <run id>`.

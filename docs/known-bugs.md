@@ -276,6 +276,13 @@ Found by a third review of commit b67e044. Not reproduced by running the scripts
 99. **On an IB rack, `switches` and `admin_switches` show as done** (`zdlra_patch.sh:1588`).
 100. **Stale docs:** the advice for an expired approval leaves out `--execute` (`README.md:122`), and lines 65 and 336.
 
+A final check of these fixes found more, also fixed: a failed pause was never retried; the abandoned-run refusal
+missed `--watch` and compute; a version that couldn't be read still led to a repeat patch; the resume guard missed a
+partial resume and blocked skipped phases; a switch version could match by substring (10.2 in 10.25); a stage could
+count as finished while its process ran on; a failed job resume couldn't be retried; `--watch` on a missing run
+polled forever; leftover switch precheck results were reused; `dbnodeupdate.zip` was unzipped before the version and
+running-patchmgr checks; and a partly written staged record looked finished.
+
 ### Open, lower risk
 
 101. **A blackout created just as Ctrl-C lands isn't tracked** (`jump/zdlra_patch_run.sh:925`).
@@ -291,3 +298,9 @@ Found by a third review of commit b67e044. Not reproduced by running the scripts
      IPv6 hosts (`:303`) and UNC paths (`:265`).
 110. **Cleanup:** `running.pid` is never read (`jump/zdlra_patch_run.sh:511`), `check_compute_version` repeats `node_version`
      (`:622`), and an unreachable branch in `step_continue` (`:1172`).
+111. **Compute readiness and pre-checks ssh directly from the jump server to every compute node** (`jump/zdlra_patch_run.sh`).
+     Check it can reach them all, not just the first two.
+112. **A blackout that has expired still counts as recorded,** so `--continue` carries on with no blackout. It ends after
+     `BLACKOUT_HOURS`; check it covers the window.
+113. **A dry-run free-space check can be too strict** with `OLD_VERSION_ACTION=overwrite`, or with the archive and unpack
+     folders on different filesystems (`staging/zdlra_stage.sh`). It only refuses, safely.

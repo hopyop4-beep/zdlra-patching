@@ -27,6 +27,9 @@ step 5.
 - [ ] **`NODE_READY_CMD`:** after each compute pass, this must succeed on the node that rebooted before the next pass
       starts. The default looks for an `ora_pmon_` process. Check that's right for "the database is back up", and that
       `NODE_READY_MINUTES` (30) is long enough.
+- [ ] **ssh from the jump server to every compute node:** the readiness check and the pre-window check use it. Check
+      all of them, not just the first two.
+- [ ] **`BLACKOUT_HOURS`:** long enough for the whole window. An expired blackout isn't detected.
 - [ ] **`emcli` login:** the session is refreshed before suspending and resuming the jobs. If `EM_USER`
       asks for a password, the script waits at that prompt. Check how the login works on the OMS, as
       it could be hours into the window by then.
