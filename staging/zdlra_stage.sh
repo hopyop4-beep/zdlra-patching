@@ -770,8 +770,18 @@ step_check() {
         fi
         free_kb="$(free_kb_on "$node" "$EXTRACT_ROOT")"
         [[ "$free_kb" =~ ^[0-9]+$ ]] || die "${z}/${node}: cannot read free space for $EXTRACT_ROOT"
-        info "${z}/${node}: $(( free_kb / 1024 / 1024 ))G free for $EXTRACT_ROOT (need $(( need_kb / 1024 / 1024 ))G)"
-        (( free_kb >= need_kb )) || die "${z}/${node}: not enough free space in $EXTRACT_ROOT"
+        # The folder the extract step will delete first doesn't count against this.
+        local reclaim_kb
+        reclaim_kb="$(on_node "$node" "if [ -d '$STAGE_DIR' ] && { [ '$OLD_VERSION_ACTION' = overwrite ] || { [ -e '${STAGE_DIR}.unpacking' ] && [ ! -e '${STAGE_DIR}/${STAGED_RECORD_NAME}' ]; }; }; then du -sk '$STAGE_DIR' | cut -f1; else echo 0; fi" 2>/dev/null || echo 0)"
+        [[ "$reclaim_kb" =~ ^[0-9]+$ ]] || reclaim_kb=0
+        free_kb=$(( free_kb + reclaim_kb ))
+        # In a dry run the archive isn't there yet: the real run needs room for it too.
+        local this_need_kb=$need_kb
+        if (( DRY_RUN )) && [[ "$sha" != "$EXPECTED_SHA" ]]; then
+            this_need_kb=$(( need_kb + $(du -k "$ARCHIVE" | cut -f1) ))
+        fi
+        info "${z}/${node}: $(( free_kb / 1024 / 1024 ))G free for $EXTRACT_ROOT (need $(( this_need_kb / 1024 / 1024 ))G)"
+        (( free_kb >= this_need_kb )) || die "${z}/${node}: not enough free space in $EXTRACT_ROOT"
         TODO_NODES+=("$node")
     done
 }
@@ -784,9 +794,9 @@ step_extract() {
     esac
     for node in ${TODO_NODES[@]+"${TODO_NODES[@]}"}; do
         # An older unzipped folder from an earlier staging is set aside. A half-finished one
-        # (its marker is still there; the record step removes it) isn't worth keeping.
+        # isn't worth keeping: its marker is there and its record, written last, isn't.
         local there
-        there="$(on_node "$node" "if [ -e '${STAGE_DIR}.unpacking' ]; then echo half; elif [ -e '$STAGE_DIR' ]; then echo yes; else echo no; fi")" \
+        there="$(on_node "$node" "if [ -e '${STAGE_DIR}.unpacking' ] && [ ! -e '${STAGE_DIR}/${STAGED_RECORD_NAME}' ]; then echo half; elif [ -e '$STAGE_DIR' ]; then echo yes; else echo no; fi")" \
             || die "${z}/${node}: not answering; can't tell what's in $STAGE_DIR."
         case "$there" in
             half)

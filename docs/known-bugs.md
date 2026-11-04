@@ -5,7 +5,7 @@ second on 2026-11-04 (commit 20097c2). Line numbers are from those commits, so t
 shifted. The `platinum` branch has none of these fixes, and its own list in
 `docs/platinum-known-bugs.md` on that branch.
 
-**Bugs 1-36 and 38-83 are fixed (2026-11-04), tested with stand-ins only.** Only item 37 is open. Even a dry run executes the real precheck, which changes the system.
+**Bugs 1-36 and 38-100 are fixed (2026-11-04), tested with stand-ins only. Items 101-110 are open, and lower risk.** Item 37 is also open. Even a dry run executes the real precheck, which changes the system.
 
 How far each finding was checked:
 
@@ -253,7 +253,7 @@ commands are in. The compute log polling still uses two ssh sessions per check.
 
 Found by a third review of commit b67e044. Not reproduced by running the scripts when found.
 
-### Being fixed
+### Fixed (2026-11-04), tested with stand-ins only
 
 84. **The next compute pass doesn't wait for the node that just rebooted** (`jump/zdlra_patch_run.sh:719`), so both
     instances can be down at once.

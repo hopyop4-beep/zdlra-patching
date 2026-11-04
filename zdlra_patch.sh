@@ -73,7 +73,7 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.7.6"
+VERSION="0.7.7"
 
 ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells switches admin_switches postcheck resume report verify)
 
@@ -337,11 +337,36 @@ phase_done() { [[ -f "${RUN_DIR}/phases_done" ]] && grep -qxF "$1" "${RUN_DIR}/p
 phase_mark_done() {
     (( DRY_RUN )) && return 0
     phase_done "$1" || echo "$1" >> "${RUN_DIR}/phases_done"
+    # Done now, even if an earlier attempt skipped it.
+    if grep -qxsF "$1" "${RUN_DIR}/phases_skipped"; then
+        { grep -vxF "$1" "${RUN_DIR}/phases_skipped" || true; } > "${RUN_DIR}/phases_skipped.tmp"
+        mv -f "${RUN_DIR}/phases_skipped.tmp" "${RUN_DIR}/phases_skipped"
+    fi
 }
 # A phase that ran but did nothing, this time: not done, so --continue looks at it again.
 phase_mark_skipped() {
     (( DRY_RUN )) && return 0
     grep -qxsF "$1" "${RUN_DIR}/phases_skipped" || echo "$1" >> "${RUN_DIR}/phases_skipped"
+}
+
+# Would this phase still do nothing, with the settings as they are now?
+phase_still_skips() {
+    case "$1" in
+        admin_switches) (( ! ADMIN_SWITCH_ENABLED )) || [[ "$(switch_type || true)" == ib ]] ;;
+        switches)       [[ "$(switch_type || true)" == ib ]] ;;
+        *)              return 1 ;;
+    esac
+}
+
+# The phases recorded as skipped that still would be, space-separated. One that wouldn't
+# any more, such as admin_switches once enabled, is left out, so it counts as not done.
+# $1 = run folder
+phases_still_skipped() {
+    local p out=""
+    while IFS= read -r p; do
+        [[ -n "$p" ]] && phase_still_skips "$p" && out+="$p "
+    done < <(cat "${1}/phases_skipped" 2>/dev/null || true)
+    echo "${out% }"
 }
 phase_undone() {
     phase_done "$1" || return 0
@@ -477,7 +502,7 @@ show_status() {
         dir="$(ls -1d "${WORK_DIR}"/*/ 2>/dev/null | sort | tail -1 || true)"
         dir="${dir%/}"
     fi
-    [[ -n "$dir" && -d "$dir" ]] || die "No runs found in $WORK_DIR"
+    [[ -n "$dir" && -d "$dir" ]] || die "No such run in $WORK_DIR: ${RUN_ID:-none yet}"
     if (( REPORT_MODE )); then
         [[ -f "${dir}/report.txt" ]] || die "Run $(basename "$dir") has no report yet."
         cat "${dir}/report.txt"
@@ -487,7 +512,9 @@ show_status() {
     echo "Folder:  $dir"
     echo "Status:  $(effective_status "$dir")"
     [[ -s "${dir}/phases_done" ]] && echo "Done:    $(paste -sd' ' "${dir}/phases_done")"
-    [[ -s "${dir}/phases_skipped" ]] && echo "Skipped: $(paste -sd' ' "${dir}/phases_skipped")"
+    local skipped
+    skipped="$(phases_still_skipped "$dir")"
+    [[ -z "$skipped" ]] || echo "Skipped: $skipped"
     if [[ -f "${dir}/background.pid" ]]; then
         local pid
         pid="$(cat "${dir}/background.pid")"
@@ -925,6 +952,7 @@ phase_precheck() {
 # in progress: pausing is enough (decided by the site).
 phase_quiesce() {
     info "== quiesce =="
+    phase_undone resume
     local missing
     missing="$(missing_sql_settings)"
     if [[ -n "$missing" ]]; then
@@ -947,8 +975,9 @@ phase_quiesce() {
             info "Replication server $server already paused by this run."
             continue
         fi
-        sql_exec "${REPLICATION_PAUSE_SQL//\{server\}/$server}" || die "Could not pause replication server $server."
+        # Recorded first: a stop just after the pause must not leave it paused and forgotten.
         (( DRY_RUN )) || echo "$server" >> "$paused"
+        sql_exec "${REPLICATION_PAUSE_SQL//\{server\}/$server}" || die "Could not pause replication server $server. It's listed in $paused, so resume will try it."
         info "Paused replication server $server"
     done <<<"$servers"
 
@@ -1447,19 +1476,44 @@ check_cell_versions() {
     (( bad == 0 )) || die "$bad cell(s) not on $target."
 }
 
+# Is every cell in CELL_GROUP_FILE on this version now?
+cells_on_target() {
+    local text cell ver
+    text="$(cell_versions || true)"
+    while IFS= read -r cell; do
+        [[ -n "$cell" ]] || continue
+        ver="$(sed -nE "s/^[[:space:]]*${cell//./[.]}:[[:space:]]*([0-9][0-9.]*)[[:space:]]*$/\1/p" <<<"$text" | head -1 || true)"
+        [[ "$ver" == "$1" ]] || return 1
+    done < <(sed -e 's/\r$//' -e 's/[[:space:]]*$//' "$CELL_GROUP_FILE")
+    return 0
+}
+
+# Is every switch in group file $2 on version $1 now? One that can't be read counts as no.
+switches_on_target() {
+    local sw text
+    while IFS= read -r sw; do
+        [[ -n "$sw" ]] || continue
+        text="$(switch_version "$sw")" || return 1
+        grep -qF -- "$1" <<<"$text" || return 1
+    done < "$2"
+    return 0
+}
+
 # The prereq check before the patch. Only if it fails: the recovery steps, then the
 # check again. A second failure stops the run for review.
 cell_prereq() {
     local dir="$1" step name="${CELL_PREREQ_STEP#-}"
-    if patchmgr_attempt cells "$dir" "$name" -cells "$CELL_GROUP_FILE" "$CELL_PREREQ_STEP"; then
+    # These always run for real. A result left over from an earlier attempt says nothing
+    # about now, and using one would run the sequence out of order.
+    if DETACHED_FRESH=1 patchmgr_attempt cells "$dir" "$name" -cells "$CELL_GROUP_FILE" "$CELL_PREREQ_STEP"; then
         return 0
     fi
     warn "$PATCHMGR_PROBLEM"
     warn "The prereq check failed: running ${CELL_RECOVERY_STEPS[*]}, then checking again."
     for step in "${CELL_RECOVERY_STEPS[@]}"; do
-        run_patchmgr cells "$dir" "${step#-}" -cells "$CELL_GROUP_FILE" "$step"
+        DETACHED_FRESH=1 run_patchmgr cells "$dir" "${step#-}" -cells "$CELL_GROUP_FILE" "$step"
     done
-    patchmgr_attempt cells "$dir" "${name}2" -cells "$CELL_GROUP_FILE" "$CELL_PREREQ_STEP" \
+    DETACHED_FRESH=1 patchmgr_attempt cells "$dir" "${name}2" -cells "$CELL_GROUP_FILE" "$CELL_PREREQ_STEP" \
         || die "The prereq check failed again after ${CELL_RECOVERY_STEPS[*]}: stopping for review. $PATCHMGR_PROBLEM"
     info "The prereq check passed after ${CELL_RECOVERY_STEPS[*]}."
 }
@@ -1487,6 +1541,10 @@ phase_cells() {
     local patch_log="${RUN_DIR}/cells_patch.log"
     if step_done cells_patch; then
         info "patchmgr -patch already succeeded in this run; only checking the versions."
+    elif ! pending_result "$patch_log" && cells_on_target "$target"; then
+        # Never patch twice: a -patch that looked failed may still have worked.
+        info "Every cell is already on $target: not running patchmgr -patch."
+        step_mark_done cells_patch
     else
         if ! pending_result "$patch_log"; then
             cell_prereq "$dir"
@@ -1585,6 +1643,7 @@ phase_switches() {
     type="$(switch_type || true)"
     if [[ "$type" == ib ]]; then
         warn "SWITCH_TYPE is IB: only RoCE switches are patched by this script. Switches NOT patched."
+        PHASE_SKIPPED=1
         return 0
     fi
     [[ "$type" == roce ]] || die "SWITCH_TYPE is '${type:-not set}' in $(staged_value patch_conf), not roce or ib: cannot tell what to do with the switches."
@@ -1605,6 +1664,9 @@ phase_switches() {
     # not be repeated, and neither must the check before it.
     if step_done switches_upgrade; then
         info "patchmgr --upgrade already succeeded in this run; only checking the versions."
+    elif ! pending_result "${RUN_DIR}/switches_upgrade.log" && switches_on_target "$target" "$SWITCH_GROUP_FILE"; then
+        info "Every switch is already on $target: not running patchmgr --upgrade."
+        step_mark_done switches_upgrade
     else
         if ! pending_result "${RUN_DIR}/switches_upgrade.log"; then
             run_patchmgr switches "$dir" precheck --roceswitches "$SWITCH_GROUP_FILE" "${SWITCH_PRECHECK_ARGS[@]}"
@@ -1615,7 +1677,7 @@ phase_switches() {
     fi
     info "Switch versions:"
     check_switch_versions "$target"
-    info "RoCE switches upgraded to $target."
+    info "RoCE switches are on $target."
 }
 
 # ---------------------------------------------------------------------------
@@ -1657,6 +1719,7 @@ phase_admin_switches() {
     type="$(switch_type || true)"
     if [[ "$type" == ib ]]; then
         warn "SWITCH_TYPE is IB: the admin switch on these racks needs manual changes. Admin switches NOT patched."
+        PHASE_SKIPPED=1
         return 0
     fi
     [[ "$type" == roce ]] || die "SWITCH_TYPE is '${type:-not set}' in $(staged_value patch_conf), not roce or ib: cannot tell what to do with the admin switches."
@@ -1676,6 +1739,9 @@ phase_admin_switches() {
     # be repeated, and neither must the check before it.
     if step_done admin_switches_upgrade; then
         info "The admin switch upgrade already succeeded in this run; only checking the versions."
+    elif ! pending_result "${RUN_DIR}/admin_switches_upgrade.log" && switches_on_target "$target" "$ADMIN_SWITCH_GROUP_FILE"; then
+        info "Every admin switch is already on $target: not running the upgrade."
+        step_mark_done admin_switches_upgrade
     else
         if ! pending_result "${RUN_DIR}/admin_switches_upgrade.log"; then
             run_patchmgr admin_switches "$dir" precheck "${precheck_args[@]}"
@@ -1686,7 +1752,7 @@ phase_admin_switches() {
     fi
     info "Admin switch versions:"
     check_switch_versions "$target" "$ADMIN_SWITCH_GROUP_FILE"
-    info "Admin switches upgraded to $target."
+    info "Admin switches are on $target."
 }
 
 phase_postcheck() {
@@ -1926,7 +1992,9 @@ phase_report() {
         echo "ZDLRA patch run $RUN_ID"
         echo "Host:      $(hostname)"
         echo "Done:      $(paste -sd' ' "${RUN_DIR}/phases_done" 2>/dev/null || true)"
-        [[ ! -s "${RUN_DIR}/phases_skipped" ]] || echo "SKIPPED:   $(paste -sd' ' "${RUN_DIR}/phases_skipped") (nothing was done in these)"
+        local skipped
+        skipped="$(phases_still_skipped "$RUN_DIR")"
+        [[ -z "$skipped" ]] || echo "SKIPPED:   $skipped (nothing was done in these)"
         echo "Staged:    $(staged_value archive) (SHA-256 $(staged_value sha256))"
         echo "Dry run:   $DRY_RUN"
         echo "Phases:    ${PHASES[*]}"
@@ -1956,6 +2024,8 @@ start_background() {
     (( SKIP_BACKUP_WAIT )) && args+=(--skip-backup-wait)
     args+=("${BG_PHASES[@]}")
 
+    # Before it starts: afterwards, this could overwrite a short run's final status.
+    set_status "running in background: ${BG_PHASES[*]}"
     local launcher=(nohup)
     command -v setsid >/dev/null 2>&1 && launcher=(setsid nohup)
     ZDLRA_LOCK_FROM=$$ "${launcher[@]}" "$SCRIPT_PATH" "${args[@]}" \
@@ -1965,7 +2035,6 @@ start_background() {
     echo "$pid" > "$LOCK_FILE"
     echo "$pid" > "${RUN_DIR}/owner.pid"
     LOCK_HANDED_OFF=1
-    set_status "running in background (pid $pid): ${BG_PHASES[*]}"
     info "Remaining phases started in the background as pid $pid: ${BG_PHASES[*]}"
     info "Follow it with:  tail -f $LOG_FILE  (a long step has a log of its own: --status names it)"
     info "Check it with:   $SCRIPT_PATH -c $CONFIG_FILE --status --run-id $RUN_ID"
@@ -2043,6 +2112,9 @@ main() {
         # Check approval before marking a changing step as running, so a refusal leaves
         # the run's status as it was.
         phase_needs_approval "$p" && require_approval
+        if phase_needs_approval "$p" && [[ "$p" != quiesce ]] && phase_done resume; then
+            die "Run $RUN_ID's resume has already run, so replication isn't paused. Not running $p. Start a new run, or run quiesce again first."
+        fi
         phase_is_guarded "$p" && refuse_if_running "$p"
         CURRENT_PHASE="$p"
         set_status "running $p"

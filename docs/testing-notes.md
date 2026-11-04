@@ -24,8 +24,8 @@ step 5.
       `ADMIN_SWITCH_ENABLED=1`; until then, a real run does not patch the admin switch. If the commands no
       longer use `--roceswitches`, add the new option to `find_long_command` and to `step_no_active_run`
       in staging.
-- [ ] **`NODE_READY_CMD`:** after the last compute pass, this must succeed on node 1 before the next phases start. The
-      default looks for an `ora_pmon_` process. Check that's right for "the database is back up", and that
+- [ ] **`NODE_READY_CMD`:** after each compute pass, this must succeed on the node that rebooted before the next pass
+      starts. The default looks for an `ora_pmon_` process. Check that's right for "the database is back up", and that
       `NODE_READY_MINUTES` (30) is long enough.
 - [ ] **`emcli` login:** the session is refreshed before suspending and resuming the jobs. If `EM_USER`
       asks for a password, the script waits at that prompt. Check how the login works on the OMS, as
