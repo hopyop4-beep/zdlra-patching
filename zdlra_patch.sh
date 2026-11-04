@@ -240,6 +240,17 @@ warn() { log WARN "$@"; }
 err()  { log ERROR "$@"; }
 die()  { err "$@"; exit 1; }
 
+# Does the text ($2) show the version $1 as a whole version, not as part of a longer
+# one? A plain substring match would take 24.1.14.0.0 for a target of 24.1.1. The
+# version may be followed by punctuation such as ")" or a full stop, but not by more
+# digits, letters or ".<digit>".
+version_in_text() {
+    [[ -n "$1" ]] || return 1
+    local esc
+    esc="$(sed 's/[][\.*^$+?(){}|/]/\\&/g' <<<"$1")"
+    grep -qE -- "(^|[^0-9A-Za-z.])${esc}([^0-9A-Za-z.]|[.]([^0-9]|$)|$)" <<<"$2"
+}
+
 # Print the comment block at the top of this file.
 usage() { awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"; }
 
@@ -302,18 +313,24 @@ script_signal_traps
 # that process writes the detached pid into the lock before exiting, so the lock is
 # never left looking stale in between. A lock whose process is gone is stale.
 acquire_lock() {
-    if [[ -e "$LOCK_FILE" ]]; then
+    # Root writes this file, in /tmp: never through a link someone else put there.
+    [[ ! -L "$LOCK_FILE" ]] || die "Lock file $LOCK_FILE is a symbolic link; remove it, and find out who made it."
+    # Created only if absent (noclobber), so two runs started together cannot both get it.
+    if ! ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null; then
         local owner
         owner="$(cat "$LOCK_FILE" 2>/dev/null || true)"
         if [[ -n "${ZDLRA_LOCK_FROM:-}" && ( "$owner" == "$ZDLRA_LOCK_FROM" || "$owner" == "$$" ) ]]; then
             info "Taking over the lock from pid $owner."
+            echo $$ > "$LOCK_FILE"
         elif [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
             die "Lock file $LOCK_FILE is held by running pid $owner. Is another run active?"
         else
             warn "Removing stale lock file $LOCK_FILE (pid ${owner:-?} is not running)."
+            rm -f -- "$LOCK_FILE"
+            ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null \
+                || die "Another run took the lock $LOCK_FILE just now."
         fi
     fi
-    echo $$ > "$LOCK_FILE"
     LOCK_HELD=1
     [[ -z "$RUN_DIR" ]] || echo $$ > "${RUN_DIR}/owner.pid"
 }
@@ -867,15 +884,16 @@ phase_precheck() {
         warn "STAGED_RECORD is not set; not checking what was staged."
     fi
 
-    # The precheck rolls back the RPM ra_preinstall installs, so preinstall must run
-    # again, unless the upgrade has already finished (ra_update done).
-    phase_done ra_update || phase_undone ra_preinstall
-    run_external_precheck before
-
+    # Before the long precheck, not after it.
     local free_gb
     free_gb=$(df -BG --output=avail "$WORK_DIR" | tail -1 | tr -dc '0-9')
     info "Free space for $WORK_DIR: ${free_gb}G (need ${MIN_FREE_GB}G)"
     (( free_gb >= MIN_FREE_GB )) || die "Not enough free space."
+
+    # The precheck rolls back the RPM ra_preinstall installs, so preinstall must run
+    # again, unless the upgrade has already finished (ra_update done).
+    phase_done ra_update || phase_undone ra_preinstall
+    run_external_precheck before
 
     # Read-only look at what quiesce will deal with, so it is part of the review.
     report_activity
@@ -1087,7 +1105,7 @@ phase_ra_update() {
     ver="$("$RACLI" version 2>&1 || true)"
     printf '%s\n' "$ver" >> "$LOG_FILE"
     if [[ -n "$target" ]]; then
-        if grep -qF "$target" <<<"$ver"; then
+        if version_in_text "$target" "$ver"; then
             info "racli version shows $target."
         else
             warn "racli version does not show TARGET_RA_VERSION $target; check: $RACLI version"
@@ -1367,7 +1385,7 @@ check_cell_versions() {
     while IFS= read -r cell; do
         [[ "$seen" == *" $cell "* ]] && continue
         err "    $cell: no version reported (expected $target)"; bad=$((bad + 1))
-    done < <(sed -e 's/\r$//' -e 's/[[:space:]]*$//' -e '/^[[:space:]]*$/d' "$CELL_GROUP_FILE")
+    done < <(group_hosts "$CELL_GROUP_FILE")
     (( bad == 0 )) || die "$bad cell(s) not on $target."
 }
 
@@ -1394,6 +1412,7 @@ phase_cells() {
     loc="$(cell_patch_location)" || die "Cell patch: $loc"
     dir="${loc#* }"
     [[ -s "$CELL_GROUP_FILE" ]] || die "$CELL_GROUP_FILE is missing or empty."
+    check_group_file "$CELL_GROUP_FILE"
     target="$(conf_value TARGET_CELL_VERSION || true)"
     [[ -n "$target" ]] || die "TARGET_CELL_VERSION is not set in $(staged_value patch_conf)."
     info "Cell patch folder: $dir; cells: $(paste -sd' ' "$CELL_GROUP_FILE"); target: $target"
@@ -1463,10 +1482,21 @@ report_switch_plan() {
             else
                 warn "    now $sw: could not read its version"
             fi
-        done < "$SWITCH_GROUP_FILE"
+        done < <(group_hosts "$SWITCH_GROUP_FILE")
     else
         warn "Switches:     $SWITCH_GROUP_FILE is missing or empty"
     fi
+}
+
+# The host names in a group file, one per line: no carriage returns (a file edited on
+# Windows), surrounding blanks, blank lines or # comments.
+group_hosts() {
+    sed -e 's/\r$//' -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$1" 2>/dev/null
+}
+
+# A group file that patchmgr or dcli read must not have Windows line ends.
+check_group_file() {
+    ! grep -q $'\r' "$1" 2>/dev/null || die "$1 has Windows (CRLF) line ends; fix it first: sed -i 's/\\r\$//' $1"
 }
 
 # Run SWITCH_VERSION_CMD for one switch; prints its output.
@@ -1492,13 +1522,13 @@ check_switch_versions() {
         if ! out="$(switch_version "$sw")"; then
             warn "    $sw: could not read its version: $(head -1 <<<"$out")"
             unread=$((unread + 1))
-        elif grep -qF "$target" <<<"$out"; then
+        elif version_in_text "$target" "$out"; then
             info "    $sw: $target"
         else
             err "    $sw: $(switch_version_line "$out") (expected $target)"
             bad=$((bad + 1))
         fi
-    done < "$group"
+    done < <(group_hosts "$group")
     (( bad == 0 )) || die "$bad switch(es) not on $target."
     (( unread == 0 )) || warn "$unread switch(es) could not be checked; check them by hand (patchmgr reported success)."
 }
@@ -1515,6 +1545,7 @@ phase_switches() {
     loc="$(switch_patch_location)" || die "Switch patch: $loc"
     dir="${loc#* }"
     [[ -s "$SWITCH_GROUP_FILE" ]] || die "$SWITCH_GROUP_FILE is missing or empty."
+    check_group_file "$SWITCH_GROUP_FILE"
     local target
     target="$(conf_value TARGET_SWITCH_VERSION || true)"
     [[ -n "$target" ]] || die "TARGET_SWITCH_VERSION is not set in $(staged_value patch_conf)."
@@ -1586,6 +1617,7 @@ phase_admin_switches() {
     loc="$(switch_patch_location)" || die "Switch patch: $loc"
     dir="${loc#* }"
     [[ -s "$ADMIN_SWITCH_GROUP_FILE" ]] || die "$ADMIN_SWITCH_GROUP_FILE is missing or empty."
+    check_group_file "$ADMIN_SWITCH_GROUP_FILE"
     target="$(conf_value TARGET_ADMIN_SWITCH_VERSION || true)"
     [[ -n "$target" ]] || die "TARGET_ADMIN_SWITCH_VERSION is not set in $(staged_value patch_conf)."
     info "Switch patch folder: $dir; admin switches: $(paste -sd' ' "$ADMIN_SWITCH_GROUP_FILE"); target: $target"
@@ -1617,7 +1649,8 @@ phase_postcheck() {
     local snap="${RUN_DIR}/snapshot_after"
     mkdir -p "$snap"
     "$RACLI" version          > "${snap}/racli_version.txt" 2>&1 || true
-    "$RACLI" status appliance > "${snap}/racli_status.txt"  2>&1 || true
+    "$RACLI" status appliance > "${snap}/racli_status.txt"  2>&1 \
+        || warn "racli status appliance failed after patching; see ${snap}/racli_status.txt"
     if [[ -d "${RUN_DIR}/snapshot_before" ]]; then
         diff -ru "${RUN_DIR}/snapshot_before" "$snap" > "${RUN_DIR}/snapshot.diff" || true
         info "Before/after diff: ${RUN_DIR}/snapshot.diff"
@@ -1678,7 +1711,7 @@ version_summary() {
     line="$(grep -F -- "${target:-@@none@@}" <<<"$text" | head -1 || true)"
     [[ -n "$line" ]] || line="$(grep -iE 'version' <<<"$text" | head -1 || true)"
     line="$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$line")"
-    version_row RA "$(hostname -s 2>/dev/null || hostname)" "$line" "$target" "$([[ -n "$target" ]] && grep -qF -- "$target" <<<"$text" && echo 1 || echo 0)" soft
+    version_row RA "$(hostname -s 2>/dev/null || hostname)" "$line" "$target" "$(version_in_text "$target" "$text" && echo 1 || echo 0)" soft
 
     target="$(conf_value TARGET_COMPUTE_VERSION || true)"
     IFS=',' read -r -a names <<<"$(staged_value component_COMPUTE_NODE | tr -d ' ')"
@@ -1692,7 +1725,7 @@ version_summary() {
     fi
 
     target="$(conf_value TARGET_CELL_VERSION || true)"
-    mapfile -t names < <(sed '/^[[:space:]]*$/d' "$CELL_GROUP_FILE" 2>/dev/null)
+    mapfile -t names < <(group_hosts "$CELL_GROUP_FILE")
     if (( ${#names[@]} )); then
         text="$(cell_versions || true)"
         image_rows cell "$target" "$text" "" "${names[@]}"
@@ -1709,11 +1742,11 @@ version_summary() {
         while IFS= read -r sw; do
             [[ -n "$sw" ]] || continue
             if text="$(switch_version "$sw")"; then
-                version_row switch "$sw" "$(switch_version_line "$text")" "$target" "$([[ -n "$target" ]] && grep -qF -- "$target" <<<"$text" && echo 1 || echo 0)"
+                version_row switch "$sw" "$(switch_version_line "$text")" "$target" "$(version_in_text "$target" "$text" && echo 1 || echo 0)"
             else
                 version_row switch "$sw" "" "$target" 0
             fi
-        done < "$SWITCH_GROUP_FILE"
+        done < <(group_hosts "$SWITCH_GROUP_FILE")
     else
         version_row switch "-" "" "$target" 0
     fi
@@ -1724,11 +1757,11 @@ version_summary() {
             while IFS= read -r sw; do
                 [[ -n "$sw" ]] || continue
                 if text="$(switch_version "$sw")"; then
-                    version_row adminsw "$sw" "$(switch_version_line "$text")" "$target" "$([[ -n "$target" ]] && grep -qF -- "$target" <<<"$text" && echo 1 || echo 0)"
+                    version_row adminsw "$sw" "$(switch_version_line "$text")" "$target" "$(version_in_text "$target" "$text" && echo 1 || echo 0)"
                 else
                     version_row adminsw "$sw" "" "$target" 0
                 fi
-            done < "$ADMIN_SWITCH_GROUP_FILE"
+            done < <(group_hosts "$ADMIN_SWITCH_GROUP_FILE")
         else
             version_row adminsw "-" "" "$target" 0
         fi

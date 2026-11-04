@@ -78,3 +78,8 @@ COMPUTE_VERSION_WAIT_MINUTES=60                # a patched node not answering af
 # SUCCESS WITH WARNING(S) carries on (warnings are listed): allowed for now because
 # the prechecks were already reviewed; to revisit. 1 = stop for review instead.
 COMPUTE_PAUSE_ON_WARNINGS=0
+# After the last pass the first node has rebooted. The phases after compute wait until
+# this command succeeds on it (resume needs the database), for up to this long.
+# Empty = only wait for ssh.
+NODE_READY_CMD="pgrep -f '^ora_pmon_' >/dev/null"
+NODE_READY_WAIT_MINUTES=45

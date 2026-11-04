@@ -170,20 +170,22 @@ cp jump/zdlra_jump.conf.example jump/zdlra_jump.conf   # then edit it
 ./jump/zdlra_patch_run.sh -z zdlra01 --execute          # real run
 ```
 
+Run it inside `tmux` or `screen`: the node work is detached, but the OEM job scripts (about 30 minutes each) run on the jump server and stop if your session drops.
+
 1. **Preflight:** checks SSH to the node, that the patch script and its config are there, the `emcli` login, the blackout reason, and the targets.
 2. **Precheck:** starts on the node detached from your session, because it can take a long time. It keeps running if your connection to the jump server drops. The script checks its status every `POLL_SECONDS`.
 3. **Approve:** when the precheck finishes, the review screen opens in your terminal and you type `APPROVE`. If the precheck failed, or you don't approve, nothing has changed and no blackout exists.
 4. **Blackout:** created after you approve, before anything changes. By default it ends by itself after `BLACKOUT_HOURS` (12), as a safety net.
 5. **OEM backup jobs:** `sr_jobs_new.ksh -z <zdlra db> -a s` suspends them, run in `OEM_JOBS_DIR`; at the end `-a r` resumes them. Each appliance's zdlra db value for that script (for example `RA1GF2`) is set in `OEM_JOBS_DB`, and a run stops before it starts if its appliance isn't listed. That script writes another one, `<zdlra db>_suspend_job_<stamp>.ksh`, with one `emcli suspend_job` per job, and the run then executes it (only the file it just created), with the output in the matching `.log`; about 30 minutes is normal. That script runs every command even if some fail, so the run checks the log for a `Job "<name>" suspended successfully` line for every job the script names. Jobs without one are listed as warnings and the run carries on. Resuming at the end works the same way with `-a r`. A dry run only shows what would run. Without `-t`, all the appliance's backup jobs are suspended. A failure is a nonzero exit, the script's usage text in its output (what it prints for a wrong value, matched by `OEM_JOBS_FAIL_RE`), a generated script naming no jobs, or none of its jobs reporting success. If suspending fails, patching does not start. The `emcli` session is refreshed first, since it can expire during a window. If resuming fails, or some jobs did not resume, the run says so again as its very last line.
 6. **Patch:** the phases before `compute` start on the node in the background, and the script prints each phase as the node reports it.
-7. **Compute:** the compute nodes are upgraded from the jump server (see below).
+7. **Compute:** the compute nodes are upgraded from the jump server (see below). Node 1 reboots last, so before going on the script waits until `NODE_READY_CMD` succeeds on it (default: a database instance is running), for up to `NODE_READY_WAIT_MINUTES` (45).
 8. **Patch again:** the phases after `compute` (`switches`, `postcheck`, `resume`, `report`) run on the node.
 9. **Finish:** when the run completes, `OEM_JOBS_RESUME_CMD` resumes the jobs and then the blackout ends. Pass `--keep-blackout` to leave both as they are. If the run fails, both stay as they are while you investigate, and the script prints the commands to undo them.
 10. **Verify:** `verify` runs on the node, waiting for new backups and replication (up to 3.5 hours by default). Then the report is shown here: the summary, the version table, and the backup and replication results. With `--keep-blackout`, `verify` is not run, as the jobs are still suspended; the script prints the command to run it later.
 
 Ctrl-C only stops watching; the work on the node carries on. To pick up again:
 
-- `--resume <run id>`: the precheck is still running, finished, or approved (for example, you were away when it finished, or you declined at first).
+- `--resume <run id>`: the precheck is still running, finished, or approved (for example, you were away when it finished, or you declined at first). Also after a failed or interrupted OEM job suspend: a blackout this run created is reused, not created again.
 - `--watch <run id>`: the patch phases are already running.
 - `--continue <run id>`: the run failed and the problem is fixed. The node phases start again and skip the ones already done (see [Continuing after a failure](#continuing-after-a-failure)).
 

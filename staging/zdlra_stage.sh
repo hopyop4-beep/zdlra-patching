@@ -395,6 +395,10 @@ verify_local() {
         warn "Archive has no single top folder; it will be unzipped into $STAGE_DIR"
     fi
     info "Unzips to:    $STAGE_DIR on each node"
+    # zdlra_patch.sh reads the staged record, the precheck and the patch folders from
+    # /radump/patches by default (STAGED_RECORD, PRECHECK_SCRIPT, *_TMP_DIR ...).
+    [[ "$STAGE_DIR" == /radump/patches ]] \
+        || warn "The archive unzips to $STAGE_DIR, not /radump/patches: zdlra_patch.sh would not see it, and could use an older /radump/patches. Zip the folder as patches/ (Copy-ZdlraPatches.ps1 -RemotePath /radump/patches), or change those paths in zdlra_patch.conf."
 
     # The conf file: exactly one conf/patch.conf_<SR>.
     local confs pattern
@@ -704,6 +708,11 @@ copy_to_node() {
     SHA_OK[$node]=1
 }
 
+# Free space in KB for a folder on a node (or for its nearest existing parent).
+node_free_kb() {
+    on_node "$1" "d='$2'; while [ ! -d \"\$d\" ]; do d=\$(dirname \"\$d\"); done; df -Pk \"\$d\"" | awk 'NR == 2 { print $4 }'
+}
+
 step_distribute() {
     local z="$1" node first="${NODES[0]}" sha
     for node in "${NODES[@]}"; do
@@ -717,11 +726,18 @@ step_distribute() {
             SHA_OK[$node]=1
             continue
         fi
+        # Before copying: the archive and its unpacked copy must both fit, with room to
+        # spare (/radump also takes the appliance's dumps). A backed-up older archive stays.
+        local free_kb need_kb=$(( 2 * $(du -k "$ARCHIVE" | cut -f1) + MIN_FREE_GB * 1024 * 1024 ))
+        free_kb="$(node_free_kb "$node" "$REMOTE_DIR")"
+        [[ "$free_kb" =~ ^[0-9]+$ ]] || die "${z}/${node}: cannot read free space for $REMOTE_DIR"
+        (( free_kb >= need_kb )) \
+            || die "${z}/${node}: not enough free space in $REMOTE_DIR to copy the archive: $(( free_kb / 1024 / 1024 ))G free, need $(( need_kb / 1024 / 1024 ))G"
         if [[ -n "$sha" ]]; then
             info "${z}/${node}: $REMOTE_ARCHIVE is an older version (SHA-256 ${sha:0:12}...)"
             set_aside_old "$node" "$REMOTE_ARCHIVE" "$REMOTE_ARCHIVE_NAME"
         fi
-        change_on_node "$node" "mkdir -p '$REMOTE_DIR'"
+        change_on_node "$node" "mkdir -p '$REMOTE_DIR'" || die "${z}/${node}: cannot create $REMOTE_DIR"
         copy_to_node "$node" "$first" || die "${z}/${node}: copy failed."
     done
 }
@@ -745,7 +761,7 @@ step_check() {
             [[ "$sha" == "$EXPECTED_SHA" ]] || die "${z}/${node}: SHA-256 mismatch or archive missing (${sha:-none})"
             info "${z}/${node}: SHA-256 OK"
         fi
-        free_kb="$(on_node "$node" "d='$EXTRACT_ROOT'; while [ ! -d \"\$d\" ]; do d=\$(dirname \"\$d\"); done; df -Pk \"\$d\"" | awk 'NR == 2 { print $4 }')"
+        free_kb="$(node_free_kb "$node" "$EXTRACT_ROOT")"
         [[ "$free_kb" =~ ^[0-9]+$ ]] || die "${z}/${node}: cannot read free space for $EXTRACT_ROOT"
         info "${z}/${node}: $(( free_kb / 1024 / 1024 ))G free for $EXTRACT_ROOT (need $(( need_kb / 1024 / 1024 ))G)"
         (( free_kb >= need_kb )) || die "${z}/${node}: not enough free space in $EXTRACT_ROOT"

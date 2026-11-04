@@ -107,6 +107,11 @@ COMPUTE_VERSION_WAIT_MINUTES=60 # a patched node not answering after this long s
 # 1 = stop for review before going on. Decided for now: carry on, because the
 # prechecks have already been reviewed. To revisit.
 COMPUTE_PAUSE_ON_WARNINGS=0
+# After the last pass the first node has rebooted. Before the phases after compute
+# (resume needs the database), wait until this command succeeds on it, for up to
+# NODE_READY_WAIT_MINUTES. Default: a database instance (ora_pmon_) is running.
+NODE_READY_CMD="pgrep -f '^ora_pmon_' >/dev/null"
+NODE_READY_WAIT_MINUTES=45
 STATE_DIR="${HOME}/zdlra_jump_state"
 LOG_DIR="${HOME}/zdlra_jump_logs"
 
@@ -342,14 +347,16 @@ has_verify()    { [[ " $PHASES " == *" verify "* ]]; }
 # it up: stage=precheck|before|compute|after|verify|done, started=0 from just before the
 # stage's node phases are started until that has worked, and during compute the pass
 # being worked on. The way the run was started (phases, keep_blackout, skip_backup_wait,
-# dry_run) is saved once and kept when the stage changes.
+# dry_run) is saved once and kept when the stage changes, and so is what this run has
+# already switched on in OEM (blackout=1, jobs_suspended=1), so --resume after a failed
+# or interrupted start does not create a second blackout.
 state_file() { echo "${STATE_DIR}/${ZDLRA}_${RUN_ID}.state"; }
 state_get()  { { sed -n "s/^$1=//p" "$(state_file)" 2>/dev/null || true; } | head -1; }
 state_set()  {
     mkdir -p "$STATE_DIR"
     local f k v keep=()
     f="$(state_file)"
-    for k in phases keep_blackout skip_backup_wait dry_run; do
+    for k in phases keep_blackout skip_backup_wait dry_run blackout jobs_suspended; do
         [[ " $* " == *" $k="* ]] && continue
         v="$(state_get "$k")"
         [[ -n "$v" ]] && keep+=("$k=$v")
@@ -679,6 +686,18 @@ step_compute() {
         warn "$NODE is not answering yet after its upgrade; trying again."
         sleep "$COMPUTE_POLL_SECONDS"
     done
+    # Answering ssh is not enough: the phases after compute use the database.
+    if [[ -n "$NODE_READY_CMD" ]]; then
+        local ready_start
+        ready_start=$(date +%s)
+        until on "$NODE" "$NODE_READY_CMD" 2>/dev/null; do
+            (( $(date +%s) - ready_start <= NODE_READY_WAIT_MINUTES * 60 )) \
+                || die "$NODE answers, but is not ready after ${NODE_READY_WAIT_MINUTES} min (NODE_READY_CMD: $NODE_READY_CMD). Check CRS and the database on it."
+            warn "$NODE is up, but not ready yet (NODE_READY_CMD); trying again."
+            sleep "$COMPUTE_POLL_SECONDS"
+        done
+        info "$NODE is ready ($NODE_READY_CMD)."
+    fi
     info "All compute nodes are on $C_TARGET."
 }
 
@@ -747,6 +766,10 @@ on_interrupt() {
     elif [[ "$WATCHING" == verify ]]; then
         warn "Stopped watching. verify keeps running on $NODE; the patching is finished, OEM jobs are resumed and the blackout ended."
         warn "Watch again:     $0 -z $ZDLRA --watch $RUN_ID$(xflag)"
+    elif [[ "$WATCHING" == setup ]]; then
+        warn "Stopped before the patch phases started on $NODE. The blackout, and the OEM jobs suspended so far, stay as they are."
+        warn "Continue later:  $0 -z $ZDLRA --resume $RUN_ID$(xflag)   (a blackout this run created is reused)"
+        print_undo
     elif [[ "$WATCHING" == precheck ]]; then
         warn "Stopped watching. The precheck keeps running on $NODE; nothing has changed yet."
         warn "Continue later:  $0 -z $ZDLRA --resume $RUN_ID$(xflag)"
@@ -804,19 +827,37 @@ step_approve() {
 
 step_blackout_start() {
     info "== blackout =="
+    # From here until the patch phases start, Ctrl-C must say what is already on.
+    WATCHING="setup"
+    if (( ! DRY_RUN )) && [[ "$(state_get blackout)" == 1 ]]; then
+        info "Run $RUN_ID already created its blackout in an earlier attempt; not creating another (status: ${SCRIPT_DIR}/oem_blackout.sh status -z $ZDLRA)."
+        BLACKOUT_ACTIVE=1
+        return 0
+    fi
     blackout start || die "Blackout was not created; patching not started. Continue later: $0 -z $ZDLRA --resume $RUN_ID$(xflag)"
-    (( DRY_RUN )) || BLACKOUT_ACTIVE=1
+    if (( ! DRY_RUN )); then
+        BLACKOUT_ACTIVE=1
+        state_set stage=precheck blackout=1
+    fi
 }
 
 step_jobs_suspend() {
     info "== suspend OEM backup jobs =="
+    if (( ! DRY_RUN )) && [[ "$(state_get jobs_suspended)" == 1 ]]; then
+        info "Run $RUN_ID already suspended the OEM backup jobs in an earlier attempt; not suspending them again."
+        JOBS_SUSPENDED=1
+        return 0
+    fi
+    # Set first: if this is interrupted part way, some jobs are already suspended.
+    (( DRY_RUN || ${#OEM_JOBS_SUSPEND_CMD[@]} == 0 )) || JOBS_SUSPENDED=1
     if ! run_jobs_cmd suspend ${OEM_JOBS_SUSPEND_CMD[@]+"${OEM_JOBS_SUSPEND_CMD[@]}"}; then
         err "Suspending OEM jobs failed; patching not started. Some jobs may already be suspended."
         JOBS_SUSPENDED=1
+        err "Once fixed:      $0 -z $ZDLRA --resume $RUN_ID$(xflag)   (the blackout is reused; the jobs are suspended again)"
         print_undo
         exit 1
     fi
-    (( DRY_RUN || ${#OEM_JOBS_SUSPEND_CMD[@]} == 0 )) || JOBS_SUSPENDED=1
+    (( DRY_RUN || ${#OEM_JOBS_SUSPEND_CMD[@]} == 0 )) || state_set stage=precheck jobs_suspended=1
 }
 
 # Start node phases ($1, space-separated) in the background on the patch node.

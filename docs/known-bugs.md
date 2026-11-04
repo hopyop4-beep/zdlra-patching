@@ -4,7 +4,7 @@ From a code review of all the code on `main` (commit 59ab2d5), on 2026-11-03. No
 are fixed yet. Line numbers are from that commit. Almost all of this also applies to the
 `platinum` branch, which has its own list in `docs/platinum-known-bugs.md`.
 
-**Bugs 1-36 and 38-48 are fixed (2026-11-03), tested with stand-ins only.** Only item 37 is open. Even a dry run executes the real precheck, which changes the system.
+**Bugs 1-36 and 38-48 are fixed (2026-11-03), tested with stand-ins only.** Item 37 is open. A second review (2026-11-04, below) fixed 49-56 and lists 57-66 as open. Even a dry run executes the real precheck, which changes the system.
 
 How far each finding was checked:
 
@@ -171,3 +171,70 @@ Each node's archive is now hashed once per run (half of bug 40).
     - Snapshot files hold only the command's output, so the before/after diff shows real changes.
 42. **Stale docs:** the status text, roadmap items, switches in the approval and warning lists, and the old
     precheck example are all corrected.
+
+## Second review (2026-11-04)
+
+A review of all the code after `20097c2`. Line numbers are left out, as they move.
+
+### Fixed (49-56), tested with stand-ins only
+
+49. **A version that only started with the target passed.** The switch, admin switch and RA checks used a
+    substring match, so a switch on `24.1.14.0.0` passed a target of `24.1.1`, and so did the version table.
+    `version_in_text` now needs the whole version: no digit, letter or `.<digit>` may follow it.
+50. **`--resume` after a failed or interrupted OEM job suspend could never work.** The blackout was already
+    created, so `start` refused because of its own record, and the message sent you back to `--resume`.
+    `--continue` refused too (the run was still at `precheck`). The jump server now saves `blackout=1` and
+    `jobs_suspended=1` in the run's state: a pickup reuses that blackout and doesn't suspend again once that
+    worked.
+51. **Ctrl-C between the blackout and the patch phases said "nothing has changed yet".** It now says the
+    blackout and any suspended jobs are still on, prints how to undo them, and points to `--resume`.
+52. **The phases after `compute` could start before the database was up.** Node 1 reboots in the last pass,
+    and the script only waited for ssh. `resume` (SQL) could fail and leave replication paused, the jobs
+    suspended and the blackout on. It now waits for `NODE_READY_CMD` (default: an `ora_pmon_` process) for up
+    to `NODE_READY_WAIT_MINUTES` (45). Check: is a running pmon enough for the SQL, or should it wait for
+    the database resource in CRS?
+53. **Group files with Windows line ends.** The files travel through a Windows PC. A `switch_group` with CRLF
+    made every switch "could not be read", which is only a warning, and the version table showed a
+    cell as UNREAD. Lines are now cleaned when read
+    (CR, blanks, `#` comments), and `cells`, `switches` and `admin_switches` refuse a group file with CRLF
+    before `patchmgr` sees it.
+54. **The lock wasn't atomic, and root wrote it through any link in `/tmp`.** Two runs started together could
+    both get it. It is now created with `noclobber`, and a symbolic link there is refused.
+55. **Free space was checked late.** The precheck checked `WORK_DIR` only after the external precheck, which
+    can take an hour and changes the system; it now checks first. Staging copied the archive to `/radump` and
+    only then checked space; it now checks (twice the archive plus `MIN_FREE_GB`) before copying.
+56. **`postcheck` ignored a failing `racli status appliance`.** It now logs a warning.
+
+Also: staging warns when the archive doesn't unzip to `/radump/patches`, where `zdlra_patch.sh` looks
+by default. It could otherwise use an older `/radump/patches` still there.
+
+### Open: to decide or check (57-66)
+
+57. **A `postcheck` failure leaves replication paused and the OEM jobs suspended.** `resume` comes after
+    `postcheck`. So a version-table mismatch, or a new `[FAIL]` from the precheck run again after patching,
+    stops the run with backups still off on an appliance that may be fine. Consider running `resume` before
+    `postcheck`, or making the version table and the second precheck warnings once patching has finished.
+58. **Rerunning the Oracle precheck after patching** (`POSTCHECK_RERUN_PRECHECK=1`) changes the system again
+    (RPM, gold images) and may report failures that only mean "already patched". Check what it prints on a
+    patched appliance.
+59. **The 24-hour approval can expire mid-window.** `switches` and `admin_switches` need it after `compute`.
+    A `--continue` the next day means running the full precheck on a half-patched appliance. The roadmap
+    already mentions a separate limit for continuing.
+60. **The 12-hour blackout can end mid-window.** RA update, 17 cells, one compute pass per node and the
+    switches can take longer, more so with a failure. Nothing warns when it ends. Consider a longer default,
+    or a check before each stage.
+61. **The OEM job scripts run in the foreground on the jump server** (about 30 minutes each). A dropped
+    session (SIGHUP) or Ctrl-C stops them part way. The node work is detached, but this isn't. Run
+    `zdlra_patch_run.sh` inside `tmux` or `screen`.
+62. **`verify` compares database times with the OS clock.** `{since}` is the node's local time from `date`.
+    The database uses the time zone CRS starts it with, which may differ. Check, or take `{since}` from
+    `sysdate` in the database.
+63. **`patchmgr` success is read from text.** Any line with `FAILED` fails the step, and `Exit status:0`
+    anywhere in the log counts. Check both against real logs.
+64. **`find_long_command` matches any process with an argument ending in `/precheck`** (for example
+    `less /radump/patches/bin/precheck`) and refuses to start. That is safe, but the message may confuse.
+65. **Staging runs each appliance in `( ... ) || rc=$?`.** Bash turns off `set -e` inside such a subshell.
+    Every step checks its own errors today, but a new step that relies on `set -e` would carry on after a
+    failure.
+66. **`blackout_over` treats any "not found" in the `emcli` output as an ended blackout.** An `emcli` error
+    with those words would then allow a second blackout. Check against real output.
