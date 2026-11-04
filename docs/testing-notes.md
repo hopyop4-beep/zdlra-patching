@@ -39,17 +39,25 @@ Run these by hand on node 1, and note what each prints.
   - Does `racli version` contain `TARGET_RA_VERSION` as written in the conf file?
   - Does `dcli -g /root/cell_group -l root 'imageinfo -ver'` print `host: version`?
   - Does `ssh admin@<switch> "show version"` contain `TARGET_SWITCH_VERSION`?
-- [ ] **`sqlplus` as root over plain ssh.** Does it work with no `ORACLE_HOME` or `ORACLE_SID` set
-      (bug 24)? From the jump server:
+- [ ] **`sqlplus` as root over plain ssh.** The scripts find the Oracle environment from the running
+      database. Check that finds the right values, on node 1:
 
   ```bash
-  ssh root@<node1> 'which sqlplus; echo "ORACLE_HOME=$ORACLE_HOME ORACLE_SID=$ORACLE_SID"'
+  ps -eo pid=,args= | grep '[o]ra_pmon_'
+  readlink /proc/<that pid>/exe
   ```
+
+  The second should end in `/bin/oracle`. Then, with those values, check root can connect as
+  raAutomation. If not, set `RA_ORACLE_HOME` and `RA_ORACLE_SID` in the conf. The DB home changes during
+  `ra_update`, so also check `resume` and `verify` connect afterwards.
 
 - [ ] **The switch patch folder.** Your note said `/radump/patching/tmp`; the scripts assume
       `/radump/patches/tmp`.
-- [ ] **`bash --version` on the nodes.** Below 4.4, `--approve` fails (bug 30).
-- [ ] **`emcli get_targets`:** does `oem_blackout.sh targets -z <zdlra>` list anything (bug 27b)?
+- [ ] **`emcli`:**
+  - Does `oem_blackout.sh targets -z <zdlra>` list anything?
+  - Is each reason on a line of its own in `emcli get_blackout_reasons`? The reason must match a whole line.
+  - What does `get_blackout_details` print for an ended blackout? The record is only set aside if it says
+    ended, stopped or expired.
 - [ ] **`sr_jobs_new.ksh`:** what exit code does it give with a wrong value?
 
 ## 3. The guard, with harmless stand-ins

@@ -89,11 +89,21 @@ current_blackout() {
     cat "$f"
 }
 
+# Has this blackout ended (BLACKOUT_HOURS passed, or stopped elsewhere)? Only a clear
+# answer counts: if in doubt, it is still on. $1 = name.
+blackout_over() {
+    local out
+    out="$("$EMCLI" get_blackout_details -name="$1" 2>&1 || true)"
+    grep -qiE '(^|[^a-z])(ended|stopped|expired)([^a-z]|$)|not found|does not exist' <<<"$out"
+}
+
+retire_record() { mv "$(state_file)" "$(state_file).stopped_$(date +%Y%m%d_%H%M%S)"; }
+
 # ---------------------------------------------------------------------------
 do_targets() {
     ensure_login
     info "EM targets matching '$ZDLRA' (name, type):"
-    "$EMCLI" get_targets -targets="%${ZDLRA}%"
+    "$EMCLI" get_targets -targets="%${ZDLRA}%:%"
 }
 
 do_start() {
@@ -102,13 +112,19 @@ do_start() {
     [[ -n "$BLACKOUT_REASON" && "$BLACKOUT_REASON" != *"<"* ]] || die "Set BLACKOUT_REASON in $CONFIG_FILE (see: emcli get_blackout_reasons)"
 
     ensure_login
-    "$EMCLI" get_blackout_reasons | grep -Fq -- "$BLACKOUT_REASON" \
+    local reasons
+    reasons="$("$EMCLI" get_blackout_reasons)" || die "emcli get_blackout_reasons failed."
+    sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$reasons" | grep -Fxq -- "$BLACKOUT_REASON" \
         || die "BLACKOUT_REASON '$BLACKOUT_REASON' is not a known reason. See: emcli get_blackout_reasons"
 
     local f
     f="$(state_file)"
     if [[ -f "$f" ]]; then
-        die "A blackout is already recorded for $ZDLRA: $(cat "$f"). Stop it first: $0 stop -z $ZDLRA -x"
+        if ! blackout_over "$(cat "$f")"; then
+            die "A blackout is already recorded for $ZDLRA: $(cat "$f"). Stop it first: $0 stop -z $ZDLRA -x"
+        fi
+        warn "The recorded blackout $(cat "$f") has already ended."
+        (( DRY_RUN )) || retire_record
     fi
 
     local name schedule
@@ -149,8 +165,13 @@ do_stop() {
         return 0
     fi
     info "[exec] $EMCLI stop_blackout -name=$name"
-    "$EMCLI" stop_blackout -name="$name" || die "stop_blackout failed for $name."
-    mv "$(state_file)" "$(state_file).stopped_$(date +%Y%m%d_%H%M%S)"
+    if ! "$EMCLI" stop_blackout -name="$name"; then
+        blackout_over "$name" || die "stop_blackout failed for $name."
+        info "Blackout $name had already ended."
+        retire_record
+        return 0
+    fi
+    retire_record
     info "Blackout $name stopped."
 }
 

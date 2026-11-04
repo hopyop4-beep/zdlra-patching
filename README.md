@@ -67,7 +67,7 @@ An interrupted `patchmgr` session or `racli` upgrade step can cause major proble
 
 ## Replication and incoming backups
 
-The `precheck`, `quiesce` and `resume` phases run SQL with `sqlplus` as the raAutomation account. `RA_SQL_CONNECT` sets the connection: `raAutomation/<password>` for now, in `zdlra_patch.conf` (not in git). The script warns unless that file is `chmod 600`, and passes the connection to `sqlplus` on stdin, so the password never shows in the process list or the log. A wallet alias (`/@raAutomation`) can replace it later. The queries and statements are settings in `zdlra_patch.conf`. All of them have defaults. There is no wait for replication already in progress: pausing it is enough. The settings:
+The `precheck`, `quiesce` and `resume` phases run SQL with `sqlplus` as the raAutomation account. Root over plain ssh has no Oracle environment, and the DB home changes during `ra_update`, so each SQL step finds `ORACLE_HOME` and `ORACLE_SID` from the running database's `ora_pmon_<sid>` process; set `RA_ORACLE_HOME` and `RA_ORACLE_SID` only if that doesn't work. `RA_SQL_CONNECT` sets the connection: `raAutomation/<password>` for now, in `zdlra_patch.conf` (not in git). The script warns unless that file is `chmod 600`, and passes the connection to `sqlplus` on stdin, so the password never shows in the process list or the log. A wallet alias (`/@raAutomation`) can replace it later. The queries and statements are settings in `zdlra_patch.conf`. All of them have defaults. There is no wait for replication already in progress: pausing it is enough. The settings:
 
 | Setting | What it must do |
 |---|---|
@@ -121,7 +121,7 @@ From the jump server, `zdlra_patch_run.sh -z <appliance> --continue <run id> -x`
 - **Precheck and pre-install:** the precheck rolls back the RPM that `ra_preinstall` installs. So running the precheck again marks `ra_preinstall` as not done, and continuing runs it again before `ra_alter`. Once `ra_update` has finished, this no longer applies.
 - **A run whose process has gone:** if the script and its command have both gone (killed, or a reboot), `--status` shows `failed: the run's process is gone`, and the jump server stops watching and prints the `--continue` command. A command that finished after the script stopped has its result picked up.
 - **Compute:** a `patchmgr` that was killed, or that ended badly with exit 0, is started again by `--watch` or `--continue`. If one stopped on warnings (`COMPUTE_PAUSE_ON_WARNINGS=1`), review them, then add `--accept-warnings` to `--watch`.
-- **Blackout:** it ends by itself after `BLACKOUT_HOURS`. If continuing takes longer than that, start a new one with `jump/oem_blackout.sh start -z <appliance> -x`.
+- **Blackout:** a record of a blackout that has already ended no longer blocks `start`. It ends by itself after `BLACKOUT_HOURS`. If continuing takes longer than that, start a new one with `jump/oem_blackout.sh start -z <appliance> -x`.
 
 ## External precheck script
 

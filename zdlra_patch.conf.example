@@ -105,6 +105,11 @@ SWITCH_VERSION_CMD=(ssh -o BatchMode=yes -o ConnectTimeout=15 admin@{switch} "sh
 # or the log. If the password has special characters, quote it: raAutomation/"p@ss".
 # Later this can be a wallet alias instead, such as "/@raAutomation".
 SQLPLUS="sqlplus"
+# Found from the running database by default (its ora_pmon_<sid> process), as root over
+# ssh has no Oracle environment and the DB home changes during ra_update. Set these
+# only if that doesn't work.
+RA_ORACLE_HOME=""
+RA_ORACLE_SID=""
 RA_SQL_CONNECT="raAutomation/<password>"
 
 # While any of these is empty, quiesce is skipped in a dry run and a real run stops

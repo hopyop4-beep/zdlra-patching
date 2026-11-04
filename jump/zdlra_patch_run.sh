@@ -696,6 +696,28 @@ step_preflight() {
     (( ${#OEM_JOBS_SUSPEND_CMD[@]} )) || warn "OEM_JOBS_SUSPEND_CMD is not set; OEM backup jobs will not be suspended."
 }
 
+# Check the phase list against the node's, before anything has started: a typo must not
+# wait until after the blackout and the OEM job suspend. "compute" runs from here.
+check_phase_list() {
+    local known p last=-1 i found node_phases=0
+    known="$(on_node "$REMOTE_SCRIPT -c $REMOTE_CONFIG --list-phases" 2>/dev/null)" \
+        || die "${NODE}: could not read the phase list from $REMOTE_SCRIPT."
+    local names=()
+    mapfile -t names <<<"$known"
+    [[ -n "$(xargs <<<"$PHASES")" ]] || die "The phase list is empty."
+    for p in $PHASES; do
+        [[ "$p" != compute ]] || continue
+        found=-1
+        for i in "${!names[@]}"; do [[ "${names[$i]}" != "$p" ]] || found=$i; done
+        (( found >= 0 )) || die "Unknown phase in the list: $p. Phases: compute ${names[*]}"
+        (( found > last )) || die "Phases must be listed once each, in this order: ${names[*]} (and compute anywhere). Got: $PHASES"
+        last=$found
+        node_phases=1
+    done
+    (( node_phases )) || has_compute || die "The phase list has nothing to run: $PHASES"
+    info "Phases: $PHASES"
+}
+
 step_precheck_start() {
     info "== precheck (on $NODE, detached) =="
     on_node "$(remote_cmd --detach precheck)" || die "Could not start the precheck on $NODE."
@@ -896,8 +918,10 @@ main() {
             [[ -z "$saved_stage" || "$saved_stage" == precheck ]] \
                 || die "Run $RUN_ID is past its precheck (at: $saved_stage). Use: $0 -z $ZDLRA --continue $RUN_ID$(xflag)"
             if [[ -n "$(state_get phases)" ]]; then load_run_settings; else save_run_settings; fi
+            check_phase_list
             info "Resuming run $RUN_ID (status: $(run_status || echo unknown))"
         else
+            check_phase_list
             step_precheck_start
         fi
         local status
@@ -905,12 +929,16 @@ main() {
         step_approve "$status"
         step_blackout_start
         step_jobs_suspend
-        start_stage before "$(phases_before)"
+        if [[ -n "$(phases_before)" ]]; then
+            start_stage before "$(phases_before)"
+        else
+            state_set stage=before started=1
+        fi
     fi
 
     # The node phases before compute, then compute from here, then the rest.
     if [[ "$stage" == before ]]; then
-        watch_until_done >/dev/null || patch_failed
+        [[ -z "$(phases_before)" ]] || watch_until_done >/dev/null || patch_failed
         if has_compute; then
             state_set stage=compute
             step_compute
@@ -933,7 +961,8 @@ main() {
     fi
 
     if [[ "$stage" != verify ]]; then
-        watch_until_done >/dev/null || patch_failed
+        # With only compute in the list, there is nothing on the node to wait for.
+        [[ -z "$(phases_before)$(phases_after)" ]] || watch_until_done >/dev/null || patch_failed
         info "Run $RUN_ID completed on $NODE."
         step_jobs_resume
         step_blackout_stop

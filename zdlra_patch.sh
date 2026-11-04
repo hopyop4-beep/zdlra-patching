@@ -58,6 +58,7 @@
 #                       done, because the precheck rolls back what it installed
 #   -s, --status        show the state of the latest run, or of --run-id ID
 #       --report        show the report of the latest run, or of --run-id ID
+#       --list-phases   print the phase names, in order (for the jump server's checks)
 #       --skip-backup-wait  quiesce does not wait for incoming backups to finish
 #       --expect-compute    this run upgrades the compute nodes (the jump server passes
 #                       it), so one off target fails the version table; without it,
@@ -69,7 +70,7 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.7.2"
+VERSION="0.7.3"
 
 ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells switches postcheck resume report verify)
 
@@ -84,6 +85,7 @@ DETACH=0
 APPROVE_MODE=0
 BG_CHILD=0                      # set internally on the detached process
 STATUS_MODE=0
+RUN_NEW=0                       # 1 = this invocation created the run's folder
 EXPECT_COMPUTE=0
 REPORT_MODE=0
 FINAL_STATUS=""                 # status to record on success instead of "completed"
@@ -171,6 +173,12 @@ SWITCH_VERSION_CMD=(ssh -o BatchMode=yes -o ConnectTimeout=15 admin@{switch} "sh
 
 # SQL on the appliance, as the raAutomation account (see the config example).
 SQLPLUS="sqlplus"
+# Root over plain ssh has no Oracle environment, and the DB home changes during
+# ra_update. So by default each SQL step finds them from the running database: the SID
+# from its ora_pmon_<sid> process, the home from that process's binary. Set these only
+# if that doesn't work.
+RA_ORACLE_HOME=""
+RA_ORACLE_SID=""
 RA_SQL_CONNECT=""               # e.g. raAutomation/<password>; empty = SQL steps not set up
 # Each query prints one value per line; the count queries print a single number.
 # {server} in the statements is a remote_ra_dbname from REPLICATION_SERVERS_SQL.
@@ -276,6 +284,8 @@ on_exit() {
         fi
     fi
     if (( LOCK_HELD && ! LOCK_HANDED_OFF )); then rm -f "$LOCK_FILE"; fi
+    # Refused before taking the lock: leave no empty run, which --status would show as latest.
+    if (( RUN_NEW && ! LOCK_HELD )) && [[ -n "$RUN_DIR" ]]; then rm -rf -- "$RUN_DIR"; fi
 }
 trap on_exit EXIT
 # Stopped by a signal: exit non-zero, or on_exit would record the run as completed.
@@ -346,6 +356,7 @@ parse_args() {
             --continue)      CONTINUE=1; shift ;;
             -s|--status)     STATUS_MODE=1; shift ;;
             --report)        STATUS_MODE=1; REPORT_MODE=1; shift ;;
+            --list-phases)   printf '%s\n' "${ALL_PHASES[@]}"; exit 0 ;;
             --bg-child)      BG_CHILD=1; ASSUME_YES=1; shift ;;
             -h|--help)       usage; exit 0 ;;
             all)             PHASES+=("${ALL_PHASES[@]}"); shift ;;
@@ -405,10 +416,11 @@ init_run() {
         RUN_ID="$(date +%Y%m%d_%H%M%S)"
         RUN_DIR="${WORK_DIR}/${RUN_ID}"
         mkdir -p "$RUN_DIR"
+        RUN_NEW=1
     fi
     LOG_FILE="${RUN_DIR}/zdlra_patch.log"
     (( ! EXPECT_COMPUTE )) || touch "${RUN_DIR}/expect_compute"
-    info "$SCRIPT_NAME $VERSION  run=$RUN_ID  dry_run=$DRY_RUN  background=$BACKGROUND  phases=${PHASES[*]}"
+    info "$SCRIPT_NAME $VERSION  run=$RUN_ID  dry_run=$DRY_RUN  background=$BACKGROUND  phases=${PHASES[*]-}"
     (( BG_CHILD )) && info "Running detached as pid $$."
     [[ "$(id -un)" == "$REQUIRED_USER" ]] || die "Run as $REQUIRED_USER (current: $(id -un))."
     [[ -x "$RACLI" ]] || die "racli not found at $RACLI"
@@ -609,7 +621,7 @@ precheck_fingerprint() {
 }
 
 # A field from the staged record (archive, sha256, staged_at, ...), or empty.
-staged_value() { sed -n "s/^$1=//p" "$STAGED_RECORD" 2>/dev/null | head -1; }
+staged_value() { { sed -n "s/^$1=//p" "$STAGED_RECORD" 2>/dev/null || true; } | head -1; }
 
 # Ask the operator to accept the precheck results and record who did, and when.
 # --yes does not skip this; it needs a terminal.
@@ -647,7 +659,7 @@ approve_precheck() {
     } >&2
 
     local reply
-    read -r -p "Review the precheck output, then type APPROVE to continue: " reply
+    read -r -p "Review the precheck output, then type APPROVE to continue: " reply || true    # no input counts as "no"
     [[ "$reply" == "APPROVE" ]] || die "Precheck not approved."
 
     local approver="${SUDO_USER:-$(logname 2>/dev/null || id -un)}"
@@ -693,9 +705,30 @@ sql_ready() { [[ -n "$RA_SQL_CONNECT" && "$RA_SQL_CONNECT" != *"<password>"* ]];
 
 # Run SQL as raAutomation and print the result rows, trimmed. Fails on ORA-/SP2- errors.
 # The connect string is passed on stdin, so it never shows in the process list.
+# Set the Oracle environment for sqlplus, for this subshell. See RA_ORACLE_HOME. With
+# no database process found here, whatever environment there is stays as it is.
+sql_env_set() {
+    local home="$RA_ORACLE_HOME" sid="$RA_ORACLE_SID" line exe
+    if [[ -z "$home" || -z "$sid" ]]; then
+        line="$(ps -eo pid=,args= 2>/dev/null | awk '$2 ~ /^ora_pmon_/ { print $1, $2; exit }' || true)"
+        if [[ -n "$line" ]]; then
+            [[ -n "$sid" ]] || sid="${line##*ora_pmon_}"
+            if [[ -z "$home" ]]; then
+                exe="$(readlink "/proc/${line%% *}/exe" 2>/dev/null || true)"
+                [[ "$exe" != */bin/oracle ]] || home="${exe%/bin/oracle}"
+            fi
+        fi
+    fi
+    if [[ -n "$home" ]]; then
+        export ORACLE_HOME="$home" PATH="${home}/bin:${PATH}" LD_LIBRARY_PATH="${home}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+    [[ -z "$sid" ]] || export ORACLE_SID="$sid"
+    return 0
+}
+
 sql_rows() {
     local out
-    out="$("$SQLPLUS" -S -L /nolog <<EOF
+    out="$(sql_env_set; "$SQLPLUS" -S -L /nolog <<EOF
 whenever sqlerror exit failure
 connect $RA_SQL_CONNECT
 set heading off feedback off pagesize 0 linesize 400 trimspool on verify off
@@ -1635,7 +1668,7 @@ version_summary() {
 # ---------------------------------------------------------------------------
 # Did this run pause any replication (resumed or not)?
 run_paused_replication() {
-    cat "${RUN_DIR}"/replication_paused*.txt 2>/dev/null | grep -q .
+    grep -qs . "${RUN_DIR}"/replication_paused*.txt
 }
 
 phase_verify() {

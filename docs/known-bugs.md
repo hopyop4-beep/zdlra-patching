@@ -4,8 +4,7 @@ From a code review of all the code on `main` (commit 59ab2d5), on 2026-11-03. No
 are fixed yet. Line numbers are from that commit. Almost all of this also applies to the
 `platinum` branch, which has its own list in `docs/platinum-known-bugs.md`.
 
-**Bugs 1-22, 25, 28, 29 and 43-47 are fixed (2026-11-03), tested with stand-ins only.** The rest are
-still open. Even a dry run executes the real precheck, which changes the system.
+**Bugs 1-33 and 43-47 are fixed (2026-11-03), tested with stand-ins only.** The rest are still open. Even a dry run executes the real precheck, which changes the system.
 
 How far each finding was checked:
 
@@ -100,29 +99,28 @@ Found and fixed while testing these:
     `patchmgr` itself ran on, it looked finished. The check and the start guard now look for
     `patchmgr -dbnodes` too. A surviving one is waited for, and a new start is refused.
 
+## Fixed: other bugs (23-33)
+
+Fixed on `main`, tested with stand-ins on a PC only. The items marked "check" depend on real output.
+
+23. **A blackout record that had expired blocked `start`.** `start` and `stop` now ask `emcli`. If the
+    details clearly say it has ended, the record is set aside; if in doubt, it still blocks. Check: what
+    `get_blackout_details` prints for an ended blackout.
+24. **`sqlplus` had no Oracle environment.** Each SQL step now finds `ORACLE_HOME` and `ORACLE_SID` from the
+    running `ora_pmon_<sid>` process, so it follows the new home after `ra_update`. `RA_ORACLE_HOME` and
+    `RA_ORACLE_SID` override it. Check: that it connects as root.
+26. **Bad phase lists failed late.** Preflight now checks the list against the node's, before the precheck
+    starts. A list starting with `compute`, or only `compute`, now works.
+27. **`oem_blackout.sh`:** a. Reasons are read first and matched whole, so a valid one can't be falsely
+    rejected. Check: each reason is on a line of its own. b. `targets` uses `%NAME%:%`. Check against
+    the `emcli` docs.
+30. **On bash older than 4.4, `--approve` failed.** The empty phase list is now guarded.
+31. **`verify` could falsely say no replication was paused.** It now reads the files directly.
+32. **An empty `STAGED_RECORD` crashed the precheck.** It no longer does.
+33. **A refused run left an empty folder.** A run refused before it takes the lock now removes its folder.
+
 ## Other bugs
 
-23. **A blackout record that has expired blocks `start`** (`jump/oem_blackout.sh:110`). The README's
-    recovery step (line 119) fails, `stop` can fail too, and preflight blocks the next run until
-    someone deletes the file.
-24. **`sqlplus` has no `ORACLE_HOME` or `ORACLE_SID` set up** (`zdlra_patch.sh:167`). Root over a
-    non-login ssh is unlikely to have them, and the DB home changes during `ra_update`, so a fixed
-    path in the conf goes stale.
-26. **Bad phase lists fail late** (`jump/zdlra_patch_run.sh:148`, `:742`, `:822`). A typo in `-p`, or a
-    list starting with `compute`, only fails after the blackout and about 30 minutes of job suspend.
-    Validate up front.
-27. **`oem_blackout.sh`:**
-    - a. A valid reason can be rejected (`:105`), because `grep -q` under `pipefail` can falsely fail.
-      `-F` also accepts part of a reason.
-    - b. `targets` may list nothing (`:96`): `get_targets -targets=%NAME%` probably filters on type.
-      Check against the `emcli` docs.
-30. **On bash older than 4.4, `--approve` fails** (`zdlra_patch.sh:393`) with "PHASES: unbound
-    variable", because of an unguarded empty array.
-31. **`verify` can falsely say no replication was paused** (`zdlra_patch.sh:1463`): `cat | grep -q .`
-    under `pipefail`.
-32. **An empty `STAGED_RECORD` crashes the precheck** (`zdlra_patch.sh:481`), though `:761` accepts it.
-33. **A refused run leaves an empty folder that `--status` shows as the latest** (`zdlra_patch.sh:390`).
-    The run folder is created before the lock is taken.
 34. **The OEM jobs check compares clocks across what may be a shared mount**
     (`jump/zdlra_patch_run.sh:224`). Skew can make it miss the new script. Create the marker inside
     `OEM_JOBS_DIR`.
