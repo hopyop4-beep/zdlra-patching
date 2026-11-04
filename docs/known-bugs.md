@@ -171,3 +171,68 @@ Each node's archive is now hashed once per run (half of bug 40).
     - Snapshot files hold only the command's output, so the before/after diff shows real changes.
 42. **Stale docs:** the status text, roadmap items, switches in the approval and warning lists, and the old
     precheck example are all corrected.
+
+## Second review of `main` (2026-11-04): open
+
+Found by a second review of commit 20097c2. Items 49-54 and 57 were confirmed by reading the code, and 79
+by running it. The others are the review's findings. None has run on a real appliance. Line numbers are from that commit.
+
+### Could repeat a patch, or do the wrong thing
+
+49. **A brief ssh failure can re-run a finished `-upgrade`** (`jump/zdlra_patch_run.sh:512`, `:553`). A failed log
+    copy looks like a failed `patchmgr`, and the good result is overwritten with `98`, so `--watch` upgrades again.
+50. **The upgrade pickup reads a failed ssh as "no pid file"** (`jump/zdlra_patch_run.sh:628`), so it can also start
+    a second `-upgrade`.
+51. **`--continue` can treat a half-finished run as done** (`jump/zdlra_patch_run.sh:1043`). Any by-hand command that
+    succeeds writes `completed`, so the jump server moves on to compute, or resumes the jobs and ends the blackout.
+52. **A compute precheck that fails fast restarts forever** (`jump/zdlra_patch_run.sh:610`), and each restart wipes
+    its log.
+53. **A rerun precheck can reuse an old pre-install result** (`zdlra_patch.sh:872`), so `ra_alter` and `ra_update` run
+    with the RPM rolled back.
+54. **A result can be lost** (`zdlra_patch.sh:1274`). It's marked collected before the step is recorded as done, so a
+    stop in between re-runs a good `-patch` or `--upgrade`.
+55. **`blackout_over` is too loose** (`jump/oem_blackout.sh:97`). Any "not found", even an error, counts as ended.
+
+### Could hang or leave things on
+
+56. **`--continue` after re-approving a precheck watches forever** (`jump/zdlra_patch_run.sh:780`).
+57. **`--resume` on an expired approval is only refused after the blackout and job suspend** (`:795`).
+58. **`postcheck` fails on cells or switches the run left out** (`zdlra_patch.sh:1745`), before `resume`.
+59. **The `NOT ALL BACKUPS ARE BACK ON` warning can be lost** (`jump/zdlra_patch_run.sh:1001`), and `verify` still waits
+    for backups that can't arrive.
+60. **Ctrl-C during the blackout start or job suspend says "nothing has changed"** (`:750`), with no undo commands.
+61. **`--keep-blackout` added on a pickup isn't saved** (`:379`).
+62. **`--watch` during compute pass 2 fails while node 1 reboots** (`:421`).
+63. **File checks run before a leftover result is picked up** (`zdlra_patch.sh:1054`).
+64. **A partly failed `resume` retries servers that already resumed** (`zdlra_patch.sh:947`).
+65. **`admin_switches` shows as done when skipped** (`zdlra_patch.sh:1576`), so enabling it later and using
+    `--continue` won't run it.
+66. **The blackout reason check can still falsely fail** (`jump/oem_blackout.sh:117`): a pipe under `pipefail`.
+
+### Lower risk
+
+67. **A failed staging copy leaves `.part`, and free space is checked after the old archive is removed**
+    (`staging/zdlra_stage.sh:694`).
+68. **An interrupted move or unzip can become the kept backup** (`staging/zdlra_stage.sh:896`, `:766`).
+69. **A brief ssh failure can make a staged node look unstaged** (`staging/zdlra_stage.sh:260`).
+70. **After a reboot, a reused pid can make a dead run look alive** (`zdlra_patch.sh:440`).
+71. **Compute restarts wipe the previous attempt's log** (`jump/zdlra_patch_run.sh:463`).
+72. **A slow compute start can report "did not start" while it's running** (`:467`).
+73. **A signal right at a command's start can drop its lock** (`zdlra_patch.sh:1228`).
+74. **After the last compute pass, the run only waits for ssh, not the database** (`jump/zdlra_patch_run.sh:678`).
+75. **Two pickups of one run aren't prevented** (`:901`), and could both resume the jobs.
+76. **`postcheck` starts the Oracle precheck with no running-command guard** (`zdlra_patch.sh:1953`).
+77. **The free-space and SQL checks only run after the long precheck** (`zdlra_patch.sh:873`).
+78. **Bad compute settings only show up hours into the window** (`jump/zdlra_patch_run.sh:646`).
+79. **`--status` with no runs crashes** (`zdlra_patch.sh:458`).
+80. **The `--relay` copy has no keepalive** (`staging/zdlra_stage.sh:689`).
+
+### Docs and cleanup
+
+81. **Stale docs:** `SWITCH_TYPE` (`README.md:20`, `zdlra_patch.conf.example:88`), the cell version check (`README.md:19`),
+    the phase lists (`README.md:180`, `zdlra_patch.conf.example:45`), the precheck timeout (`zdlra_patch.conf.example:21`),
+    this file's opening lines, and a comment above the wrong function (`staging/zdlra_stage.sh:619`).
+82. **Design:** the jump server decides progress from one status word. It should compare a stage's phases against the
+    node's `phases_done` (root of 51 and 56).
+83. **Duplicates:** three "is a patch running" checks that have drifted apart. `phase_admin_switches` is a copy of
+    `phase_switches`. The compute log polling uses two ssh sessions per check.
