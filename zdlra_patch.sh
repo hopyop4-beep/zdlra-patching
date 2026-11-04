@@ -66,7 +66,7 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.7.0"
+VERSION="0.7.1"
 
 ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells switches postcheck resume report verify)
 
@@ -104,7 +104,7 @@ PRECHECK_ARGS=(-srnumber={sr_number})
 PRECHECK_CWD=""                 # folder to run it from; empty = the script's own folder
 # Added for the actual patching event (a run with --execute), not for dry runs.
 PRECHECK_EVENT_ARGS=(-recheck_all)
-PRECHECK_TIMEOUT=3600           # seconds before the precheck is killed
+PRECHECK_WARN_MINUTES=60        # a warning only: the precheck is never stopped
 PRECHECK_SUMMARY_HEADER="FAILURE SUMMARY"   # failures are read from after this line
 PRECHECK_FAIL_PATTERN='\[FAIL\]'            # extended regex for a failure line
 PRECHECK_WARN_PATTERN='\[WARN\]'            # extended regex for a warning line
@@ -139,8 +139,10 @@ RA_UPDATE_WARN_MINUTES=240      # about 2 hours in one sample
 CELL_GROUP_FILE="/root/cell_group"
 CELL_PATCH_TMP_DIR="/radump/patches/tmp"     # where staging unzipped the cell patch
 CELL_PATCH_FILES_DIR="/radump/patches/patches"
-# Run in this order before the patch itself.
-CELL_PREP_STEPS=(-patch_check_prereq -reset_force -cleanup)
+# Before the patch: the prereq check. Only if it fails: these steps, in order, then the
+# prereq check again; a second failure stops for review.
+CELL_PREREQ_STEP=-patch_check_prereq
+CELL_RECOVERY_STEPS=(-reset_force -cleanup)
 # Added to "patchmgr -cells <group> -patch", e.g. (-ignore_alerts) or
 # (-smtp_from "addr" -smtp_to "addr1 addr2").
 CELL_PATCH_EXTRA_ARGS=()
@@ -272,6 +274,13 @@ on_exit() {
     if (( LOCK_HELD && ! LOCK_HANDED_OFF )); then rm -f "$LOCK_FILE"; fi
 }
 trap on_exit EXIT
+# Stopped by a signal: exit non-zero, or on_exit would record the run as completed.
+script_signal_traps() {
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+}
+script_signal_traps
 
 # Take the lock. A detached process takes it over from the process that started it:
 # that process writes the detached pid into the lock before exiting, so the lock is
@@ -363,6 +372,8 @@ load_config() {
         # shellcheck source=/dev/null
         source "$CONFIG_FILE"
         config_password_check
+        [[ -z "${CELL_PREP_STEPS[*]+x}" ]] || warn "CELL_PREP_STEPS in $CONFIG_FILE is no longer used: see CELL_PREREQ_STEP and CELL_RECOVERY_STEPS."
+        [[ -z "${PRECHECK_TIMEOUT+x}" ]] || warn "PRECHECK_TIMEOUT in $CONFIG_FILE is no longer used: the precheck is never stopped (PRECHECK_WARN_MINUTES only warns)."
     else
         warn "Config file $CONFIG_FILE not found; using built-in defaults."
     fi
@@ -448,14 +459,17 @@ log_item_changes() {
     LC_ALL=C comm -23 "$1" "$2" | while IFS= read -r name; do info "  $3 resolved by patching: $name"; done
 }
 
-# Run the external precheck script. It is read-only, so it runs in dry-run mode too.
+# Run the external precheck script, in dry-run mode too, so a dry run gives real
+# answers. It is not read-only: it installs and rolls back an RPM and moves the gold
+# images. So, like patchmgr and racli, it runs in a session of its own and is never
+# stopped by this script (run_detached).
 # Failures and warnings are read from the lines after PRECHECK_SUMMARY_HEADER, e.g.
 #   FAILURE SUMMARY
 #   ***********************************
 #   <date> [FAIL] <failure name>
 #   <date> [WARN] <warning name>
 # The phase fails on any failure not listed in PRECHECK_WAIVERS (and on warnings too
-# when PRECHECK_FAIL_ON_WARN=1), a timeout, or a non-zero exit code with no summary.
+# when PRECHECK_FAIL_ON_WARN=1), or a non-zero exit code with no summary.
 # Files written to precheck_<label>/:
 #   output.txt          full output
 #   failures.txt        failure lines from the summary
@@ -500,13 +514,14 @@ run_external_precheck() {
     fi
     local cwd="${PRECHECK_CWD:-$(dirname "$PRECHECK_SCRIPT")}" cmd="./$(basename "$PRECHECK_SCRIPT")"
     [[ -n "$PRECHECK_CWD" ]] && cmd="$PRECHECK_SCRIPT"
-    info "Running precheck ($label): cd $cwd && $cmd ${args[*]-} (timeout ${PRECHECK_TIMEOUT}s)"
+    info "Running precheck ($label): cd $cwd && $cmd ${args[*]-}"
 
+    # A new precheck run: never reuse the result of an earlier one.
     local rc=0
-    ( cd "$cwd" && timeout "$PRECHECK_TIMEOUT" "$cmd" ${args[@]+"${args[@]}"} ) \
-        > "$out_file" 2>&1 || rc=$?
+    DETACHED_QUIET=1 DETACHED_FRESH=1 run_detached "precheck ($label)" "$cwd" "$out_file" \
+        "$PRECHECK_WARN_MINUTES" "$cmd" ${args[@]+"${args[@]}"}
+    rc="$DETACHED_RC"
     info "Precheck output: $out_file (exit code $rc)"
-    (( rc == 124 )) && die "Precheck timed out after ${PRECHECK_TIMEOUT}s."
 
     # Use the last summary section (colour codes removed). If the header is
     # missing, fall back to searching the whole output.
@@ -678,7 +693,13 @@ sql_exec() {
         return 0
     fi
     info "[exec] SQL: $1"
-    sql_rows "$1" >/dev/null
+    # SQL*Plus only runs a PL/SQL block on a "/" line. A plain statement ends with ";":
+    # it must not get one, or it would run twice.
+    local stmt="$1"
+    if grep -qiE '^[[:space:]]*(begin|declare)([[:space:]]|$)' <<<"$stmt" && [[ "$stmt" != */ ]]; then
+        stmt+=$'\n/'
+    fi
+    sql_rows "$stmt" >/dev/null
 }
 
 # Which SQL settings are still empty (TODO placeholders).
@@ -934,9 +955,12 @@ phase_ra_preinstall() {
         return 0
     fi
     [[ -f "$rel" ]] || die "ZDLRA software zip not found: $rel"
-    confirm "Run '$RACLI ${args[*]}'?"
+    # With a result left by an earlier attempt, nothing runs: keep that attempt's marker.
     local marker="${RUN_DIR}/.ra_preinstall.start"
-    touch "$marker"
+    if ! pending_result "${RUN_DIR}/ra_preinstall.log"; then
+        confirm "Run '$RACLI ${args[*]}'?"
+        touch "$marker"
+    fi
     run_racli_step preinstall "$RA_PREINSTALL_WARN_MINUTES" "$RA_PREINSTALL_SUCCESS" "${args[@]}"
     local log="${RUN_DIR}/ra_preinstall.log" failed
     failed="$(grep -E "$RA_PREINSTALL_FAIL_RE" "$log" | head -20 || true)"
@@ -963,7 +987,7 @@ phase_ra_alter() {
     fi
     [[ -n "$(ra_gold_image_names)" ]] || die "The staged record names no gold images (ra_gold_images). Stage again with the current staging script."
     [[ -z "$missing" ]] || die "Gold images not in ${RA_GOLD_IMAGES_PATH}: $missing. The precheck moves them there; check its output."
-    confirm "Run '$RACLI ${args[*]}'?"
+    pending_result "${RUN_DIR}/ra_alter.log" || confirm "Run '$RACLI ${args[*]}'?"
     run_racli_step alter "$RA_ALTER_WARN_MINUTES" "$RA_ALTER_SUCCESS" "${args[@]}"
 }
 
@@ -976,7 +1000,7 @@ phase_ra_update() {
         info "[dry-run] $RACLI ${args[*]}  (success: '$RA_UPDATE_SUCCESS'; target ${target:-not set})"
         return 0
     fi
-    confirm "Run '$RACLI ${args[*]}'? It stops the appliance services while it patches (about 2 hours)."
+    pending_result "${RUN_DIR}/ra_update.log" || confirm "Run '$RACLI ${args[*]}'? It stops the appliance services while it patches (about 2 hours)."
     run_racli_step update "$RA_UPDATE_WARN_MINUTES" "$RA_UPDATE_SUCCESS" "${args[@]}"
     ver="$("$RACLI" version 2>&1 || true)"
     printf '%s\n' "$ver" >> "$LOG_FILE"
@@ -1053,6 +1077,8 @@ DETACHED_LOG=""
 DETACHED_WHAT=""
 DETACHED_RC=""
 DETACHED_POLL_SECONDS=10
+DETACHED_QUIET=0                # 1 = do not show the log as it grows, or add it to the run log
+DETACHED_FRESH=0                # 1 = always run the command, ignoring a result left by an earlier attempt
 
 detached_pidfile() { echo "${RUN_DIR}/detached.pid"; }
 
@@ -1079,18 +1105,39 @@ detached_leave_running() {
 }
 
 detached_on_signal() {
-    trap - INT TERM HUP
+    script_signal_traps
     detached_leave_running || true
     exit 1
 }
 
+# Did an earlier attempt leave this command's result, not yet picked up? That happens
+# when this script stopped while the command ran on to the end.
+pending_result() { [[ -s "${1}.rc" ]]; }
+
 # run_detached WHAT DIR LOG WARN_MINUTES COMMAND [ARGS...]
-# Runs COMMAND in DIR, detached as above; sets DETACHED_RC to its exit status.
+# Runs COMMAND in DIR, detached as above; sets DETACHED_RC to its exit status. If an
+# earlier attempt left a result (pending_result), that is used and the command is NOT
+# run again. Each result is picked up once: a failed step does run again next time.
 run_detached() {
     local what="$1" dir="$2" log="$3" warn_min="$4"; shift 4
-    local rcfile="${log}.rc" pidfile
+    local rcfile="${log}.rc" pidfile running
     pidfile="$(detached_pidfile)"
+    if running="$(detached_running)"; then
+        DETACHED_PID=""
+        die "Not starting $what: this run's last command is still running ($running)."
+    fi
+    if (( ! DETACHED_FRESH )) && pending_result "$log"; then
+        DETACHED_RC="$(tr -dc '0-9' < "$rcfile")"
+        mv -f -- "$rcfile" "${rcfile}.collected"
+        rm -f -- "$pidfile"
+        warn "$what already finished in an earlier attempt (exit $DETACHED_RC): using that result, not running it again. Log: $log"
+        (( DETACHED_QUIET )) || cat "$log" >> "$LOG_FILE"
+        (( DETACHED_RC != 97 )) || die "$what: cannot enter $dir. Log: $log"
+        return 0
+    fi
     rm -f -- "$rcfile" "$pidfile"
+    # Keep the log of an earlier attempt: it may be the only record of what happened.
+    [[ ! -s "$log" ]] || mv -f -- "$log" "${log}.$(date +%Y%m%d_%H%M%S)"
     : > "$log"
     info "[exec] cd $dir && $* (own session; log: $log)"
 
@@ -1100,21 +1147,30 @@ run_detached() {
     else
         warn "setsid not found: $what runs with nohup only."
     fi
-    # The inner bash records its pid, runs the command, then writes the exit status.
-    "${launcher[@]}" bash -c 'echo $$ > "$1"; cd "$2" || exit 97; shift 3; "$@"; echo $? > "$0"' \
-        "$rcfile" "$pidfile" "$dir" _ "$@" >> "$log" 2>&1 < /dev/null &
-    local waited=0
-    while [[ ! -s "$pidfile" ]] && (( waited < 30 )); do sleep 1; waited=$((waited + 1)); done
-    DETACHED_PID="$(cat "$pidfile" 2>/dev/null)"
+    # Set first, so a signal at any moment from here leaves the command alone and hands
+    # it the lock.
     DETACHED_LOG="$log"
     DETACHED_WHAT="$what"
-    [[ -n "$DETACHED_PID" ]] || die "$what did not start. Log: $log"
     trap detached_on_signal INT TERM HUP
+    # The inner bash records its pid, runs the command, then writes the exit status.
+    "${launcher[@]}" bash -c 'echo $$ > "$1"; cd "$2" || { echo 97 > "$0"; exit 97; }; shift 3; "$@"; echo $? > "$0"' \
+        "$rcfile" "$pidfile" "$dir" _ "$@" >> "$log" 2>&1 < /dev/null &
+    DETACHED_PID=$!
+    # However slow the start, wait for its own record of its pid while it is alive.
+    while [[ ! -s "$pidfile" && ! -s "$rcfile" ]] && kill -0 "$DETACHED_PID" 2>/dev/null; do sleep 1; done
+    if [[ -s "$pidfile" ]]; then
+        DETACHED_PID="$(cat "$pidfile")"
+    elif [[ ! -s "$rcfile" ]]; then
+        DETACHED_PID=""
+        script_signal_traps
+        die "$what did not start. Log: $log"
+    fi
 
     # Show the log as it grows: print the lines added since the last look, and once
     # more at the end so nothing is missed.
     local shown=0 start warned=0
     show_new_lines() {
+        (( ! DETACHED_QUIET )) || return 0
         local total
         total=$(wc -l < "$log")
         (( total > shown )) && sed -n "$(( shown + 1 )),${total}p" "$log" >&2
@@ -1128,6 +1184,7 @@ run_detached() {
             [[ -s "$rcfile" ]] && break
             show_new_lines
             DETACHED_PID=""
+            script_signal_traps
             die "$what ended without an exit status (was it killed?). Log: $log"
         fi
         if (( ! warned && $(date +%s) - start > warn_min * 60 )); then
@@ -1137,27 +1194,41 @@ run_detached() {
         sleep "$DETACHED_POLL_SECONDS"
     done
     show_new_lines
-    trap - INT TERM HUP
+    script_signal_traps
     DETACHED_RC="$(tr -dc '0-9' < "$rcfile")"
     DETACHED_PID=""
+    mv -f -- "$rcfile" "${rcfile}.collected"
     rm -f -- "$pidfile"
-    cat "$log" >> "$LOG_FILE"
+    (( DETACHED_QUIET )) || cat "$log" >> "$LOG_FILE"
     (( DETACHED_RC != 97 )) || die "$what: cannot enter $dir. Log: $log"
 }
 
-# A command this run started, or any "patchmgr -cells", "patchmgr --roceswitches" or racli upgrade step on this
-# node, still running: prints "pid N (command)".
+# Reads "pid args" lines (ps -eo pid=,args=); prints the first that is a patchmgr run,
+# a racli upgrade step or the Oracle precheck ($1 = its file name), however it was
+# started: by full path, through bash, or in run_detached's wrapper.
+find_long_command() {
+    awk -v pc="$1" '{
+        for (i = 2; i <= NF; i++) {
+            if ($i ~ /(^|\/)patchmgr$/ && $0 ~ / (-cells|--roceswitches|-dbnodes) /) { print; exit }
+            if ($i ~ /(^|\/)racli$/ && ($(i+1) " " $(i+2)) ~ /^(run preinstall|alter appliance|update appliance)/) { print; exit }
+            if (pc != "" && substr($i, length($i) - length(pc)) == "/" pc) { print; exit }
+        }
+    }'
+}
+
+# A command this run started, or any such command on this node, still running: prints
+# "pid N (command)".
 long_command_running() {
     local line
     detached_running && return 0
     if ps -eo pid=,args= >/dev/null 2>&1; then
-        line="$(ps -eo pid=,args= | awk '($2 ~ /patchmgr$/ && (/ -cells / || / --roceswitches /)) || / racli (run preinstall|alter appliance|update appliance)/ { print; exit }')"
+        line="$(ps -eo pid=,args= | find_long_command "$(basename "${PRECHECK_SCRIPT:-}")")"
         [[ -n "$line" ]] && { echo "pid ${line# }"; return 0; }
     fi
     return 1
 }
 
-# Called before a cells or RA phase is marked as running, so a refusal leaves the
+# Called before a precheck, cells, switches or RA phase is marked as running, so a refusal leaves the
 # run's status as it is.
 refuse_if_running() {
     local running
@@ -1167,11 +1238,23 @@ refuse_if_running() {
     fi
 }
 
+# The steps that must not run twice once they have worked (cells -patch, switches
+# --upgrade), one per line in <run dir>/steps_done, so --continue skips them.
+step_done() { [[ -f "${RUN_DIR}/steps_done" ]] && grep -qxF "$1" "${RUN_DIR}/steps_done"; }
+step_mark_done() { step_done "$1" || echo "$1" >> "${RUN_DIR}/steps_done"; }
+
 # Run one patchmgr command from the patch folder, never cut short (run_detached).
 # Success: exit 0, "SUCCESS: Completed run of command", "Exit status:0", and no
-# FAILED lines. $1 = cells | switches (log <prefix>_<name>.log), $2 = folder,
-# $3 = log name, rest = patchmgr arguments.
+# FAILED lines. Stops the run if it fails.
+# $1 = cells | switches (log <prefix>_<name>.log), $2 = folder, $3 = log name, rest =
+# patchmgr arguments.
 run_patchmgr() {
+    patchmgr_attempt "$@" || die "$PATCHMGR_PROBLEM"
+}
+
+# The same, but a failure returns 1 with the reason in PATCHMGR_PROBLEM.
+PATCHMGR_PROBLEM=""
+patchmgr_attempt() {
     local prefix="$1" dir="$2" name="$3"; shift 3
     local log="${RUN_DIR}/${prefix}_${name}.log" rc step="-$name" warn_min="$CELL_PATCH_WARN_MINUTES"
     [[ "$prefix" == switches ]] && warn_min="$SWITCH_PATCH_WARN_MINUTES"
@@ -1181,11 +1264,17 @@ run_patchmgr() {
     failed="$(grep -E 'FAILED' "$log" | head -10 || true)"
     if [[ -n "$failed" ]]; then
         while IFS= read -r line; do err "  $line"; done <<<"$failed"
-        die "patchmgr $step reported failures. Log: $log"
+        PATCHMGR_PROBLEM="patchmgr $step reported failures. Log: $log"
+        return 1
     fi
-    (( rc == 0 )) || die "patchmgr $step exited with code $rc. Log: $log"
-    grep -q 'SUCCESS: Completed run of command' "$log" && grep -q 'Exit status:0' "$log" \
-        || die "patchmgr $step did not report a completed run (no 'SUCCESS: Completed run of command' / 'Exit status:0'). Log: $log"
+    if (( rc != 0 )); then
+        PATCHMGR_PROBLEM="patchmgr $step exited with code $rc. Log: $log"
+        return 1
+    fi
+    if ! { grep -q 'SUCCESS: Completed run of command' "$log" && grep -q 'Exit status:0' "$log"; }; then
+        PATCHMGR_PROBLEM="patchmgr $step did not report a completed run (no 'SUCCESS: Completed run of command' / 'Exit status:0'). Log: $log"
+        return 1
+    fi
     info "patchmgr $step: completed."
 }
 
@@ -1205,6 +1294,23 @@ check_cell_versions() {
     (( bad == 0 )) || die "$bad cell(s) not on $target."
 }
 
+# The prereq check before the patch. Only if it fails: the recovery steps, then the
+# check again. A second failure stops the run for review.
+cell_prereq() {
+    local dir="$1" step name="${CELL_PREREQ_STEP#-}"
+    if patchmgr_attempt cells "$dir" "$name" -cells "$CELL_GROUP_FILE" "$CELL_PREREQ_STEP"; then
+        return 0
+    fi
+    warn "$PATCHMGR_PROBLEM"
+    warn "The prereq check failed: running ${CELL_RECOVERY_STEPS[*]}, then checking again."
+    for step in "${CELL_RECOVERY_STEPS[@]}"; do
+        run_patchmgr cells "$dir" "${step#-}" -cells "$CELL_GROUP_FILE" "$step"
+    done
+    patchmgr_attempt cells "$dir" "${name}2" -cells "$CELL_GROUP_FILE" "$CELL_PREREQ_STEP" \
+        || die "The prereq check failed again after ${CELL_RECOVERY_STEPS[*]}: stopping for review. $PATCHMGR_PROBLEM"
+    info "The prereq check passed after ${CELL_RECOVERY_STEPS[*]}."
+}
+
 phase_cells() {
     info "== cells =="
     local loc dir target
@@ -1215,19 +1321,27 @@ phase_cells() {
     [[ -n "$target" ]] || die "TARGET_CELL_VERSION is not set in $(staged_value patch_conf)."
     info "Cell patch folder: $dir; cells: $(paste -sd' ' "$CELL_GROUP_FILE"); target: $target"
 
-    local step
     if (( DRY_RUN )); then
-        for step in "${CELL_PREP_STEPS[@]}"; do info "[dry-run] cd $dir && ./patchmgr -cells $CELL_GROUP_FILE $step"; done
+        info "[dry-run] cd $dir && ./patchmgr -cells $CELL_GROUP_FILE $CELL_PREREQ_STEP"
+        info "[dry-run]   only if that fails: ${CELL_RECOVERY_STEPS[*]}, then $CELL_PREREQ_STEP again (a second failure stops)"
         info "[dry-run] cd $dir && ./patchmgr -cells $CELL_GROUP_FILE -patch ${CELL_PATCH_EXTRA_ARGS[*]-}"
         info "[dry-run] $DCLI -g $CELL_GROUP_FILE -l root 'imageinfo -ver'  (each cell must be $target)"
         return 0
     fi
 
-    for step in "${CELL_PREP_STEPS[@]}"; do
-        run_patchmgr cells "$dir" "${step#-}" -cells "$CELL_GROUP_FILE" "$step"
-    done
-    confirm "Patch the storage cells now (patchmgr -patch; the cells reboot)?"
-    run_patchmgr cells "$dir" patch -cells "$CELL_GROUP_FILE" -patch ${CELL_PATCH_EXTRA_ARGS[@]+"${CELL_PATCH_EXTRA_ARGS[@]}"}
+    # A -patch that already worked, or that finished after this script stopped, must not
+    # be repeated, and neither must the checks before it.
+    local patch_log="${RUN_DIR}/cells_patch.log"
+    if step_done cells_patch; then
+        info "patchmgr -patch already succeeded in this run; only checking the versions."
+    else
+        if ! pending_result "$patch_log"; then
+            cell_prereq "$dir"
+            confirm "Patch the storage cells now (patchmgr -patch; the cells reboot)?"
+        fi
+        run_patchmgr cells "$dir" patch -cells "$CELL_GROUP_FILE" -patch ${CELL_PATCH_EXTRA_ARGS[@]+"${CELL_PATCH_EXTRA_ARGS[@]}"}
+        step_mark_done cells_patch
+    fi
 
     info "Image version reported by patchmgr:"
     check_cell_versions "$(sed -n '/Current image version on cell(s) is:/,/For details/p' "${RUN_DIR}/cells_patch.log" | sed -E 's/^.*:INFO *: *//')" "$target"
@@ -1327,9 +1441,18 @@ phase_switches() {
         info "[dry-run] ${SWITCH_VERSION_CMD[*]}  (on each switch; must show $target)"
         return 0
     fi
-    run_patchmgr switches "$dir" precheck --roceswitches "$SWITCH_GROUP_FILE" "${SWITCH_PRECHECK_ARGS[@]}"
-    confirm "Upgrade the RoCE switches now (patchmgr --upgrade)?"
-    run_patchmgr switches "$dir" upgrade --roceswitches "$SWITCH_GROUP_FILE" "${SWITCH_UPGRADE_ARGS[@]}"
+    # An --upgrade that already worked, or that finished after this script stopped, must
+    # not be repeated, and neither must the check before it.
+    if step_done switches_upgrade; then
+        info "patchmgr --upgrade already succeeded in this run; only checking the versions."
+    else
+        if ! pending_result "${RUN_DIR}/switches_upgrade.log"; then
+            run_patchmgr switches "$dir" precheck --roceswitches "$SWITCH_GROUP_FILE" "${SWITCH_PRECHECK_ARGS[@]}"
+            confirm "Upgrade the RoCE switches now (patchmgr --upgrade)?"
+        fi
+        run_patchmgr switches "$dir" upgrade --roceswitches "$SWITCH_GROUP_FILE" "${SWITCH_UPGRADE_ARGS[@]}"
+        step_mark_done switches_upgrade
+    fi
     info "Switch versions:"
     check_switch_versions "$target"
     info "RoCE switches upgraded to $target."
@@ -1649,7 +1772,7 @@ main() {
         # Check approval before marking a changing step as running, so a refusal leaves
         # the run's status as it was.
         [[ "$p" == ra_* || "$p" == quiesce || "$p" == cells || "$p" == switches ]] && require_approval
-        [[ "$p" == ra_* || "$p" == cells || "$p" == switches ]] && refuse_if_running "$p"
+        [[ "$p" == precheck || "$p" == ra_* || "$p" == cells || "$p" == switches ]] && refuse_if_running "$p"
         CURRENT_PHASE="$p"
         set_status "running $p"
         "phase_${p}"
@@ -1657,6 +1780,13 @@ main() {
     done
 
     if (( ${#BG_PHASES[@]} )); then
+        # Refuse here, while there is someone to tell, not after detaching.
+        for p in "${BG_PHASES[@]}"; do
+            if [[ "$p" == precheck || "$p" == ra_* || "$p" == cells || "$p" == switches ]]; then
+                refuse_if_running "$p"
+                break
+            fi
+        done
         start_background
         return 0
     fi

@@ -16,7 +16,7 @@ The script breaks a patch into phases. You can run them one at a time or all tog
 | `ra_preinstall` | Runs `racli run preinstall --zdlra_release_file=<ZDLRA software zip>`, with the zip staging recorded as `ra_release=`. Success: the log reaches `End: ra_preinstall post cleanup`, no `CHECK:`/`HOST:` line says `FAIL`, and `/root/.ra_preinstall.install` is written. It must come after the precheck, which rolls back the RPM it installs |
 | `ra_alter` | Checks that both gold images (named in `ra_gold_images=`) are in `/radump`, where the precheck moves them. Then runs `racli alter appliance --online_updates --gold_images_path=/radump/`, which installs the new grid and DB homes. Success: `End: Alter Appliance` |
 | `ra_update` | Runs `racli update appliance --ignore_incidents`, which patches the appliance (about 2 hours). Success: `End: Patch Recovery Appliance - Step [Patch]`. Afterwards `racli version` should show `TARGET_RA_VERSION` from the conf file (a warning if not) |
-| `cells` | Patches the storage cells from the first compute node. Each `patchmgr` runs in a session of its own and is never stopped by the script (see below). In the cell patch folder (worked out from the `FILES_CELL` zip, because its name changes per release), it runs `patchmgr -cells /root/cell_group` with `-patch_check_prereq`, `-reset_force`, `-cleanup` and then `-patch` (plus `CELL_PATCH_EXTRA_ARGS`). Each step must report a completed run with exit status 0 and no `FAILED` lines. Afterwards every cell must be on `TARGET_CELL_VERSION` from the conf file, according to both `patchmgr` and `dcli ... imageinfo -ver` |
+| `cells` | Patches the storage cells from the first compute node. Each `patchmgr` runs in a session of its own and is never stopped by the script (see below). In the cell patch folder (worked out from the `FILES_CELL` zip, because its name changes per release), it runs `patchmgr -cells /root/cell_group -patch_check_prereq`. Only if that fails does it run `-reset_force` and `-cleanup`, then the check again; a second failure stops for review. Then `-patch` (plus `CELL_PATCH_EXTRA_ARGS`). Each step must report a completed run with exit status 0 and no `FAILED` lines. Afterwards every cell must be on `TARGET_CELL_VERSION` from the conf file, according to both `patchmgr` and `dcli ... imageinfo -ver` |
 | `switches` | Upgrades the RoCE switches from the first compute node, in the switch patch folder (worked out from the `FILES_SWITCH` zip, e.g. `patch_switch_24.1.14.0.0.250706`): `patchmgr --roceswitches /root/switch_group --upgrade --roceswitch-precheck` (about 12 minutes in one sample), then `--upgrade`. Each runs in a session of its own and is never stopped by the script, and must report a completed run with exit status 0 and no `FAILED` lines. Afterwards each switch's version (`SWITCH_VERSION_CMD`, by default `ssh admin@<switch> show version`) must show `TARGET_SWITCH_VERSION` from the conf file; a switch that can't be read only gives a warning. On an InfiniBand rack (`SWITCH_TYPE` not `roce`) the phase only warns that the switches were not patched. From the jump server it runs after `compute` |
 | `postcheck` | Runs the checks again and compares the result with the snapshot. Then shows a table of every component's version against its target: RA (`racli version`, `TARGET_RA_VERSION`), each compute node and cell (`imageinfo -ver`, `TARGET_COMPUTE_VERSION` and `TARGET_CELL_VERSION`), and each RoCE switch (`TARGET_SWITCH_VERSION`). A compute node, cell or switch on another version fails the phase; the RA line and anything that can't be read are warnings. Saved to `versions.txt` |
 | `resume` | Resumes only the replication servers that this run paused |
@@ -59,7 +59,8 @@ An interrupted `patchmgr` session or `racli` upgrade step can cause major proble
 
 - **Nothing reaches it:** stopping the script, a dropped SSH session or a closed terminal doesn't affect the command. The script only waits for it, shows its log as it grows, and reads its exit status from a file.
 - **No time limit stops it:** past `CELL_PATCH_WARN_MINUTES` (or `RA_PREINSTALL_WARN_MINUTES`, `RA_ALTER_WARN_MINUTES`, `RA_UPDATE_WARN_MINUTES`), the script only logs a warning and keeps waiting.
-- **Nothing starts over it:** the `cells` and `ra_*` phases refuse to start while a `patchmgr -cells` or `racli` upgrade step is still running on the node.
+- **Nothing starts over it:** the `precheck`, `cells`, `switches` and `ra_*` phases refuse to start while the Oracle precheck, a `patchmgr` run or a `racli` upgrade step is still running on the node, and staging refuses to replace `/radump/patches` while one is, or while a run holds the lock.
+- **A finished command is not run again:** if the script stopped while a command ran on to the end, the next attempt (`--continue`) picks up that command's result rather than running it again. A cells `-patch` or switches `--upgrade` that has worked is never repeated in the same run. The log of an earlier attempt is kept, with a date on its name.
 - **If the script itself stops while the command runs,** it says so, and leaves the command running. The run's status becomes "… still running (pid …), do not start it again until it finishes". The lock passes to the command, so nothing can start over it until it ends.
 
 ## Replication and incoming backups
@@ -142,14 +143,13 @@ FAILURE SUMMARY
 Each failure and warning is listed in the run log. The phase fails if:
 
 - there is any failure that is not in `PRECHECK_WAIVERS`
-- the script runs past `PRECHECK_TIMEOUT`
 - the script exits with a non-zero code and prints no summary
 
 Warnings and waived failures are logged but do not stop the run. To make warnings stop the run as well, set `PRECHECK_FAIL_ON_WARN=1`; waivers then apply to warnings too. If your version of the script uses a different header or tags, change `PRECHECK_SUMMARY_HEADER`, `PRECHECK_FAIL_PATTERN` or `PRECHECK_WARN_PATTERN`.
 
 Results are saved to `<run id>/precheck_before/`: the full output, plus the failure and warning lines and sorted lists of their names. By default `postcheck` runs the script again and saves the results to `precheck_after/`. It then logs which failures and warnings are new since patching and which were resolved.
 
-The script runs in dry-run mode too, because it only reads. **Do not commit the script or its output to this repo.** Get it from Oracle and keep it on the appliance.
+The script runs in dry-run mode too, so a dry run gives real answers. It is not read-only, though: it installs and rolls back an RPM and moves the gold images, so even a dry run changes the system. So, like `patchmgr` and `racli`, it runs in a session of its own and is never stopped by the script; past `PRECHECK_WARN_MINUTES` the script only logs a warning. **Do not commit the script or its output to this repo.** Get it from Oracle and keep it on the appliance.
 
 ## Running a patch from the jump server (OMS)
 
@@ -179,6 +179,8 @@ Ctrl-C only stops watching; the work on the node carries on. To pick up again:
 - `--resume <run id>`: the precheck is still running, finished, or approved (for example, you were away when it finished, or you declined at first).
 - `--watch <run id>`: the patch phases are already running.
 - `--continue <run id>`: the run failed and the problem is fixed. The node phases start again and skip the ones already done (see [Continuing after a failure](#continuing-after-a-failure)).
+
+Picking up a run uses how it was started: its phase list, `--keep-blackout` and `--skip-backup-wait` are saved on the jump server from the precheck on, so phases you left out stay left out. `-p` on a pickup is ignored with a warning. A real run must be picked up with `-x`, and a dry run without it. If a stage's phases were never confirmed as started, for example after an ssh failure, a pickup asks the node and starts them if needed.
 
 On the node itself, the same split is available as `zdlra_patch.sh --detach precheck`, followed by `zdlra_patch.sh --approve --run-id <run id>`.
 

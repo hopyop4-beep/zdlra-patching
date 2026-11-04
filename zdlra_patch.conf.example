@@ -29,7 +29,7 @@ PRECHECK_ARGS=(-srnumber={sr_number})
 PRECHECK_CWD=""                      # empty = run from the script's own folder
 # Added for the actual patching event (a run with --execute), not for dry runs:
 PRECHECK_EVENT_ARGS=(-recheck_all)
-PRECHECK_TIMEOUT=3600
+PRECHECK_WARN_MINUTES=60             # a warning only: the precheck is never stopped
 PRECHECK_SUMMARY_HEADER="FAILURE SUMMARY"
 PRECHECK_FAIL_PATTERN='\[FAIL\]'
 PRECHECK_WARN_PATTERN='\[WARN\]'
@@ -72,7 +72,10 @@ RA_UPDATE_WARN_MINUTES=240
 # Runs from the first compute node in the folder the cell patch (FILES_CELL) unzipped
 # to under /radump/patches/tmp; the folder's name is read from the zip.
 CELL_GROUP_FILE="/root/cell_group"
-CELL_PREP_STEPS=(-patch_check_prereq -reset_force -cleanup)   # before -patch, in order
+# Before -patch: the prereq check. Only if it fails: the recovery steps, in order, then
+# the check again; a second failure stops for review.
+CELL_PREREQ_STEP=-patch_check_prereq
+CELL_RECOVERY_STEPS=(-reset_force -cleanup)
 CELL_PATCH_EXTRA_ARGS=()             # none needed (-ignore_alerts is not used); e.g. (-smtp_from ...)
 # patchmgr runs in a session of its own and is never stopped by the script (an
 # interrupted patchmgr session can cause major problems). Past this long, the script

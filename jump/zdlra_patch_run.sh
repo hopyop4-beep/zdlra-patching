@@ -70,6 +70,7 @@ RESUME_RUN_ID=""
 WATCH_RUN_ID=""
 CONTINUE_RUN_ID=""
 KEEP_BLACKOUT=0
+PHASES_GIVEN=0
 
 SSH_USER="root"
 REMOTE_SCRIPT="/root/zdlra-patching/zdlra_patch.sh"
@@ -132,7 +133,7 @@ parse_args() {
         case "$1" in
             -z|--zdlra)      ZDLRA="$2"; shift 2 ;;
             -x|--execute)    DRY_RUN=0; shift ;;
-            -p|--phases)     PHASES="$2"; shift 2 ;;
+            -p|--phases)     PHASES="$2"; PHASES_GIVEN=1; shift 2 ;;
             -r|--resume)     RESUME_RUN_ID="$2"; shift 2 ;;
             -w|--watch)      WATCH_RUN_ID="$2"; shift 2 ;;
             --continue)      CONTINUE_RUN_ID="$2"; shift 2 ;;
@@ -297,11 +298,54 @@ phases_after()  { [[ " $PHASES " == *" compute "* ]] && sed -E 's/.*(^| )compute
 has_compute()   { [[ " $PHASES " == *" compute "* ]]; }
 has_verify()    { [[ " $PHASES " == *" verify "* ]]; }
 
-# Where this run is, on the jump server, so --watch can pick it up:
-#   stage=before|compute|after|done, and during compute the pass being worked on.
+# Where this run is, on the jump server, so --resume, --watch and --continue can pick
+# it up: stage=precheck|before|compute|after|verify|done, started=0 from just before the
+# stage's node phases are started until that has worked, and during compute the pass
+# being worked on. The way the run was started (phases, keep_blackout, skip_backup_wait,
+# dry_run) is saved once and kept when the stage changes.
 state_file() { echo "${STATE_DIR}/${ZDLRA}_${RUN_ID}.state"; }
-state_set()  { mkdir -p "$STATE_DIR"; printf '%s\n' "$@" > "$(state_file)"; }
-state_get()  { sed -n "s/^$1=//p" "$(state_file)" 2>/dev/null | head -1; }
+state_get()  { { sed -n "s/^$1=//p" "$(state_file)" 2>/dev/null || true; } | head -1; }
+state_set()  {
+    mkdir -p "$STATE_DIR"
+    local f k v keep=()
+    f="$(state_file)"
+    for k in phases keep_blackout skip_backup_wait dry_run; do
+        [[ " $* " == *" $k="* ]] && continue
+        v="$(state_get "$k")"
+        [[ -n "$v" ]] && keep+=("$k=$v")
+    done
+    printf '%s\n' "$@" ${keep[@]+"${keep[@]}"} > "$f.tmp" && mv "$f.tmp" "$f"
+}
+
+# Save how this run was started, for picking it up later.
+save_run_settings() {
+    state_set stage=precheck "phases=$PHASES" "keep_blackout=$KEEP_BLACKOUT" "skip_backup_wait=$SKIP_BACKUP_WAIT" "dry_run=$DRY_RUN"
+}
+
+# Picking up a run: use how it was started, not this command's defaults, so phases the
+# operator left out stay left out. --keep-blackout and --skip-backup-wait can be added.
+load_run_settings() {
+    local saved dry
+    saved="$(state_get phases)"
+    if [[ -z "$saved" ]]; then
+        (( PHASES_GIVEN )) || die "No saved phase list for run $RUN_ID in $(state_file). Pass the phases this run should carry on with: -p \"...\""
+    else
+        if (( PHASES_GIVEN )) && [[ "$PHASES" != "$saved" ]]; then
+            warn "Ignoring -p: run $RUN_ID was started with its own phase list."
+        fi
+        PHASES="$saved"
+    fi
+    info "Phases of run $RUN_ID: $PHASES"
+    [[ "$(state_get keep_blackout)" != 1 ]] || KEEP_BLACKOUT=1
+    [[ "$(state_get skip_backup_wait)" != 1 ]] || SKIP_BACKUP_WAIT=1
+    dry="$(state_get dry_run)"
+    if [[ -n "$dry" && "$dry" != "$DRY_RUN" ]]; then
+        if (( dry )); then
+            die "Run $RUN_ID was started as a dry run; this command has -x. Start a new run to patch for real."
+        fi
+        die "Run $RUN_ID is a real run: add -x. Without it, nothing would be resumed, and the run would be marked done."
+    fi
+}
 
 run_log_dir() { local d="${LOG_DIR}/${ZDLRA}_${RUN_ID}"; mkdir -p "$d"; echo "$d"; }
 
@@ -583,6 +627,7 @@ step_precheck_start() {
     on_node "$(remote_cmd --detach precheck)" || die "Could not start the precheck on $NODE."
     RUN_ID="$(on_node "$REMOTE_SCRIPT -c $REMOTE_CONFIG --status" | status_field Run)"
     [[ "$RUN_ID" =~ ^[0-9_]+$ ]] || die "Could not read the run id from $NODE."
+    save_run_settings
     info "Precheck running in run $RUN_ID"
 }
 
@@ -678,10 +723,47 @@ step_patch() {
     (( SKIP_BACKUP_WAIT )) && opts+=" --skip-backup-wait"
     if ! on_node "$(remote_cmd $opts $phases)"; then
         err "Could not start the patch phases on $NODE."
+        err "Once fixed:      $0 -z $ZDLRA --continue $RUN_ID$(xflag)"
         print_undo
         exit 1
     fi
     STAGE="patch"
+}
+
+# Start a stage's node phases. started=0 is recorded first, so if the start fails, the
+# node's status from the stage before ("completed") is not taken for this stage's.
+# $1 = stage, $2 = phases, $3 = "continue" (see step_patch)
+start_stage() {
+    state_set "stage=$1" started=0
+    step_patch "$2" "${3:-}"
+    state_set "stage=$1" started=1
+}
+
+# The node phases of a stage.
+stage_phases() {
+    case "$1" in
+        before) phases_before ;;
+        after)  phases_after ;;
+        verify) echo verify ;;
+    esac
+}
+
+# Picking up a stage whose start was not confirmed (started=0): find out if it started.
+step_pickup_unstarted() {
+    local stage="$1" status
+    status="$(run_status || true)"
+    [[ -n "$status" ]] || die "Could not read the status of run $RUN_ID from $NODE, so cannot tell if the $stage phases started. Try again."
+    case "$status" in
+        *running*)
+            info "The $stage phases did start ($status)."
+            state_set "stage=$stage" started=1 ;;
+        *failed*)
+            info "The $stage phases did start, and failed ($status)."
+            state_set "stage=$stage" started=1 ;;
+        *)
+            info "The $stage phases never started (status: $status). Starting them now."
+            start_stage "$stage" "$(stage_phases "$stage")" continue ;;
+    esac
 }
 
 step_jobs_resume() {
@@ -717,18 +799,26 @@ main() {
     if [[ -n "$WATCH_RUN_ID" || -n "$CONTINUE_RUN_ID" ]]; then
         RUN_ID="${WATCH_RUN_ID:-$CONTINUE_RUN_ID}"
         STAGE="patch"
+        load_run_settings
         stage="$(state_get stage)"; stage="${stage:-before}"
         info "Picking up run $RUN_ID at: $stage"
         [[ "$stage" != done ]] || die "Run $RUN_ID is already done. Report: ssh ${SSH_USER}@${NODE} $REMOTE_SCRIPT -c $REMOTE_CONFIG --report --run-id $RUN_ID"
+        [[ "$stage" != precheck ]] || die "Run $RUN_ID has not got past its precheck: $0 -z $ZDLRA --resume $RUN_ID$(xflag)"
         if (( ! DRY_RUN )) && [[ "$stage" != verify ]]; then
             BLACKOUT_ACTIVE=1
             (( ${#OEM_JOBS_SUSPEND_CMD[@]} == 0 )) || JOBS_SUSPENDED=1
         fi
+        [[ "$(state_get started)" != 0 ]] || step_pickup_unstarted "$stage"
         [[ -z "$CONTINUE_RUN_ID" ]] || step_continue "$stage"
     else
         step_preflight
         if [[ -n "$RESUME_RUN_ID" ]]; then
             RUN_ID="$RESUME_RUN_ID"
+            local saved_stage
+            saved_stage="$(state_get stage)"
+            [[ -z "$saved_stage" || "$saved_stage" == precheck ]] \
+                || die "Run $RUN_ID is past its precheck (at: $saved_stage). Use: $0 -z $ZDLRA --continue $RUN_ID$(xflag)"
+            if [[ -n "$(state_get phases)" ]]; then load_run_settings; else save_run_settings; fi
             info "Resuming run $RUN_ID (status: $(run_status || echo unknown))"
         else
             step_precheck_start
@@ -738,8 +828,7 @@ main() {
         step_approve "$status"
         step_blackout_start
         step_jobs_suspend
-        state_set stage=before
-        step_patch "$(phases_before)"
+        start_stage before "$(phases_before)"
     fi
 
     # The node phases before compute, then compute from here, then the rest.
@@ -749,17 +838,21 @@ main() {
             state_set stage=compute
             step_compute
             stage=after
-            state_set stage=after
             if [[ -n "$(phases_after)" ]]; then
                 STAGE="patch"
-                step_patch "$(phases_after)"
+                start_stage after "$(phases_after)"
+            else
+                state_set stage=after started=1
             fi
         fi
     elif [[ "$stage" == compute ]]; then
         step_compute
-        state_set stage=after
         STAGE="patch"
-        [[ -z "$(phases_after)" ]] || step_patch "$(phases_after)"
+        if [[ -n "$(phases_after)" ]]; then
+            start_stage after "$(phases_after)"
+        else
+            state_set stage=after started=1
+        fi
     fi
 
     if [[ "$stage" != verify ]]; then
@@ -772,8 +865,7 @@ main() {
             if (( KEEP_BLACKOUT )); then
                 warn "verify not run: the OEM jobs are still suspended (--keep-blackout). Once they are resumed: ssh ${SSH_USER}@${NODE} $(remote_cmd --run-id "$RUN_ID" verify)"
             else
-                state_set stage=verify
-                step_patch verify
+                start_stage verify verify
                 stage=verify
             fi
         fi
@@ -819,14 +911,14 @@ step_continue() {
     case "$stage:$status" in
         before:*failed*)
             info "Continuing the node phases before compute."
-            step_patch "$(phases_before)" continue ;;
+            start_stage before "$(phases_before)" continue ;;
         after:*failed*)
             [[ -n "$(phases_after)" ]] || die "Nothing to continue after compute."
             info "Continuing the node phases after compute."
-            step_patch "$(phases_after)" continue ;;
+            start_stage after "$(phases_after)" continue ;;
         verify:*failed*)
             info "Running verify again."
-            step_patch verify continue ;;
+            start_stage verify verify continue ;;
         compute:*)
             info "Continuing the compute passes." ;;
         done:*)

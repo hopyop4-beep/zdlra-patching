@@ -4,61 +4,60 @@ From a code review of all the code on `main` (commit 59ab2d5), on 2026-11-03. No
 are fixed yet. Line numbers are from that commit. Almost all of this also applies to the
 `platinum` branch, which has its own list in `docs/platinum-known-bugs.md`.
 
-**Don't run with `-x` until the first group is fixed.** Even a dry run executes the real
-precheck, so bug 3 applies to dry runs too.
+**The "fix before any real run" group is fixed (2026-11-03), tested with stand-ins only.** The
+other groups are still open. Even a dry run executes the real precheck, which changes the
+system.
 
 How far each finding was checked:
 
-- **Read in the code:** 1, 2, 3, 4.
-- **Run in bash during the review:** 2, 25, 28, 35a.
+- **Open bugs run in bash during the review:** 35a.
 - **Not run on the real tools:** nothing here has run on an appliance. Anything about how
   `sqlplus`, `emcli`, `patchmgr` or `racli` behave comes from knowledge of those tools, so
-  check it on the real system. That applies most to 1, 27b and 37.
+  check it on the real system. That applies most to 27b and 37.
 - The other findings come from the review and have not been checked separately.
 
-## Fix before any real run
+## Fixed: was "fix before any real run"
 
-1. **Replication probably never pauses or resumes** (`zdlra_patch.sh:652`, settings at `:176`,
-   `:177`). The pause and resume statements are PL/SQL blocks sent to `sqlplus` with no closing
-   `/`, so they wouldn't execute, yet the script logs "Paused" and records the server.
-   Replication would keep running through the patching. Fix: have `sql_exec` add a newline and
-   `/`. The `sqlplus` stand-in used for testing couldn't catch this; make it reject a PL/SQL
-   block with no `/`.
-2. **The guard against starting over a running `patchmgr` or `racli` mostly doesn't match**
-   (`zdlra_patch.sh:1154`). `/bin/bash ./patchmgr ...` and `/opt/.../racli update appliance` both
-   get past it; only a bare `./patchmgr` or `racli` matches. If the script is hard-killed, its
-   lock looks stale and a new run could start a second command on top of the first. The precheck
-   phase isn't guarded at all (`:1652`), though it rolls back the pre-install RPM.
-3. **The precheck can be killed** (`zdlra_patch.sh:506`, also postcheck at `:1349`). It runs under
-   `timeout`, and in the foreground when not detached, though it installs and rolls back an RPM
-   and moves the gold images. That breaks the rule that these sessions can't die. The comment at
-   `:451` and the README (line 152) calling it read-only are wrong.
-4. **A failed start can look like a finished run** (`jump/zdlra_patch_run.sh:752`). The stage is
-   saved as `after` before the phases start. If the start fails, `--continue` or `--watch` reads
-   the old `completed`, resumes the jobs and ends the blackout, with switches and postcheck
-   skipped and replication still paused. Fix: save the stage only after the phases have started.
-   Related at `:741`: if the first start fails, the status stays `precheck approved`, and
-   `--watch` or `--continue` loop forever.
-5. **`--continue` can patch things you left out** (`jump/zdlra_patch_run.sh:67`). The phase list
-   isn't saved with the run, so a limited `-p` run falls back to the full list, including cells
-   and compute. `--skip-backup-wait` and `--keep-blackout` are lost the same way, so a
-   `--keep-blackout` run picked up with `--watch` ends the blackout and resumes the jobs.
-6. **A good command can be run again in full** (`zdlra_patch.sh:1094`). If the session drops during
-   `patchmgr -patch`, the result is never picked up and the phase isn't marked done. `--continue`
-   then repeats the prep steps and the patch on freshly patched cells. `run_detached` also empties
-   the old log and deletes its result file (`:1093`), destroying the only evidence.
-7. **Staging can replace `/radump/patches` during a run** (`staging/zdlra_stage.sh:707`).
-   `set_aside_old` moves or deletes the folder that holds the `patchmgr` working folder, the staged
-   record and the precheck, without checking the lock or for running commands. Fix: refuse when a
-   run is active on that node.
+Fixed on `main`, tested with stand-ins on a PC only. Still to check on a real appliance:
+`sqlplus` really running the blocks, `setsid`, and `ps` output.
 
-43. **The cell prep steps are wrong** (`zdlra_patch.sh:143`, `:1226`, `zdlra_patch.conf.example:75`,
-    `README.md:19`). Confirmed by the user on 2026-11-03: `-reset_force` and `-cleanup` should only run
-    if `-patch_check_prereq` fails. Today it's the opposite: they run every time after a passing
-    prereq, and a failing prereq stops the run before they can run (`run_patchmgr` dies on it). The
-    flow to build (user, 2026-11-03): run the prereq. If it passes, go to `-patch`. If it fails, run
-    `-reset_force` and `-cleanup`, then the prereq again. If that passes, go to `-patch`; if it fails
-    a second time, stop for review.
+1. **Replication never paused or resumed.** PL/SQL blocks had no closing `/`. `sql_exec` now adds
+   one to blocks only, so a plain statement doesn't run twice. The `sqlplus` stand-in now only runs
+   a block when `/` follows, so this can't come back unnoticed.
+2. **The guard against starting over a running command mostly didn't match.** It now finds
+   `patchmgr` (`-cells`, `--roceswitches`, `-dbnodes`), the `racli` upgrade steps and the Oracle
+   precheck, by full path, through bash, or in the wrapper. The precheck phase is guarded too, and
+   a refusal comes before detaching, while someone can see it.
+3. **The precheck could be killed.** It now runs like `patchmgr` and `racli`: in a session of its
+   own, with no time limit. `PRECHECK_TIMEOUT` is gone; `PRECHECK_WARN_MINUTES` only warns.
+4. **A failed start could look like a finished run.** The jump server records `started=0` before
+   starting a stage's phases and `started=1` once that worked. A pickup at `started=0` asks the
+   node, and starts the phases if they never started.
+5. **`--continue` could patch things left out.** The phase list, `--keep-blackout` and
+   `--skip-backup-wait` are saved with the run from the precheck on, and pickups use them. `-p` on a
+   pickup is ignored with a warning. With no saved list, it stops and asks for `-p`.
+6. **A good command could be run again in full.** A result left by an earlier attempt is picked up,
+   not run again, and the checks before it are skipped. A cells `-patch` or switches `--upgrade`
+   that worked is never repeated in the run. A failed one does run again, and old logs are kept.
+7. **Staging could replace `/radump/patches` during a run.** It now refuses, before changing anything,
+   on a node with a run holding the lock or a command from bug 2 running.
+25. **A missing state file killed `--watch` and `--continue` silently.** `state_get` no longer fails.
+28. **The "cannot enter folder" error could never appear.** The wrapper now writes its result.
+29. **A signal just after a command started could remove its lock.** The trap is now set before the
+    command starts. A slow start no longer reports "did not start" while the command runs on.
+43. **The cell prep steps were wrong.** Now: the prereq check; only if it fails, `-reset_force` and
+    `-cleanup`, then the check again; a second failure stops for review. Then `-patch`.
+    `CELL_PREP_STEPS` is replaced by `CELL_PREREQ_STEP` and `CELL_RECOVERY_STEPS`.
+
+Found and fixed while testing these:
+
+44. **A signal to the script could record the run as `completed`.** Outside a running command, `TERM`
+    ended the script with exit code 0 in its exit handler, so the jump server would take the run as
+    finished, then resume the jobs and end the blackout. It now records `failed in <phase>`.
+45. **A pickup without `-x` on a real run could mark it done** with nothing resumed. The jump server now
+    saves whether the run was real, and refuses a mismatch either way.
+46. **`--resume` on a run past its precheck could approve it again and create another blackout.** It now
+    refuses and points to `--continue`. `--watch` and `--continue` refuse a run still at its precheck.
 
 ## Could finish wrongly or leave backups off
 
@@ -119,8 +118,6 @@ How far each finding was checked:
 24. **`sqlplus` has no `ORACLE_HOME` or `ORACLE_SID` set up** (`zdlra_patch.sh:167`). Root over a
     non-login ssh is unlikely to have them, and the DB home changes during `ra_update`, so a fixed
     path in the conf goes stale.
-25. **A missing state file kills `--watch` and `--continue` silently** (`jump/zdlra_patch_run.sh:720`,
-    `state_get` at `:304`). Already fixed on `platinum`.
 26. **Bad phase lists fail late** (`jump/zdlra_patch_run.sh:148`, `:742`, `:822`). A typo in `-p`, or a
     list starting with `compute`, only fails after the blackout and about 30 minutes of job suspend.
     Validate up front.
@@ -129,12 +126,6 @@ How far each finding was checked:
       `-F` also accepts part of a reason.
     - b. `targets` may list nothing (`:96`): `get_targets -targets=%NAME%` probably filters on type.
       Check against the `emcli` docs.
-28. **The "cannot enter folder" error can never appear** (`zdlra_patch.sh:1104`, `:1145`). The wrapper
-    exits 97 without writing the result file, so you get "ended without an exit status". The jump
-    server's copy (`jump/zdlra_patch_run.sh:378`) does it correctly.
-29. **A signal just after a command starts can remove its lock** (`zdlra_patch.sh:1107`). The trap and
-    `DETACHED_PID` are set only after a wait of up to 30 seconds. A slow start is also misreported as
-    "did not start" while the command runs on. Use `$!`, and set the trap before starting.
 30. **On bash older than 4.4, `--approve` fails** (`zdlra_patch.sh:393`) with "PHASES: unbound
     variable", because of an unguarded empty array.
 31. **`verify` can falsely say no replication was paused** (`zdlra_patch.sh:1463`): `cat | grep -q .`
@@ -148,6 +139,7 @@ How far each finding was checked:
 35. **`staging/zdlra_stage.sh`:**
     - a. `on_node` has no `ssh -n` (`:225`), so it swallows input, and only the first extra backup is
       removed.
+      When fixing: `step_no_active_run` feeds its script to `on_node` on stdin, so it must keep working.
     - b. An archive taken from an already staged appliance is rejected (`:387`), because
       `CONF_GLOB` also matches `patch.conf_*.orig`. The archive also carries that appliance's record
       and unpacked `tmp/`.

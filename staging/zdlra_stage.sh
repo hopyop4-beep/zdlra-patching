@@ -605,6 +605,33 @@ step_components() {
 # backup: keep it as <path>.<date>.bak, unless a backup already exists - then only
 # the oldest backup is kept and the current old version is replaced.
 # $3 = what it is, for messages.
+# Staging replaces /radump/patches, which holds the patchmgr working folders, the
+# staged record and the precheck. So refuse on a node with a patch run holding its lock,
+# or with the Oracle precheck, a patchmgr run or a racli upgrade step going. Read only;
+# checked before anything changes, in a dry run too.
+step_no_active_run() {
+    local node out
+    for node in "${NODES[@]}"; do
+        out="$(on_node "$node" "bash -s" <<'REMOTE'
+lock=/tmp/zdlra_patch.lock
+if [ -s "$lock" ] && kill -0 "$(cat "$lock")" 2>/dev/null; then echo "a patch run holds $lock (pid $(cat "$lock"))"; fi
+ps -eo pid=,args= | awk '{
+    for (i = 2; i <= NF; i++) {
+        if ($i ~ /(^|\/)patchmgr$/ && $0 ~ / (-cells|--roceswitches|-dbnodes) /) { print "running: " $0; exit }
+        if ($i ~ /(^|\/)racli$/ && ($(i+1) " " $(i+2)) ~ /^(run preinstall|alter appliance|update appliance)/) { print "running: " $0; exit }
+        if ($i ~ /\/precheck$/) { print "running: " $0; exit }
+    }
+}'
+echo CHECKED
+REMOTE
+)" || die "${node}: could not check for a running patch."
+        grep -q '^CHECKED$' <<<"$out" || die "${node}: could not check for a running patch."
+        out="$(grep -v '^CHECKED$' <<<"$out" || true)"
+        [[ -z "$out" ]] || die "${node}: not staging while patching is active, as this replaces $STAGE_DIR: $out"
+    done
+    info "No patch run active on: ${NODES[*]}"
+}
+
 set_aside_old() {
     local node="$1" path="$2" what="$3" baks oldest
     if [[ "$OLD_VERSION_ACTION" == overwrite ]]; then
@@ -1061,7 +1088,7 @@ Z_CUR=""
 stage_appliance() {
     local z="$1"
     info "======== $z ========"
-    info "== nodes ==";      step_nodes "$z"; step_components "$z"
+    info "== nodes ==";      step_nodes "$z"; step_no_active_run; step_components "$z"
     info "== distribute =="; step_distribute "$z"
     info "== check ==";      step_check "$z"
     if (( ${#TODO_NODES[@]} == 0 )); then
