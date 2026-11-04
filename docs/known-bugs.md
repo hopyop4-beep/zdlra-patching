@@ -4,9 +4,8 @@ From a code review of all the code on `main` (commit 59ab2d5), on 2026-11-03. No
 are fixed yet. Line numbers are from that commit. Almost all of this also applies to the
 `platinum` branch, which has its own list in `docs/platinum-known-bugs.md`.
 
-**The "fix before any real run" group is fixed (2026-11-03), tested with stand-ins only.** The
-other groups are still open. Even a dry run executes the real precheck, which changes the
-system.
+**Bugs 1-22, 25, 28, 29 and 43-47 are fixed (2026-11-03), tested with stand-ins only.** The rest are
+still open. Even a dry run executes the real precheck, which changes the system.
 
 How far each finding was checked:
 
@@ -59,59 +58,50 @@ Found and fixed while testing these:
 46. **`--resume` on a run past its precheck could approve it again and create another blackout.** It now
     refuses and points to `--continue`. `--watch` and `--continue` refuse a run still at its precheck.
 
-## Could finish wrongly or leave backups off
+## Fixed: could finish wrongly, leave backups off, or hang
 
-8. **The printed "Resume OEM jobs" command doesn't resume anything** (`jump/zdlra_patch_run.sh:287`,
-   also `:689`, `:694`). `sr_jobs_new.ksh` only generates the script that does. Following the
-   printed command leaves the backup jobs suspended, and nothing reports it.
-9. **An expired `emcli` login leaves every job suspended** (`jump/zdlra_patch_run.sh:693`). Resume
-   doesn't refresh the login. Every `emcli` line fails, only warnings appear, and the run ends
-   "Done". `verify` then only warns too.
-10. **A suspend where no jobs succeeded still starts patching** (`jump/zdlra_patch_run.sh:269`),
-    although the README (line 170) says it won't. A generated script with no jobs also passes, as
-    "0 of 0". At a minimum, 0 of N or 0 of 0 should fail the suspend.
-11. **A cell that doesn't come back still passes** (`zdlra_patch.sh:1195`). `check_cell_versions`
-    skips lines it can't read, so "All cells on target" is reported, and `postcheck` only warns.
-    Compare against the names in `CELL_GROUP_FILE`.
-12. **An unreadable `SWITCH_TYPE` skips the switches and marks them done** (`zdlra_patch.sh:1313`).
-    Only an explicit `ib` should skip them; empty should fail.
-13. **A precheck killed partway can count as passed** (`zdlra_patch.sh:552`). Any summary it printed
-    is trusted, whatever the exit code. Treat signal exits (128 and up) as failures at least, and
-    show the exit code at approval.
-14. **Rerunning the precheck doesn't clear the old approval** (`zdlra_patch.sh:1604`). `--approve`
-    says "already approved" and can't renew an expired one. A rerun that dies early leaves the old
-    approval valid, so patch steps go ahead after a failed precheck. `phase_precheck` should remove
-    `precheck_passed` and the approval at its start.
-15. **A dry-run approval can authorize a real run** (`zdlra_patch.sh:612`) that never ran
-    `-recheck_all`. The approval doesn't record whether the precheck was a dry run.
-16. **The node-only commands in the README fail at `postcheck`** (`README.md:37`, also lines 46, 49,
-    95). They have no compute step, so `postcheck` finds every compute node on the old version and
-    stops, and replication stays paused. Either document that real runs go through the jump server,
-    or make compute mismatches soft when the run didn't include compute.
+Fixed on `main`, tested with stand-ins on a PC only.
 
-## Can hang forever
+8. **The printed "Resume OEM jobs" command resumed nothing.** It now includes running the script that
+   `sr_jobs_new.ksh` writes.
+9. **An expired `emcli` login left every job suspended.** The session is refreshed before each suspend
+   and resume. If that fails, it counts as a failure.
+10. **A suspend where no jobs succeeded still started patching.** None succeeding, or a script naming no
+    jobs, now fails: patching doesn't start. Some not succeeding still carries on, as agreed. If a
+    resume fails or is partial, the run says so again as its very last line.
+11. **A cell that didn't come back still passed.** Every cell in `CELL_GROUP_FILE` must now report its
+    version.
+12. **An unreadable `SWITCH_TYPE` skipped the switches.** Only `IB` skips them now. Anything else that
+    isn't `roce` stops the phase.
+13. **A precheck killed partway could pass.** Exit codes of 128 and up now fail it, and the review shows
+    the exit code. A lower non-zero exit with a summary still counts, as before.
+14. **A rerun precheck left the old approval valid.** It now removes the old pass and approval at the
+    start, so `--approve` works again and patch steps refuse until the new one is approved.
+15. **A dry-run approval could authorize a real run.** The approval records it, and a real run refuses.
+16. **Node-only commands failed at `postcheck`.** Compute nodes off target only fail the version table
+    in a run that upgrades them (the jump server passes `--expect-compute`). Otherwise they are a
+    warning, marked `CHECK`. The README says real runs go through the jump server.
+17. **The jump server never checked the node process was alive.** `--status` now reads
+    `failed: the run's process is gone` if the status says running, but neither the script nor its
+    command is alive. The jump server then stops watching and prints `--continue`.
+18. **An approval expiring mid-window left the status "running".** Covered by 17.
+19. **A `patchmgr` dying without a result was waited on forever.** If the node answers, and neither the
+    wrapper nor any `patchmgr -dbnodes` is running, it's recorded as failed, and picking up starts it
+    again. The compute version check gives up after `COMPUTE_VERSION_WAIT_MINUTES` (60).
+20. **A compute step that never started hung on `--watch`.** A pickup now starts it.
+21. **A compute pass that stopped could never move on.** A step that ended badly with exit 0 is started
+    again on pickup. For warnings (`COMPUTE_PAUSE_ON_WARNINGS=1`), add `--accept-warnings` to `--watch`.
+22. **`cells` failed on patchmgr's version text after a good patch.** That text is now only for the log;
+    `imageinfo` decides.
 
-17. **The jump server never checks that the node process is alive** (`jump/zdlra_patch_run.sh:616`).
-    After a reboot or kill, the status stays `running`, or `still running (pid N)` (set at
-    `zdlra_patch.sh:1075`) even after the command ends. `--continue` only watches it. Fix with a
-    machine-readable state plus a liveness check.
-18. **An approval expiring mid-window leaves the status "running"** (`zdlra_patch.sh:628`). The
-    background process rechecks before each phase and exits with `PRESERVE_STATUS=1`, so nothing
-    records the failure and the watch never ends.
-19. **`patchmgr` dying without a result file is waited on forever** (`jump/zdlra_patch_run.sh:407`).
-    The node's `run_detached` detects this, but the jump server's copy doesn't. The compute version
-    check (`:448`) can also loop forever, and it discards `dcli` errors.
-20. **A compute step that never started hangs on `--watch`** (`jump/zdlra_patch_run.sh:543`). The
-    state says `step=precheck` before the start can fail; `--watch` then assumes it's running.
-21. **A compute pass stopped by warnings or a `FAILED` line can't move on**
-    (`jump/zdlra_patch_run.sh:438`), despite the message telling you to use `--watch`. Only a non-zero
-    exit restarts a step, so someone has to delete files on the node by hand.
+Found and fixed while testing these:
+
+47. **`--watch` could start a second `patchmgr` on a compute node.** If the wrapper was killed while
+    `patchmgr` itself ran on, it looked finished. The check and the start guard now look for
+    `patchmgr -dbnodes` too. A surviving one is waited for, and a new start is refused.
 
 ## Other bugs
 
-22. **`cells` fails on patchmgr's version text after a good patch** (`zdlra_patch.sh:1233`), a format
-    not yet seen on a real system. `--continue` then re-patches every cell. The `imageinfo` check at
-    `:1235` is the real one; make the first advisory.
 23. **A blackout record that has expired blocks `start`** (`jump/oem_blackout.sh:110`). The README's
     recovery step (line 119) fails, `stop` can fail too, and preflight blocks the next run until
     someone deletes the file.

@@ -53,6 +53,8 @@
 #                           the suspended OEM jobs from the first attempt are kept. A
 #                           failed compute pass is picked up the same way as --watch.
 #       --keep-blackout     do not end the blackout or resume OEM jobs when the run completes
+#       --accept-warnings   with --watch: accept the warnings a compute patchmgr stopped on
+#                           (COMPUTE_PAUSE_ON_WARNINGS=1), once they are reviewed
 #       --skip-backup-wait  quiesce on the node does not wait for incoming backups to finish
 #   -c, --config FILE       config file (default: zdlra_jump.conf next to this script)
 #   -h, --help              show this help
@@ -71,6 +73,8 @@ WATCH_RUN_ID=""
 CONTINUE_RUN_ID=""
 KEEP_BLACKOUT=0
 PHASES_GIVEN=0
+ACCEPT_WARNINGS=0
+JOBS_RESUME_PROBLEM=""
 
 SSH_USER="root"
 REMOTE_SCRIPT="/root/zdlra-patching/zdlra_patch.sh"
@@ -98,6 +102,7 @@ COMPUTE_WORK_DIR="/radump/zdlra_compute"       # per run: db_nodes files, logs, 
 NODE_DCLI="dcli"
 COMPUTE_WARN_MINUTES=240        # past this, a warning only; patchmgr is never stopped
 COMPUTE_POLL_SECONDS=60
+COMPUTE_VERSION_WAIT_MINUTES=60 # a patched node not answering after this long stops the run (patchmgr has ended)
 # "SUCCESS WITH WARNING(S)" from patchmgr: 0 = carry on (the warnings are listed),
 # 1 = stop for review before going on. Decided for now: carry on, because the
 # prechecks have already been reviewed. To revisit.
@@ -138,6 +143,7 @@ parse_args() {
             -w|--watch)      WATCH_RUN_ID="$2"; shift 2 ;;
             --continue)      CONTINUE_RUN_ID="$2"; shift 2 ;;
             --keep-blackout) KEEP_BLACKOUT=1; shift ;;
+            --accept-warnings) ACCEPT_WARNINGS=1; shift ;;
             --skip-backup-wait) SKIP_BACKUP_WAIT=1; shift ;;
             -c|--config)     CONFIG_FILE="$2"; shift 2 ;;
             -h|--help)       usage; exit 0 ;;
@@ -218,6 +224,12 @@ run_jobs_cmd() {
             || info "[dry-run] then run the script it writes ($(jobs_cmd_fill "${OEM_JOBS_GENERATED//\{action\}/$label}")) and check its log"
         return 0
     fi
+    # A window takes hours and the session can expire. Without one, every emcli command
+    # in the generated script would fail.
+    if ! "${SCRIPT_DIR}/oem_blackout.sh" login -z "$ZDLRA" -c "$CONFIG_FILE"; then
+        err "$label OEM jobs: no emcli session."
+        return 1
+    fi
     info "[exec] $label OEM jobs: ${OEM_JOBS_DIR:+cd $OEM_JOBS_DIR && }${cmd[*]}"
     # The output is shown as it comes and also checked: a nonzero exit or a line
     # matching OEM_JOBS_FAIL_RE (the script's error and usage text) counts as failed.
@@ -257,9 +269,9 @@ run_generated_jobs_script() {
     rc=${PIPESTATUS[0]}
     # The script runs every emcli command even if some fail, so its exit status says
     # little. Instead, every job it names (-name="...") must have a line
-    # Job "<name>" <suspended|resumed> successfully in the log. Jobs without one are
-    # listed as warnings and the run carries on; jobs that are still running are
-    # caught by the wait for incoming backups before patching.
+    # Job "<name>" <suspended|resumed> successfully in the log. If none has, this fails.
+    # If only some have not, they are listed as warnings and the run carries on; jobs
+    # that are still running are caught by the wait for incoming backups before patching.
     local jobs=() missing=() j total
     mapfile -t jobs < <(sed -n 's/.*-name="\([^"]*\)".*/\1/p' "$dir/$f")
     total=${#jobs[@]}
@@ -273,19 +285,36 @@ run_generated_jobs_script() {
         (( ${#missing[@]} <= 20 )) || warn "  ... and $(( ${#missing[@]} - 20 )) more (see the log)"
     fi
     (( rc == 0 )) || warn "$label OEM jobs: $f exited with status $rc (see $dir/$log)."
+    if (( total == 0 )); then
+        err "$label OEM jobs: $f names no jobs (no -name=\"...\" lines)."
+        return 1
+    fi
+    if (( ${#missing[@]} == total )); then
+        err "$label OEM jobs: none of the $total job(s) reported 'successfully' (see $dir/$log)."
+        return 1
+    fi
+    [[ "$label" != resume ]] || (( ${#missing[@]} == 0 )) \
+        || JOBS_RESUME_PROBLEM="${#missing[@]} of $total job(s) not resumed; see $dir/$log"
     info "$label OEM jobs: $f finished, $(( total - ${#missing[@]} )) of $total job(s) ${label%e}ed successfully; log $dir/$log"
 }
 
-jobs_cmd_text() {
-    local c=(); mapfile -t c < <(jobs_cmd_fill "$@")
-    echo "${OEM_JOBS_DIR:+cd $OEM_JOBS_DIR && }${c[*]}"
+# How to resume the OEM jobs by hand. sr_jobs_new.ksh only writes the script that does it.
+jobs_resume_text() {
+    local c=(); mapfile -t c < <(jobs_cmd_fill ${OEM_JOBS_RESUME_CMD[@]+"${OEM_JOBS_RESUME_CMD[@]}"})
+    local text="${OEM_JOBS_DIR:+cd $OEM_JOBS_DIR && }${c[*]-}"
+    if [[ -n "$OEM_JOBS_GENERATED" ]]; then
+        local pattern
+        pattern="$(jobs_cmd_fill "$OEM_JOBS_GENERATED")"
+        text+=" && ksh ./<the newest ${pattern//\{action\}/resume}, which that writes>"
+    fi
+    echo "$text"
 }
 
 # What to undo by hand after a failure or interruption, once the work has started.
 print_undo() {
     # The node records which replication servers this run paused; its resume phase undoes only those.
     [[ "$STAGE" == patch || "$STAGE" == compute ]] && err "Resume replication (if quiesce paused it): ssh ${SSH_USER}@${NODE} $(remote_cmd --run-id "$RUN_ID" resume)"
-    (( JOBS_SUSPENDED )) && err "Resume OEM jobs: $(jobs_cmd_text ${OEM_JOBS_RESUME_CMD[@]+"${OEM_JOBS_RESUME_CMD[@]}"})"
+    (( JOBS_SUSPENDED )) && err "Resume OEM jobs: $(jobs_resume_text)"
     (( BLACKOUT_ACTIVE )) && err "End blackout:    ${SCRIPT_DIR}/oem_blackout.sh stop -z $ZDLRA -x"
     return 0
 }
@@ -416,6 +445,9 @@ log=$work/$job.log rc=$work/$job.rc pidf=$work/$job.pid
 if [ -s "$work/running.pid" ] && kill -0 "$(cat "$work/running.pid")" 2>/dev/null; then
     echo "ERROR a patchmgr is already running on $(hostname) (pid $(cat "$work/running.pid"))"; exit 3
 fi
+if ps -eo args= 2>/dev/null | grep -q '[p]atchmgr .*-dbnodes'; then
+    echo "ERROR a patchmgr -dbnodes is already running on $(hostname)"; exit 3
+fi
 mkdir -p "$work" || { echo "ERROR cannot create $work"; exit 1; }
 : > "$log"; rm -f "$rc" "$pidf"
 L="nohup"; command -v setsid >/dev/null 2>&1 && L="setsid nohup"
@@ -428,24 +460,36 @@ REMOTE
 }
 
 # Poll a detached patchmgr on a node until its exit status is written, showing its
-# log as it grows. A failed ssh (e.g. a reboot) only means "try again".
+# log as it grows. A failed ssh (e.g. a reboot) only means "try again". If the node
+# answers, and neither the wrapper nor any patchmgr is running, with no exit status, it
+# was killed: that is recorded on the node as exit 99, so picking up starts the step
+# again. A patchmgr still running after its wrapper died is waited for, never restarted.
 # Copies the full log here; prints its local path. $1 = runner, $2 = job.
 wait_remote_patchmgr() {
     local runner="$1" job="$2" work="${COMPUTE_WORK_DIR}/${RUN_ID}"
     local local_log
     local_log="$(run_log_dir)/compute_${runner}_${job}.log"
-    local shown=0 total rc="" start warned=0 out
+    local shown=0 total rc="" start warned=0 out gone=0
     start=$(date +%s)
     while :; do
-        if out="$(on "$runner" "cat '$work/$job.rc' 2>/dev/null; echo; wc -l < '$work/$job.log'" 2>/dev/null)"; then
-            rc="$(head -1 <<<"$out" | tr -dc '0-9')"
-            total="$(tail -1 <<<"$out" | tr -dc '0-9')"
+        if out="$(on "$runner" "echo RC=\$(cat '$work/$job.rc' 2>/dev/null); echo TOTAL=\$(wc -l < '$work/$job.log'); { kill -0 \"\$(cat '$work/$job.pid' 2>/dev/null)\" 2>/dev/null || ps -eo args= 2>/dev/null | grep -q '[p]atchmgr .*-dbnodes'; } && echo ALIVE=1 || echo ALIVE=0" 2>/dev/null)"; then
+            rc="$(sed -n 's/^RC=//p' <<<"$out" | tr -dc '0-9')"
+            total="$(sed -n 's/^TOTAL=//p' <<<"$out" | tr -dc '0-9')"
             if [[ -n "$total" ]] && (( total > shown )); then
                 on "$runner" "sed -n '$(( shown + 1 )),${total}p' '$work/$job.log'" 2>/dev/null | sed "s|^|  ${runner}: |" >&2 || true
                 shown=$total
             fi
             [[ -n "$rc" ]] && break
+            # Twice in a row, in case it finished between reading the status and the process.
+            if grep -qx 'ALIVE=0' <<<"$out"; then gone=$((gone + 1)); else gone=0; fi
+            if (( gone >= 2 )); then
+                err "patchmgr $job on $runner ended without an exit status (was it killed?)."
+                on "$runner" "echo 99 > '$work/$job.rc'" 2>/dev/null || true
+                rc=99
+                break
+            fi
         else
+            gone=0
             warn "Could not reach $runner; patchmgr keeps running there. Trying again."
         fi
         if (( ! warned && $(date +%s) - start > COMPUTE_WARN_MINUTES * 60 )); then
@@ -478,21 +522,40 @@ check_patchmgr_log() {
     if [[ -n "$warnings" ]]; then
         warn "$what: SUCCESS WITH WARNING(S):"
         while IFS= read -r l; do warn "  $(cut -c1-200 <<<"$l")"; done <<<"$warnings"
-        if (( COMPUTE_PAUSE_ON_WARNINGS )); then
-            die "$what has warnings and COMPUTE_PAUSE_ON_WARNINGS=1. Review them, then continue with --watch $RUN_ID."
+        if (( COMPUTE_PAUSE_ON_WARNINGS && ! ACCEPT_WARNINGS )); then
+            err "$what has warnings and COMPUTE_PAUSE_ON_WARNINGS=1. Once reviewed, accept them: $0 -z $ZDLRA --watch $RUN_ID --accept-warnings$(xflag)"
+            print_undo
+            exit 3
         fi
     fi
     info "$what: completed."
 }
 
+# check_patchmgr_log for a job on a node. A step that ended badly with exit 0 (FAILED
+# lines, no success line) is recorded on the node as exit 98, so picking up starts it
+# again; stopping on warnings is not, as the step itself worked.
+# $1 = runner, $2 = job, $3 = "<exit status> <local log>", $4 = what.
+check_compute_job() {
+    local rc=0
+    ( check_patchmgr_log "${3%% *}" "${3#* }" "$4" ) || rc=$?
+    (( rc != 0 )) || return 0
+    (( rc == 3 )) || on "$1" "echo 98 > '${COMPUTE_WORK_DIR}/${RUN_ID}/$2.rc'" 2>/dev/null || true
+    exit 1
+}
+
 # The patched node's image version, from the runner (the patched node may still be
-# coming up, so this retries until it answers).
+# coming up, so this retries, for up to COMPUTE_VERSION_WAIT_MINUTES).
 check_compute_version() {
-    local runner="$1" target="$2" work="${COMPUTE_WORK_DIR}/${RUN_ID}" out ver
+    local runner="$1" target="$2" work="${COMPUTE_WORK_DIR}/${RUN_ID}" out ver start
+    start=$(date +%s)
     while :; do
         if out="$(on "$runner" "$NODE_DCLI -g '$work/db_nodes_${target}' -l root 'imageinfo -ver'" 2>/dev/null)" && [[ -n "$out" ]]; then
             ver="$(sed -n "s/^${target}:[[:space:]]*//p" <<<"$out" | head -1 | tr -d '[:space:]')"
             [[ -n "$ver" ]] && break
+        fi
+        if (( $(date +%s) - start > COMPUTE_VERSION_WAIT_MINUTES * 60 )); then
+            err "Last answer from $NODE_DCLI on $runner: $(head -3 <<<"${out:-nothing}" | tr '\n' ' ')"
+            die "No image version from $target after ${COMPUTE_VERSION_WAIT_MINUTES} min. patchmgr itself has finished: check $target."
         fi
         warn "No image version from $target yet (checked from $runner); trying again."
         sleep "$COMPUTE_POLL_SECONDS"
@@ -521,6 +584,17 @@ compute_pass() {
         info "$runner: patchmgr -precheck ${out#STARTED }"
         from=precheck_wait
     fi
+    # Picking up a precheck that never started (a failure just before it): start it.
+    # Exit 1 is "the node answered, and no pid file"; a failed ssh only means "try waiting".
+    if [[ "$from" == precheck_wait ]]; then
+        local started=0
+        on "$runner" "[ -f '$work/precheck_${target}.pid' ]" 2>/dev/null || started=$?
+        if (( started == 1 )); then
+            info "$runner: patchmgr -precheck for $target never started; starting it"
+            compute_pass "$runner" "$target" precheck
+            return
+        fi
+    fi
     # Picking up a precheck that already failed: start it again.
     if [[ "$from" == precheck_wait ]] && [[ "$(job_rc "$runner" "precheck_${target}")" =~ ^[1-9][0-9]*$ ]]; then
         info "$runner: the previous patchmgr -precheck for $target failed; starting it again"
@@ -531,7 +605,7 @@ compute_pass() {
     if [[ "$from" == precheck || "$from" == precheck_wait ]]; then
         local res
         res="$(wait_remote_patchmgr "$runner" "precheck_${target}")"
-        check_patchmgr_log "${res%% *}" "${res#* }" "patchmgr -precheck on $runner for $target"
+        check_compute_job "$runner" "precheck_${target}" "$res" "patchmgr -precheck on $runner for $target"
         from=upgrade
     fi
     if [[ "$from" == upgrade ]]; then
@@ -549,7 +623,7 @@ compute_pass() {
         fi
         local res
         res="$(wait_remote_patchmgr "$runner" "upgrade_${target}")"
-        check_patchmgr_log "${res%% *}" "${res#* }" "patchmgr -upgrade on $runner for $target"
+        check_compute_job "$runner" "upgrade_${target}" "$res" "patchmgr -upgrade on $runner for $target"
         from=verify
     fi
     state_set stage=compute "runner=$runner" "target=$target" step=verify
@@ -721,6 +795,7 @@ step_patch() {
     local opts="--run-id $RUN_ID --background"
     [[ "${2:-}" == continue ]] && opts+=" --continue"
     (( SKIP_BACKUP_WAIT )) && opts+=" --skip-backup-wait"
+    has_compute && opts+=" --expect-compute"
     if ! on_node "$(remote_cmd $opts $phases)"; then
         err "Could not start the patch phases on $NODE."
         err "Once fixed:      $0 -z $ZDLRA --continue $RUN_ID$(xflag)"
@@ -768,12 +843,14 @@ step_pickup_unstarted() {
 
 step_jobs_resume() {
     if (( KEEP_BLACKOUT )); then
-        info "OEM jobs left suspended (--keep-blackout). Resume them with: $(jobs_cmd_text ${OEM_JOBS_RESUME_CMD[@]+"${OEM_JOBS_RESUME_CMD[@]}"})"
+        info "OEM jobs left suspended (--keep-blackout). Resume them with: $(jobs_resume_text)"
         return 0
     fi
     info "== resume OEM backup jobs =="
-    run_jobs_cmd resume ${OEM_JOBS_RESUME_CMD[@]+"${OEM_JOBS_RESUME_CMD[@]}"} \
-        || warn "Resuming OEM jobs failed. Resume them with: $(jobs_cmd_text ${OEM_JOBS_RESUME_CMD[@]+"${OEM_JOBS_RESUME_CMD[@]}"})"
+    if ! run_jobs_cmd resume ${OEM_JOBS_RESUME_CMD[@]+"${OEM_JOBS_RESUME_CMD[@]}"}; then
+        JOBS_RESUME_PROBLEM="resuming them failed. Resume them with: $(jobs_resume_text)"
+    fi
+    [[ -z "$JOBS_RESUME_PROBLEM" ]] || err "OEM backup jobs: $JOBS_RESUME_PROBLEM"
 }
 
 step_blackout_stop() {
@@ -882,6 +959,7 @@ main() {
     state_set stage=done
     step_show_report
     info "Done. Report on $NODE: $REMOTE_SCRIPT -c $REMOTE_CONFIG --report --run-id $RUN_ID"
+    [[ -z "$JOBS_RESUME_PROBLEM" ]] || err "NOT ALL BACKUPS ARE BACK ON. OEM backup jobs: $JOBS_RESUME_PROBLEM"
 }
 
 # The run's report from the node: summary, version table, backup/replication check.

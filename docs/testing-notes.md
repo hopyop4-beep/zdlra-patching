@@ -19,6 +19,9 @@ step 5.
 - [ ] Fill in `VERIFY_BACKUPS_SQL` and `VERIFY_REPLICATION_SQL`, or `verify` only warns. Each prints one
       number, with `{since}` where the start time goes.
 - [ ] Set `OEM_JOBS_DB` for the appliance, and `BLACKOUT_TARGETS`.
+- [ ] **`emcli` login:** the session is refreshed before suspending and resuming the jobs. If `EM_USER`
+      asks for a password, the script waits at that prompt. Check how the login works on the OMS, as
+      it could be hours into the window by then.
 
 ## 2. Checks that change nothing
 
@@ -92,15 +95,15 @@ back an RPM and moves the gold images. Nothing else changes. No blackout is crea
 
 ## 5. First real run
 
-Do this only once the next group of bugs is fixed, or be ready for them:
+The bugs most likely to matter here are fixed, but only tested with stand-ins, so check these
+yourself on the first run:
 
-- **Bugs 8, 9, 10:** backup jobs can stay suspended, or patching can start with nothing suspended. After
-  each suspend and resume, check the jobs in OEM yourself. To resume by hand, run the generated
-  `<zdlra db>_resume_job_*.ksh`, not just `sr_jobs_new.ksh`.
-- **Bugs 11, 12:** check the cells and switches yourself, even if the run says they're fine.
-- **Bugs 14, 15:** don't reuse a dry run's approval for a real run. Start a new run.
-- **Bugs 17–21:** the jump server can wait forever on a run that has died. If nothing changes for a long
-  time, check on the node with `zdlra_patch.sh --status --run-id <id>` and `ps`.
+- **OEM jobs:** after each suspend and resume, check them in OEM. To resume by hand, run the generated
+  `<zdlra db>_resume_job_*.ksh`, not just `sr_jobs_new.ksh`. If not all jobs resumed, the run says so
+  in its last line.
+- **Cells and switches:** check them yourself, even if the run says they're fine.
+- **A run that seems stuck:** check `zdlra_patch.sh --status --run-id <id>` on the node, and `ps`. The
+  status should read `failed: the run's process is gone` if the script and its command have both gone.
 
 Check at each step:
 
@@ -114,8 +117,7 @@ Check at each step:
   - `End: Alter Appliance`.
   - `End: Patch Recovery Appliance - Step [Patch]`.
   - patchmgr: `SUCCESS: Completed run of command`, `Exit status:0`.
-  - Cells: `Current image version on cell(s) is:` ... `For details`. If that differs, the phase fails after
-    a good patch (bug 22). **Don't `--continue` in that case without telling me**, as it would re-patch.
+  - Cells: `Current image version on cell(s) is:` ... `For details`. This is only logged; `imageinfo` decides.
 - [ ] **Cell prereq flow:** `-reset_force` and `-cleanup` run only if `-patch_check_prereq` fails.
 - [ ] **Compute:** both passes, through the reboots. Decide about "SUCCESS WITH WARNING(S)", which carries
       on for now (`COMPUTE_PAUSE_ON_WARNINGS=0`).
@@ -128,6 +130,9 @@ Check at each step:
 
 - [ ] A step fails, then `--continue <run id> -x`: finished phases are skipped.
 - [ ] The cell prereq fails once: it recovers. Fails twice: it stops.
+- [ ] Compute: `patchmgr` fails, then `--watch <run id> -x`: that step starts again. With
+      `COMPUTE_PAUSE_ON_WARNINGS=1`, it stops on warnings until you add `--accept-warnings`.
+- [ ] **Compute guard:** `ps -eo args=` on a compute node shows `patchmgr ... -dbnodes` while one runs.
 
 ## 7. For Platinum later
 

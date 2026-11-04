@@ -49,6 +49,8 @@ vi zdlra_patch.conf
 ./zdlra_patch.sh --execute --run-id 20261028_140211 --continue all
 ```
 
+**This script does not upgrade the compute nodes; the jump server does.** So run a real patch from the jump server ([below](#running-a-patch-from-the-jump-server-oms)). Run on the node alone, as above, compute nodes off target are only a warning in the version table, and the report tells you so.
+
 Each run writes its log, snapshots and report to `$WORK_DIR/<run id>/`.
 
 The patches must be staged first with `staging/zdlra_stage.sh` (see [Staging the patches](#staging-the-patches-windows-pc)). The approval covers the staged archive: if a different bundle is staged after you approve, the patch steps refuse to run.
@@ -81,7 +83,7 @@ If a run fails after `quiesce`, replication stays paused. Once the appliance is 
 
 ## Precheck approval and background runs
 
-After the precheck, the script shows the failures and warnings, then waits for you to type `APPROVE`. `--yes` does not skip this. The approval is saved in `<run id>/precheck_approval.txt` with who approved it, when, and a fingerprint of the results.
+After the precheck, the script shows the failures, warnings and exit code, then waits for you to type `APPROVE`. `--yes` does not skip this. The approval is saved in `<run id>/precheck_approval.txt` with who approved it, when, and a fingerprint of the results.
 
 `quiesce`, the `ra_*` phases and `cells` refuse to run unless the run has an approval that:
 
@@ -117,6 +119,8 @@ From the jump server, `zdlra_patch_run.sh -z <appliance> --continue <run id> -x`
 
 - **Approval:** the approval must still be valid (`PRECHECK_APPROVAL_MAX_AGE_HOURS`). If it has expired, run the precheck again in the same run (`--run-id <run id> precheck`) and approve it, then continue.
 - **Precheck and pre-install:** the precheck rolls back the RPM that `ra_preinstall` installs. So running the precheck again marks `ra_preinstall` as not done, and continuing runs it again before `ra_alter`. Once `ra_update` has finished, this no longer applies.
+- **A run whose process has gone:** if the script and its command have both gone (killed, or a reboot), `--status` shows `failed: the run's process is gone`, and the jump server stops watching and prints the `--continue` command. A command that finished after the script stopped has its result picked up.
+- **Compute:** a `patchmgr` that was killed, or that ended badly with exit 0, is started again by `--watch` or `--continue`. If one stopped on warnings (`COMPUTE_PAUSE_ON_WARNINGS=1`), review them, then add `--accept-warnings` to `--watch`.
 - **Blackout:** it ends by itself after `BLACKOUT_HOURS`. If continuing takes longer than that, start a new one with `jump/oem_blackout.sh start -z <appliance> -x`.
 
 ## External precheck script
@@ -144,6 +148,7 @@ Each failure and warning is listed in the run log. The phase fails if:
 
 - there is any failure that is not in `PRECHECK_WAIVERS`
 - the script exits with a non-zero code and prints no summary
+- the script is killed by a signal, even if it printed a summary
 
 Warnings and waived failures are logged but do not stop the run. To make warnings stop the run as well, set `PRECHECK_FAIL_ON_WARN=1`; waivers then apply to warnings too. If your version of the script uses a different header or tags, change `PRECHECK_SUMMARY_HEADER`, `PRECHECK_FAIL_PATTERN` or `PRECHECK_WARN_PATTERN`.
 
@@ -167,7 +172,7 @@ cp jump/zdlra_jump.conf.example jump/zdlra_jump.conf   # then edit it
 2. **Precheck:** starts on the node detached from your session, because it can take a long time. It keeps running if your connection to the jump server drops. The script checks its status every `POLL_SECONDS`.
 3. **Approve:** when the precheck finishes, the review screen opens in your terminal and you type `APPROVE`. If the precheck failed, or you don't approve, nothing has changed and no blackout exists.
 4. **Blackout:** created after you approve, before anything changes. By default it ends by itself after `BLACKOUT_HOURS` (12), as a safety net.
-5. **OEM backup jobs:** `sr_jobs_new.ksh -z <zdlra db> -a s` suspends them, run in `OEM_JOBS_DIR`; at the end `-a r` resumes them. Each appliance's zdlra db value for that script (for example `RA1GF2`) is set in `OEM_JOBS_DB`, and a run stops before it starts if its appliance isn't listed. That script writes another one, `<zdlra db>_suspend_job_<stamp>.ksh`, with one `emcli suspend_job` per job, and the run then executes it (only the file it just created), with the output in the matching `.log`; about 30 minutes is normal. That script runs every command even if some fail, so the run checks the log for a `Job "<name>" suspended successfully` line for every job the script names. Jobs without one are listed as warnings and the run carries on. Resuming at the end works the same way with `-a r`. A dry run only shows what would run. Without `-t`, all the appliance's backup jobs are suspended. A failure is a nonzero exit, or the script's usage text in its output (what it prints for a wrong value), matched by `OEM_JOBS_FAIL_RE`. If suspending fails, patching does not start.
+5. **OEM backup jobs:** `sr_jobs_new.ksh -z <zdlra db> -a s` suspends them, run in `OEM_JOBS_DIR`; at the end `-a r` resumes them. Each appliance's zdlra db value for that script (for example `RA1GF2`) is set in `OEM_JOBS_DB`, and a run stops before it starts if its appliance isn't listed. That script writes another one, `<zdlra db>_suspend_job_<stamp>.ksh`, with one `emcli suspend_job` per job, and the run then executes it (only the file it just created), with the output in the matching `.log`; about 30 minutes is normal. That script runs every command even if some fail, so the run checks the log for a `Job "<name>" suspended successfully` line for every job the script names. Jobs without one are listed as warnings and the run carries on. Resuming at the end works the same way with `-a r`. A dry run only shows what would run. Without `-t`, all the appliance's backup jobs are suspended. A failure is a nonzero exit, the script's usage text in its output (what it prints for a wrong value, matched by `OEM_JOBS_FAIL_RE`), a generated script naming no jobs, or none of its jobs reporting success. If suspending fails, patching does not start. The `emcli` session is refreshed first, since it can expire during a window. If resuming fails, or some jobs did not resume, the run says so again as its very last line.
 6. **Patch:** the phases before `compute` start on the node in the background, and the script prints each phase as the node reports it.
 7. **Compute:** the compute nodes are upgraded from the jump server (see below).
 8. **Patch again:** the phases after `compute` (`switches`, `postcheck`, `resume`, `report`) run on the node.

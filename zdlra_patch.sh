@@ -59,6 +59,9 @@
 #   -s, --status        show the state of the latest run, or of --run-id ID
 #       --report        show the report of the latest run, or of --run-id ID
 #       --skip-backup-wait  quiesce does not wait for incoming backups to finish
+#       --expect-compute    this run upgrades the compute nodes (the jump server passes
+#                       it), so one off target fails the version table; without it,
+#                       that is a warning, as this script does not upgrade them
 #   -h, --help          show this help
 
 set -Eeuo pipefail
@@ -66,7 +69,7 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.7.1"
+VERSION="0.7.2"
 
 ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells switches postcheck resume report verify)
 
@@ -81,6 +84,7 @@ DETACH=0
 APPROVE_MODE=0
 BG_CHILD=0                      # set internally on the detached process
 STATUS_MODE=0
+EXPECT_COMPUTE=0
 REPORT_MODE=0
 FINAL_STATUS=""                 # status to record on success instead of "completed"
 PRESERVE_STATUS=0               # 1 = a failure now leaves the run's status unchanged
@@ -299,6 +303,7 @@ acquire_lock() {
     fi
     echo $$ > "$LOCK_FILE"
     LOCK_HELD=1
+    [[ -z "$RUN_DIR" ]] || echo $$ > "${RUN_DIR}/owner.pid"
 }
 
 # Phases this run has finished (real runs only), one per line in <run dir>/phases_done,
@@ -337,6 +342,7 @@ parse_args() {
             -a|--approve)    APPROVE_MODE=1; shift ;;
             -r|--run-id)     RUN_ID="$2"; shift 2 ;;
             --skip-backup-wait) SKIP_BACKUP_WAIT=1; shift ;;
+            --expect-compute) EXPECT_COMPUTE=1; shift ;;
             --continue)      CONTINUE=1; shift ;;
             -s|--status)     STATUS_MODE=1; shift ;;
             --report)        STATUS_MODE=1; REPORT_MODE=1; shift ;;
@@ -401,10 +407,28 @@ init_run() {
         mkdir -p "$RUN_DIR"
     fi
     LOG_FILE="${RUN_DIR}/zdlra_patch.log"
+    (( ! EXPECT_COMPUTE )) || touch "${RUN_DIR}/expect_compute"
     info "$SCRIPT_NAME $VERSION  run=$RUN_ID  dry_run=$DRY_RUN  background=$BACKGROUND  phases=${PHASES[*]}"
     (( BG_CHILD )) && info "Running detached as pid $$."
     [[ "$(id -un)" == "$REQUIRED_USER" ]] || die "Run as $REQUIRED_USER (current: $(id -un))."
     [[ -x "$RACLI" ]] || die "racli not found at $RACLI"
+}
+
+# The run's status. One that says it is running, but whose script and command have
+# both gone (killed, reboot, a refusal after detaching), reads as failed: nothing will
+# ever update it, and whoever is watching must not wait for ever. $1 = run folder.
+effective_status() {
+    local dir="$1" status f pid
+    status="$(cat "${dir}/status" 2>/dev/null || echo unknown)"
+    if [[ "$status" == *running* ]]; then
+        for f in owner.pid detached.pid; do
+            pid="$(cat "${dir}/${f}" 2>/dev/null || true)"
+            [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && { echo "$status"; return 0; }
+        done
+        echo "failed: the run's process is gone (last status: $status)"
+        return 0
+    fi
+    echo "$status"
 }
 
 # --status: show the state, background process and recent log of a run.
@@ -424,7 +448,7 @@ show_status() {
     fi
     echo "Run:     $(basename "$dir")"
     echo "Folder:  $dir"
-    echo "Status:  $(cat "${dir}/status" 2>/dev/null || echo unknown)"
+    echo "Status:  $(effective_status "$dir")"
     [[ -s "${dir}/phases_done" ]] && echo "Done:    $(paste -sd' ' "${dir}/phases_done")"
     if [[ -f "${dir}/background.pid" ]]; then
         local pid
@@ -522,6 +546,8 @@ run_external_precheck() {
         "$PRECHECK_WARN_MINUTES" "$cmd" ${args[@]+"${args[@]}"}
     rc="$DETACHED_RC"
     info "Precheck output: $out_file (exit code $rc)"
+    echo "$rc" > "${out_dir}/exit_code"
+    (( rc < 128 )) || die "Precheck was killed by a signal (exit code $rc), so its results can't be trusted. See $out_file"
 
     # Use the last summary section (colour codes removed). If the header is
     # missing, fall back to searching the whole output.
@@ -608,6 +634,7 @@ approve_precheck() {
         [[ -s "${dir}/failure_names.txt" ]] && while IFS= read -r name; do echo "  [FAIL] $name"; done < "${dir}/failure_names.txt"
         echo "Warnings:     $warns"
         [[ -s "${dir}/warning_names.txt" ]] && while IFS= read -r name; do echo "  [WARN] $name"; done < "${dir}/warning_names.txt"
+        echo "Exit code:    $(cat "${dir}/exit_code" 2>/dev/null || echo unknown)"
         echo "Full output:  ${dir}/output.txt"
         echo "Staged:       $(staged_value archive) (staged $(staged_value staged_at))"
         echo "  SHA-256     $(staged_value sha256)"
@@ -628,6 +655,7 @@ approve_precheck() {
         echo "approved_by=$approver"
         echo "approved_at=$(date '+%F %T %Z')"
         echo "approved_epoch=$(date +%s)"
+        echo "precheck_dry_run=$(sed -n 's/^dry_run=//p' "${RUN_DIR}/precheck_passed" 2>/dev/null)"
         echo "host=$(hostname)"
         echo "failures=$fails"
         echo "warnings=$warns"
@@ -646,6 +674,9 @@ require_approval() {
     local by epoch fp age max
     by="$(sed -n 's/^approved_by=//p' "$f")"
     epoch="$(sed -n 's/^approved_epoch=//p' "$f")"
+    if (( ! DRY_RUN )) && [[ "$(sed -n 's/^precheck_dry_run=//p' "$f")" == 1 ]]; then
+        die "The precheck of run $RUN_ID was a dry run, without PRECHECK_EVENT_ARGS. For a real run, run the precheck again with --execute and approve that."
+    fi
     fp="$(sed -n 's/^fingerprint=//p' "$f")"
     age=$(( $(date +%s) - epoch ))
     max=$(( PRECHECK_APPROVAL_MAX_AGE_HOURS * 3600 ))
@@ -774,6 +805,10 @@ wait_for_zero() {
 # ---------------------------------------------------------------------------
 phase_precheck() {
     info "== precheck =="
+    # A new precheck replaces the last one: its pass and approval no longer count, so
+    # patch steps refuse until this one passes and is approved.
+    rm -f -- "${RUN_DIR}/precheck_passed" "${RUN_DIR}/precheck_approval.txt"
+    phase_undone precheck
     run_ro "$RACLI" version || warn "racli version failed"
     run_ro "$RACLI" status appliance || die "Appliance status check failed"
 
@@ -805,7 +840,7 @@ phase_precheck() {
     # TODO: confirm the patch is valid for the current version (compare racli version with patch README).
 
     # Marks the precheck as passed, so a detached precheck can be approved later with --approve.
-    touch "${RUN_DIR}/precheck_passed"
+    echo "dry_run=$DRY_RUN" > "${RUN_DIR}/precheck_passed"
     approve_precheck
 }
 
@@ -1280,17 +1315,22 @@ patchmgr_attempt() {
 
 # Every cell must be on the target version. $1 = text with "cell: version" lines.
 check_cell_versions() {
-    local text="$1" target="$2" line cell ver bad=0 seen=0
+    local text="$1" target="$2" line cell ver bad=0 seen=" "
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9._-]+):[[:space:]]*([0-9][0-9.]*)[[:space:]]*$ ]] || continue
-        cell="${BASH_REMATCH[1]}"; ver="${BASH_REMATCH[2]}"; seen=$((seen + 1))
+        cell="${BASH_REMATCH[1]}"; ver="${BASH_REMATCH[2]}"; seen+="$cell "
         if [[ "$ver" == "$target" ]]; then
             info "    $cell: $ver"
         else
             err "    $cell: $ver (expected $target)"; bad=$((bad + 1))
         fi
     done <<<"$text"
-    (( seen > 0 )) || die "No cell versions found to check."
+    [[ "$seen" != " " ]] || die "No cell versions found to check."
+    # Every cell in the group must have answered, not just some of them.
+    while IFS= read -r cell; do
+        [[ "$seen" == *" $cell "* ]] && continue
+        err "    $cell: no version reported (expected $target)"; bad=$((bad + 1))
+    done < <(sed -e 's/\r$//' -e 's/[[:space:]]*$//' -e '/^[[:space:]]*$/d' "$CELL_GROUP_FILE")
     (( bad == 0 )) || die "$bad cell(s) not on $target."
 }
 
@@ -1343,8 +1383,11 @@ phase_cells() {
         step_mark_done cells_patch
     fi
 
+    # What patchmgr printed is only for the log: imageinfo decides.
     info "Image version reported by patchmgr:"
-    check_cell_versions "$(sed -n '/Current image version on cell(s) is:/,/For details/p' "${RUN_DIR}/cells_patch.log" | sed -E 's/^.*:INFO *: *//')" "$target"
+    sed -n '/Current image version on cell(s) is:/,/For details/p' "${RUN_DIR}/cells_patch.log" | sed -E 's/^.*:INFO *: *//' \
+        | grep -E '^[[:space:]]*[A-Za-z0-9._-]+:[[:space:]]*[0-9]' | sed 's/^/    /' >&2 \
+        || warn "    none found in cells_patch.log; imageinfo decides."
     info "Image version from imageinfo:"
     check_cell_versions "$(cell_versions)" "$target"
     info "All cells are on $target."
@@ -1360,8 +1403,11 @@ switch_type() { conf_value SWITCH_TYPE | tr '[:upper:]' '[:lower:]'; }
 report_switch_plan() {
     local type loc
     type="$(switch_type || true)"
-    if [[ "$type" != roce ]]; then
-        warn "Switches:     SWITCH_TYPE is '${type:-not set}': only RoCE switches are patched here; the switches phase will skip them"
+    if [[ "$type" == ib ]]; then
+        warn "Switches:     SWITCH_TYPE is IB: only RoCE switches are patched here; the switches phase will skip them"
+        return 0
+    elif [[ "$type" != roce ]]; then
+        warn "Switches:     SWITCH_TYPE is '${type:-not set}', not roce or ib: the switches phase will stop"
         return 0
     fi
     if loc="$(switch_patch_location)"; then
@@ -1424,10 +1470,11 @@ phase_switches() {
     info "== switches (RoCE) =="
     local type loc dir
     type="$(switch_type || true)"
-    if [[ "$type" != roce ]]; then
-        warn "SWITCH_TYPE is '${type:-not set}', not roce: only RoCE switches are patched by this script. Switches NOT patched."
+    if [[ "$type" == ib ]]; then
+        warn "SWITCH_TYPE is IB: only RoCE switches are patched by this script. Switches NOT patched."
         return 0
     fi
+    [[ "$type" == roce ]] || die "SWITCH_TYPE is '${type:-not set}' in $(staged_value patch_conf), not roce or ib: cannot tell what to do with the switches."
     loc="$(switch_patch_location)" || die "Switch patch: $loc"
     dir="${loc#* }"
     [[ -s "$SWITCH_GROUP_FILE" ]] || die "$SWITCH_GROUP_FILE is missing or empty."
@@ -1501,18 +1548,19 @@ version_row() {
 }
 
 # Rows from "name: version" lines (dcli ... imageinfo -ver), one per expected name.
-# $1 component, $2 target, $3 dcli output, rest = names
+# $1 component, $2 target, $3 dcli output, $4 "soft" or empty (see version_row), rest = names
 image_rows() {
-    local comp="$1" target="$2" text="$3" name ver; shift 3
+    local comp="$1" target="$2" text="$3" mode="$4" name ver; shift 4
     for name in "$@"; do
         ver="$(sed -nE "s/^[[:space:]]*${name//./[.]}:[[:space:]]*([0-9][0-9.]*)[[:space:]]*$/\1/p" <<<"$text" | head -1 || true)"
-        version_row "$comp" "$name" "$ver" "$target" "$([[ -n "$ver" && "$ver" == "$target" ]] && echo 1 || echo 0)"
+        version_row "$comp" "$name" "$ver" "$target" "$([[ -n "$ver" && "$ver" == "$target" ]] && echo 1 || echo 0)" "$mode"
     done
 }
 
 # Every component's version against its target, shown and saved to versions.txt.
-# A compute node, cell or switch on another version fails (dry run: a warning, as
-# nothing has been patched); the RA line is a warning only, like after ra_update.
+# A cell or switch on another version fails, and so does a compute node if this run
+# upgrades them (--expect-compute); dry run: a warning, as nothing has been patched.
+# The RA line is a warning only, like after ra_update.
 version_summary() {
     info "Versions after patching:"
     VERSION_ROWS=(); VERSION_BAD=0; VERSION_SOFT=0; VERSION_UNREAD=0
@@ -1529,7 +1577,9 @@ version_summary() {
     IFS=',' read -r -a names <<<"$(staged_value component_COMPUTE_NODE | tr -d ' ')"
     if (( ${#names[@]} )); then
         text="$("$DCLI" -l root -c "$(IFS=,; echo "${names[*]}")" 'imageinfo -ver' 2>&1 || true)"
-        image_rows compute "$target" "$text" "${names[@]}"
+        local mode=soft
+        [[ ! -f "${RUN_DIR}/expect_compute" ]] || mode=""
+        image_rows compute "$target" "$text" "$mode" "${names[@]}"
     else
         version_row compute "-" "" "$target" 0
     fi
@@ -1538,15 +1588,17 @@ version_summary() {
     mapfile -t names < <(sed '/^[[:space:]]*$/d' "$CELL_GROUP_FILE" 2>/dev/null)
     if (( ${#names[@]} )); then
         text="$(cell_versions || true)"
-        image_rows cell "$target" "$text" "${names[@]}"
+        image_rows cell "$target" "$text" "" "${names[@]}"
     else
         version_row cell "-" "" "$target" 0
     fi
 
     target="$(conf_value TARGET_SWITCH_VERSION || true)"
-    if [[ "$(switch_type || true)" != roce ]]; then
-        VERSION_ROWS+=("$(printf '%-9s %-20s %-34s %-24s %s' switch "-" "(not RoCE: not patched here)" "${target:-<not set>}" "SKIPPED")")
-    elif [[ -s "$SWITCH_GROUP_FILE" ]]; then
+    local type
+    type="$(switch_type || true)"
+    if [[ "$type" == ib ]]; then
+        VERSION_ROWS+=("$(printf '%-9s %-20s %-34s %-24s %s' switch "-" "(InfiniBand: not patched here)" "${target:-<not set>}" "SKIPPED")")
+    elif [[ "$type" == roce && -s "$SWITCH_GROUP_FILE" ]]; then
         while IFS= read -r sw; do
             [[ -n "$sw" ]] || continue
             if text="$(switch_version "$sw")"; then
@@ -1566,7 +1618,7 @@ version_summary() {
     while IFS= read -r line; do info "  $line"; done < "${RUN_DIR}/versions.txt"
 
     (( VERSION_UNREAD == 0 )) || warn "$VERSION_UNREAD version(s) could not be read or have no target; check them by hand."
-    (( VERSION_SOFT == 0 )) || warn "racli version does not show TARGET_RA_VERSION; check: $RACLI version"
+    (( VERSION_SOFT == 0 )) || warn "$VERSION_SOFT component(s) marked CHECK are off target or unconfirmed: racli version not showing TARGET_RA_VERSION, or compute nodes in a run that does not upgrade them (the jump server does that)."
     if (( VERSION_BAD )); then
         if (( DRY_RUN )); then
             warn "[dry-run] $VERSION_BAD component(s) not on target yet (nothing was patched)."
@@ -1701,6 +1753,7 @@ start_background() {
     local pid=$!
     echo "$pid" > "${RUN_DIR}/background.pid"
     echo "$pid" > "$LOCK_FILE"
+    echo "$pid" > "${RUN_DIR}/owner.pid"
     LOCK_HANDED_OFF=1
     set_status "running in background (pid $pid): ${BG_PHASES[*]}"
     info "Remaining phases started in the background as pid $pid: ${BG_PHASES[*]}"

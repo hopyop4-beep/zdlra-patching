@@ -50,7 +50,7 @@ usage() { awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' 
 parse_args() {
     while (( $# )); do
         case "$1" in
-            targets|start|status|stop) ACTION="$1"; shift ;;
+            targets|start|status|stop|login) ACTION="$1"; shift ;;
             -z|--zdlra)   ZDLRA="$2"; shift 2 ;;
             -c|--config)  CONFIG_FILE="$2"; shift 2 ;;
             -x|--execute) DRY_RUN=0; shift ;;
@@ -153,6 +153,9 @@ do_stop() {
     mv "$(state_file)" "$(state_file).stopped_$(date +%Y%m%d_%H%M%S)"
     info "Blackout $name stopped."
 }
+
+# Only make sure emcli has a session (for the OEM jobs, whose script uses it too).
+do_login() { ensure_login; }
 
 main() {
     parse_args "$@"
