@@ -233,8 +233,19 @@ run_jobs_cmd() {
     info "[exec] $label OEM jobs: ${OEM_JOBS_DIR:+cd $OEM_JOBS_DIR && }${cmd[*]}"
     # The output is shown as it comes and also checked: a nonzero exit or a line
     # matching OEM_JOBS_FAIL_RE (the script's error and usage text) counts as failed.
-    local out rc marker
-    out="$(mktemp)"; marker="$(mktemp)"    # marker: files newer than this were made by this call
+    local out rc marker=""
+    out="$(mktemp)"
+    # Files newer than the marker were made by this call. It goes in the folder they appear
+    # in, so both timestamps come from the same clock even on a shared mount. The pause is
+    # for a filesystem that only keeps whole seconds: "newer" must not depend on the second.
+    if [[ -n "$OEM_JOBS_GENERATED" ]]; then
+        marker="$(mktemp "${OEM_JOBS_DIR:-.}/.zdlra_marker.XXXXXX")" || {
+            err "$label OEM jobs: cannot write in ${OEM_JOBS_DIR:-the current folder}."
+            rm -f "$out"
+            return 1
+        }
+        sleep 1
+    fi
     ( if [[ -n "$OEM_JOBS_DIR" ]]; then cd "$OEM_JOBS_DIR" || exit 1; fi; "${cmd[@]}" ) 2>&1 | tee "$out"
     rc=${PIPESTATUS[0]}
     if (( rc == 0 )) && [[ -n "$OEM_JOBS_FAIL_RE" ]] && grep -qE "$OEM_JOBS_FAIL_RE" "$out"; then
@@ -245,7 +256,7 @@ run_jobs_cmd() {
     if (( rc == 0 )) && [[ -n "$OEM_JOBS_GENERATED" ]]; then
         run_generated_jobs_script "$label" "$marker" || rc=1
     fi
-    rm -f "$marker"
+    [[ -z "$marker" ]] || rm -f "$marker"
     return "$rc"
 }
 

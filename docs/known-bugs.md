@@ -4,7 +4,7 @@ From a code review of all the code on `main` (commit 59ab2d5), on 2026-11-03. No
 are fixed yet. Line numbers are from that commit. Almost all of this also applies to the
 `platinum` branch, which has its own list in `docs/platinum-known-bugs.md`.
 
-**Bugs 1-33 and 43-48 are fixed (2026-11-03), tested with stand-ins only.** The rest are still open. Even a dry run executes the real precheck, which changes the system.
+**Bugs 1-34 and 43-48 are fixed (2026-11-03), tested with stand-ins only.** The rest are still open. Even a dry run executes the real precheck, which changes the system.
 
 How far each finding was checked:
 
@@ -103,7 +103,7 @@ Found and fixed while testing these:
     `patchmgr` itself ran on, it looked finished. The check and the start guard now look for
     `patchmgr -dbnodes` too. A surviving one is waited for, and a new start is refused.
 
-## Fixed: other bugs (23-33)
+## Fixed: other bugs (23-34)
 
 Fixed on `main`, tested with stand-ins on a PC only. The items marked "check" depend on real output.
 
@@ -122,12 +122,11 @@ Fixed on `main`, tested with stand-ins on a PC only. The items marked "check" de
 31. **`verify` could falsely say no replication was paused.** It now reads the files directly.
 32. **An empty `STAGED_RECORD` crashed the precheck.** It no longer does.
 33. **A refused run left an empty folder.** A run refused before it takes the lock now removes its folder.
+34. **The OEM jobs check compared clocks across what may be a shared mount.** The marker is now created
+    inside `OEM_JOBS_DIR`, so both timestamps come from the same clock.
 
 ## Other bugs
 
-34. **The OEM jobs check compares clocks across what may be a shared mount**
-    (`jump/zdlra_patch_run.sh:224`). Skew can make it miss the new script. Create the marker inside
-    `OEM_JOBS_DIR`.
 35. **`staging/zdlra_stage.sh`:**
     - a. `on_node` has no `ssh -n` (`:225`), so it swallows input, and only the first extra backup is
       removed.
