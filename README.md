@@ -6,7 +6,7 @@ A phased Bash script to automate patching of the Oracle Zero Data Loss Recovery 
 
 ## How it works
 
-For a detailed walkthrough with diagrams, see [docs/how-it-works.html](docs/how-it-works.html). It covers how the scripts and functions connect, the stages, failure handling and the files they leave behind. GitHub shows HTML as source, so download it and open it in a browser. It describes v0.7.8, so its line numbers may drift as the scripts change.
+For a detailed walkthrough with diagrams, see [docs/how-it-works.html](docs/how-it-works.html). It covers how the scripts and functions connect, the stages, failure handling and the files they leave behind, and section 13 traces a real run step by step through the code. GitHub shows HTML as source, so download it and open it in a browser. It describes v0.7.8, so its line numbers may drift as the scripts change.
 
 The script breaks a patch into phases. You can run them one at a time or all together:
 
