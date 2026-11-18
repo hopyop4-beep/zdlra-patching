@@ -1,0 +1,28 @@
+---
+# The controller's record of this run, in zdlra_controller_state (JSON): the blackout, the
+# OEM jobs and the finished compute passes. With zdlra_cstate_set (a dict), those keys are
+# changed and saved; without it, the record is only read. Sets zdlra_cstate.
+
+- name: Read the controller's record of the run
+  ansible.builtin.slurp:
+    src: "{{ zdlra_controller_state }}"
+  register: zdlra_cstate_raw
+  delegate_to: localhost
+  failed_when: false
+
+- name: Parse it
+  ansible.builtin.set_fact:
+    zdlra_cstate: "{{ (zdlra_cstate_raw.content | b64decode | from_json) if zdlra_cstate_raw.content is defined else {} }}"
+
+- name: Save the change
+  when: zdlra_cstate_set is defined
+  block:
+    - name: Merge the change
+      ansible.builtin.set_fact:
+        zdlra_cstate: "{{ zdlra_cstate | combine(zdlra_cstate_set) }}"
+    - name: Write the record
+      ansible.builtin.copy:
+        dest: "{{ zdlra_controller_state }}"
+        content: "{{ zdlra_cstate | to_nice_json }}\n"
+        mode: "0600"
+      delegate_to: localhost

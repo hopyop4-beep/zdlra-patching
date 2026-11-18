@@ -1,0 +1,149 @@
+---
+# Defaults for the zdlra_patch role. Override them in inventory/group_vars or
+# inventory/host_vars (per appliance), or with -e. The names follow zdlra_patch.conf and
+# jump/zdlra_jump.conf, lower-cased with a zdlra_ prefix.
+
+# --- Run ---------------------------------------------------------------------
+# Dry run is the default: commands that change something are only shown. Read-only
+# commands, and Oracle's precheck, still run. Pass -e zdlra_execute=true to run for real.
+# --check also means a dry run.
+zdlra_execute: false
+# Continue an existing run (its folder, approval and finished phases). Empty = a new run.
+zdlra_run_id: ""
+# Ask "type YES" before each racli step, the cell patch and the switch upgrade, as the
+# script does without --yes. The precheck approval (type APPROVE) is always asked.
+zdlra_confirm_steps: true
+# The upgrade of the compute nodes, between cells and switches. false = like
+# zdlra_patch.sh on its own: compute nodes off target are only a warning.
+zdlra_compute_enabled: true
+# Leave the blackout and the suspended OEM jobs as they are when the run completes.
+zdlra_keep_blackout: false
+# quiesce does not wait for incoming backups to finish.
+zdlra_skip_backup_wait: false
+# Accept the warnings a compute patchmgr stopped on (zdlra_compute_pause_on_warnings),
+# once they are reviewed.
+zdlra_accept_warnings: false
+
+# --- Paths on the compute nodes -------------------------------------------------
+zdlra_racli: /opt/oracle.RecoveryAppliance/bin/racli
+zdlra_staged_record: /radump/patches/ZDLRA_STAGED.txt
+zdlra_work_dir: /radump/zdlra_patch_runs
+zdlra_min_free_gb: 50
+zdlra_required_user: root
+zdlra_helper_dir: /root/zdlra-ansible           # where the role copies its two helper scripts
+zdlra_dcli: dcli
+
+# Ansible polls a long command every this many seconds, and gives up watching after
+# zdlra_wait_max_hours. Giving up only stops watching: the command keeps running on the
+# node, and running the playbook again with the same zdlra_run_id picks it up.
+zdlra_poll_seconds: 30
+zdlra_wait_max_hours: 12
+
+# --- External precheck ------------------------------------------------------------
+# Oracle's precheck, run as ./precheck -srnumber=<SR> from its own folder. {sr_number}
+# is SR_NUMBER= from the conf file staging set up; {patch_conf} is that file's path.
+zdlra_precheck_script: /radump/patches/bin/precheck
+zdlra_precheck_args: ["-srnumber={sr_number}"]
+zdlra_precheck_cwd: ""                          # empty = the script's own folder
+zdlra_precheck_event_args: ["-recheck_all"]     # added on a real run only
+zdlra_precheck_warn_minutes: 60                 # a warning only: never stopped
+zdlra_precheck_summary_header: FAILURE SUMMARY
+zdlra_precheck_fail_pattern: '\[FAIL\]'
+zdlra_precheck_warn_pattern: '\[WARN\]'
+zdlra_precheck_fail_on_warn: false
+zdlra_precheck_waivers: []                      # parts of failure names reviewed and accepted
+zdlra_precheck_required: true
+zdlra_precheck_require_approval: true
+zdlra_precheck_approval_max_age_hours: 24
+zdlra_postcheck_rerun_precheck: true
+
+# --- RA software upgrade ----------------------------------------------------------
+# {ra_release} = ra_release= from the staged record; {gold_images_path} = the setting below.
+zdlra_ra_preinstall_args: [run, preinstall, "--zdlra_release_file={ra_release}"]
+zdlra_ra_preinstall_success: "End: ra_preinstall post cleanup"
+zdlra_ra_preinstall_fail_re: '(CHECK|HOST):.*FAIL'
+zdlra_ra_preinstall_done_file: /root/.ra_preinstall.install
+zdlra_ra_preinstall_warn_minutes: 60
+zdlra_ra_gold_images_path: /radump/
+zdlra_ra_alter_args: [alter, appliance, --online_updates, "--gold_images_path={gold_images_path}"]
+zdlra_ra_alter_success: "End: Alter Appliance"
+zdlra_ra_alter_warn_minutes: 60
+zdlra_ra_update_args: [update, appliance, --ignore_incidents]
+zdlra_ra_update_success: "End: Patch Recovery Appliance - Step [Patch]"
+zdlra_ra_update_warn_minutes: 240
+
+# --- Storage cells ------------------------------------------------------------------
+zdlra_cell_group_file: /root/cell_group
+zdlra_patch_tmp_dir: /radump/patches/tmp        # where staging unzipped the patches
+zdlra_patch_files_dir: /radump/patches/patches  # the patch zips
+zdlra_cell_prereq_step: -patch_check_prereq
+zdlra_cell_recovery_steps: [-reset_force, -cleanup]
+zdlra_cell_patch_extra_args: []
+zdlra_cell_patch_warn_minutes: 360
+
+# --- RoCE switches ------------------------------------------------------------------
+zdlra_switch_group_file: /root/switch_group
+zdlra_switch_precheck_args: [--upgrade, --roceswitch-precheck]
+zdlra_switch_upgrade_args: [--upgrade]
+zdlra_switch_patch_warn_minutes: 180
+# Prints one switch's version; {switch} is its name. Run on the patch node.
+zdlra_switch_version_cmd: "ssh -o BatchMode=yes -o ConnectTimeout=15 admin@{switch} 'show version'"
+
+# --- Admin switches (placeholder, as in the script) -----------------------------------
+# TODO(site): the commands are only copies of the RoCE ones. A real run skips the phase,
+# with a warning, until zdlra_admin_switch_enabled is true. {group} = the group file.
+zdlra_admin_switch_enabled: false
+zdlra_admin_switch_group_file: /root/admin_switch_group
+zdlra_admin_switch_precheck_args: [--roceswitches, "{group}", --upgrade, --roceswitch-precheck]
+zdlra_admin_switch_upgrade_args: [--roceswitches, "{group}", --upgrade]
+
+# --- Replication and incoming backups --------------------------------------------------
+zdlra_sqlplus: sqlplus
+zdlra_ra_oracle_home: ""                        # found from the running database if empty
+zdlra_ra_oracle_sid: ""
+# raAutomation/<password>. Keep it in an Ansible Vault file (see
+# inventory/group_vars/all/vault.yml.example). Empty = the SQL steps are not set up.
+zdlra_ra_sql_connect: ""
+zdlra_replication_servers_sql: >-
+  select remote_ra_dbname from ra_replication_pair
+  where upper(replication_server_state) = 'RUNNING'
+  and upper(replication_server_role) in ('UPSTREAM','PAIRED');
+zdlra_replication_status_sql: >-
+  select remote_ra_dbname || '  state=' || replication_server_state || '  role=' || replication_server_role
+  from ra_replication_pair;
+zdlra_replication_pause_sql: "begin dbms_ra.pause_replication_server(replication_server_name => '{server}'); end;"
+zdlra_replication_resume_sql: "begin dbms_ra.resume_replication_server(replication_server_name => '{server}'); end;"
+zdlra_active_backups_sql: >-
+  select count(*) from gv$session s where s.status = 'ACTIVE'
+  and (lower(s.program) like '%rman%' or lower(s.module) like '%rman%');
+zdlra_active_backups_list_sql: >-
+  select 'inst=' || s.inst_id || ' sid=' || s.sid || ',' || s.serial# || '  ' || s.program
+  || '  machine=' || s.machine || '  event=' || s.event || '  wait=' || s.seconds_in_wait || 's'
+  from gv$session s where s.status = 'ACTIVE'
+  and (lower(s.program) like '%rman%' or lower(s.module) like '%rman%') order by s.inst_id, s.sid;
+zdlra_quiesce_poll_seconds: 60
+zdlra_quiesce_timeout_minutes: 120
+zdlra_quiesce_wait_for_backups: true
+zdlra_quiesce_allow_unconfigured: false
+
+# --- verify ---------------------------------------------------------------------------
+# Each query prints one number; {since} becomes to_date('<time>', 'YYYY-MM-DD HH24:MI:SS'),
+# when resume ran. TODO(site): fill in both queries.
+zdlra_verify_backups_sql: ""
+zdlra_verify_replication_sql: ""
+zdlra_verify_poll_seconds: 300
+zdlra_verify_timeout_minutes: 210
+
+# --- Compute nodes (run from the controller, as from the jump server) -------------------
+zdlra_compute_work_dir: /radump/zdlra_compute
+zdlra_compute_warn_minutes: 240
+zdlra_compute_version_wait_minutes: 60
+zdlra_node_ready_cmd: "ps -eo args= | grep -q '[o]ra_pmon_'"
+zdlra_node_ready_minutes: 30
+zdlra_compute_pause_on_warnings: false
+
+# --- Controller side ------------------------------------------------------------------
+# Per-run state kept on the controller (blackout, OEM jobs, finished compute passes) and
+# copies of the compute logs.
+zdlra_state_dir: "{{ lookup('env', 'HOME') }}/zdlra_ansible_state"
+zdlra_log_dir: "{{ lookup('env', 'HOME') }}/zdlra_ansible_logs"

@@ -1,0 +1,14 @@
+---
+# One-line state of the run in <run dir>/status (zdlra_status), and a line in the run's log.
+- name: "Status: {{ zdlra_status }}"
+  ansible.builtin.copy:
+    dest: "{{ zdlra_run_dir }}/status"
+    content: "{{ now(fmt='%Y-%m-%d %H:%M:%S') }}  {{ zdlra_status }}\n"
+    mode: "0640"
+
+- name: Log the status
+  ansible.builtin.lineinfile:
+    path: "{{ zdlra_run_dir }}/zdlra_patch.log"
+    line: "{{ now(fmt='%Y-%m-%d %H:%M:%S') }} [INFO ] {{ zdlra_status }}"
+    create: true
+    mode: "0640"

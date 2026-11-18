@@ -1,0 +1,98 @@
+---
+# ra_preinstall: racli run preinstall with the ZDLRA software from the staged record
+# (ra_release=). Success: the success line, no CHECK:/HOST: line saying FAIL, and the done
+# file written by this run. It must follow the precheck, which rolls back what it installs.
+
+- name: Work out the pre-install command
+  ansible.builtin.set_fact:
+    zdlra_ra_release: "{{ zdlra_staged.ra_release | default('') }}"
+    zdlra_ra_cmd_args: "{{ zdlra_ra_preinstall_args | zdlra_fill({'ra_release': zdlra_staged.ra_release | default(''), 'gold_images_path': zdlra_ra_gold_images_path}) }}"
+
+- name: Check the staged record names the ZDLRA software
+  ansible.builtin.assert:
+    that: zdlra_ra_release | length > 0
+    fail_msg: The staged record has no ra_release (the ZDLRA software zip). Stage again with the current staging script.
+    quiet: true
+
+- name: Look for the ZDLRA software zip and an earlier attempt's result
+  ansible.builtin.command:
+    argv: [/bin/bash, -c, '[ -f "$1" ] && echo zip=yes || echo zip=no; "$2" state "$3/ra_preinstall.log" "$3/detached.pid"', x,
+           "{{ zdlra_ra_release }}", "{{ zdlra_detached }}", "{{ zdlra_run_dir }}"]
+  register: zdlra_pi_look
+  changed_when: false
+
+- name: "[dry-run] pre-install"
+  ansible.builtin.debug:
+    msg:
+      - "[dry-run] {{ zdlra_racli }} {{ zdlra_ra_cmd_args | join(' ') }}"
+      - "  success: '{{ zdlra_ra_preinstall_success }}', no lines matching '{{ zdlra_ra_preinstall_fail_re }}', {{ zdlra_ra_preinstall_done_file }} written"
+      - "{{ '' if 'zip=yes' in zdlra_pi_look.stdout else 'WARNING: ZDLRA software zip not found: ' ~ zdlra_ra_release }}"
+  when: zdlra_dry_run
+
+- name: Pre-install
+  when: not zdlra_dry_run
+  vars:
+    _fresh: "{{ zdlra_pi_look.stdout_lines[-1] == 'none' }}"
+    _log: "{{ zdlra_run_dir }}/ra_preinstall.log"
+    _marker: "{{ zdlra_run_dir }}/.ra_preinstall.start"
+  block:
+    - name: Check the ZDLRA software zip is there
+      ansible.builtin.assert:
+        that: "'zip=yes' in zdlra_pi_look.stdout"
+        fail_msg: "ZDLRA software zip not found: {{ zdlra_ra_release }}"
+        quiet: true
+      when: _fresh | bool
+
+    # With a result or a run left by an earlier attempt, nothing starts: keep its marker.
+    - name: Confirm and mark the start
+      when: _fresh | bool
+      block:
+        - name: Confirm the pre-install
+          ansible.builtin.include_tasks: confirm.yml
+          vars:
+            zdlra_confirm_text: "Run '{{ zdlra_racli }} {{ zdlra_ra_cmd_args | join(' ') }}'?"
+        - name: Mark the start
+          ansible.builtin.file:
+            path: "{{ _marker }}"
+            state: touch
+            mode: "0640"
+
+    - name: Run racli run preinstall
+      ansible.builtin.include_tasks: racli_step.yml
+      vars:
+        zdlra_ra_name: preinstall
+        zdlra_ra_args: "{{ zdlra_ra_cmd_args }}"
+        zdlra_ra_warn: "{{ zdlra_ra_preinstall_warn_minutes }}"
+        zdlra_ra_success: "{{ zdlra_ra_preinstall_success }}"
+
+    - name: Look for failed checks and the done file
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -c
+          - 'grep -E -- "$2" "$1" | head -20; if [ -n "$3" ] && [ ! "$3" -nt "$4" ]; then echo "NO_DONE_FILE"; fi; true'
+          - x
+          - "{{ _log }}"
+          - "{{ zdlra_ra_preinstall_fail_re }}"
+          - "{{ zdlra_ra_preinstall_done_file }}"
+          - "{{ _marker }}"
+      register: zdlra_pi_check
+      changed_when: false
+
+    - name: Pre-install did not pass
+      when: zdlra_pi_check.stdout | trim | length > 0
+      block:
+        - name: Mark the result as used
+          ansible.builtin.command: "{{ zdlra_detached }} collect {{ _log }}"
+          changed_when: false
+        - name: Stop
+          ansible.builtin.fail:
+            msg: >-
+              {{ ('racli preinstall did not write ' ~ zdlra_ra_preinstall_done_file)
+                 if zdlra_pi_check.stdout_lines == ['NO_DONE_FILE']
+                 else 'racli preinstall reported failed checks: ' ~ (zdlra_pi_check.stdout_lines | reject('equalto', 'NO_DONE_FILE') | join(' | ')) }}.
+              Log: {{ _log }}
+
+    - name: Pre-install passed
+      ansible.builtin.debug:
+        msg: Pre-install passed all checks.

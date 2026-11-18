@@ -1,0 +1,21 @@
+---
+# Fingerprint of the before-patching precheck results and the staged archive, worked out
+# as zdlra_patch.sh does, so an approval only covers what was reviewed. Sets zdlra_fingerprint.
+- name: Fingerprint the precheck results and the staged archive
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - -c
+      - >-
+        set -o pipefail;
+        { cat "$1/precheck_before/failure_names.txt" "$1/precheck_before/warning_names.txt" 2>/dev/null;
+        echo "staged=$2"; } | sha256sum | cut -d' ' -f1
+      - fingerprint
+      - "{{ zdlra_run_dir }}"
+      - "{{ zdlra_staged.sha256 | default('') }}"
+  register: zdlra_fp
+  changed_when: false
+
+- name: Remember the fingerprint
+  ansible.builtin.set_fact:
+    zdlra_fingerprint: "{{ zdlra_fp.stdout | trim }}"

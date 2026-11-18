@@ -1,0 +1,48 @@
+---
+# Pause one replication server (zdlra_server). It is listed in replication_paused.txt before
+# the pause, so a stop just after the pause can't leave it paused and forgotten; it only
+# counts as paused (replication_pause_confirmed.txt) once the pause has worked.
+
+- name: "{{ zdlra_server }}: already paused by this run"
+  ansible.builtin.debug:
+    msg: "Replication server {{ zdlra_server }} already paused by this run."
+  when: zdlra_server in zdlra_confirmed
+
+- name: "{{ zdlra_server }}: pause it"
+  when: zdlra_server not in zdlra_confirmed
+  block:
+    - name: "{{ zdlra_server }}: list it as paused first"
+      ansible.builtin.lineinfile:
+        path: "{{ zdlra_run_dir }}/replication_paused.txt"
+        line: "{{ zdlra_server }}"
+        create: true
+        mode: "0640"
+      when: not zdlra_dry_run
+
+    - name: "{{ zdlra_server }}: pause"
+      ansible.builtin.include_tasks: sql.yml
+      vars:
+        zdlra_sql_text: "{{ zdlra_replication_pause_sql | replace('{server}', zdlra_server) }}"
+        zdlra_sql_mode: exec
+        zdlra_sql_fatal: false
+
+    - name: "{{ zdlra_server }}: the pause failed"
+      when: not zdlra_sql_ok
+      block:
+        # It failed, so there's nothing to resume.
+        - name: "{{ zdlra_server }}: take it off the list"
+          ansible.builtin.lineinfile:
+            path: "{{ zdlra_run_dir }}/replication_paused.txt"
+            line: "{{ zdlra_server }}"
+            state: absent
+        - name: "{{ zdlra_server }}: stop"
+          ansible.builtin.fail:
+            msg: "Could not pause replication server {{ zdlra_server }}."
+
+    - name: "{{ zdlra_server }}: confirmed paused"
+      ansible.builtin.lineinfile:
+        path: "{{ zdlra_run_dir }}/replication_pause_confirmed.txt"
+        line: "{{ zdlra_server }}"
+        create: true
+        mode: "0640"
+      when: not zdlra_dry_run

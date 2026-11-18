@@ -1,0 +1,29 @@
+---
+# switches: upgrade the RoCE switches (--roceswitch-precheck, then --upgrade). An InfiniBand
+# rack (SWITCH_TYPE IB) is skipped with a warning; any other value that isn't roce stops.
+
+- name: InfiniBand rack
+  when: zdlra_switch_type == 'ib'
+  block:
+    - name: Skip the switches
+      ansible.builtin.debug:
+        msg: "WARNING: SWITCH_TYPE is IB: only RoCE switches are patched here. Switches NOT patched."
+    - name: Record the phase as skipped
+      ansible.builtin.set_fact:
+        zdlra_phase_skipped: true
+
+- name: Check SWITCH_TYPE
+  ansible.builtin.fail:
+    msg: "SWITCH_TYPE is '{{ zdlra_switch_type or 'not set' }}' in {{ zdlra_staged.patch_conf | default('the conf file') }}, not roce or ib: cannot tell what to do with the switches."
+  when: zdlra_switch_type not in ['roce', 'ib']
+
+- name: Upgrade the RoCE switches
+  ansible.builtin.include_tasks: switch_upgrade.yml
+  vars:
+    zdlra_sw_prefix: switches
+    zdlra_sw_label: RoCE switches
+    zdlra_sw_group_file: "{{ zdlra_switch_group_file }}"
+    zdlra_sw_precheck_args: "{{ ['--roceswitches', zdlra_switch_group_file] + zdlra_switch_precheck_args }}"
+    zdlra_sw_upgrade_args: "{{ ['--roceswitches', zdlra_switch_group_file] + zdlra_switch_upgrade_args }}"
+    zdlra_sw_target: "{{ zdlra_conf.TARGET_SWITCH_VERSION | default('') }}"
+  when: zdlra_switch_type == 'roce'

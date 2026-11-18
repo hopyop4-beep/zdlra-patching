@@ -1,0 +1,27 @@
+---
+# report: a summary of the run, with the version table, in <run dir>/report.txt.
+
+- name: Re-read the run's records
+  ansible.builtin.include_tasks: read_state.yml
+
+- name: Read the approval, the paused servers and the version table
+  ansible.builtin.slurp:
+    src: "{{ zdlra_run_dir }}/{{ item }}"
+  register: zdlra_rep_files
+  failed_when: false
+  loop: [precheck_approval.txt, replication_paused.txt, replication_paused_resumed.txt, versions.txt]
+
+- name: Write the report
+  vars:
+    _f: "{{ dict(zdlra_rep_files.results | map(attribute='item') | zip(zdlra_rep_files.results | map(attribute='content', default='') | map('b64decode'))) }}"
+    _approval: "{{ _f['precheck_approval.txt'] | zdlra_kv }}"
+    _paused: "{{ ((_f['replication_paused.txt'] | zdlra_lines) + (_f['replication_paused_resumed.txt'] | zdlra_lines)) | unique | sort }}"
+    _skipped: "{{ zdlra_skipped | difference(zdlra_done) }}"
+  ansible.builtin.template:
+    src: report.txt.j2
+    dest: "{{ zdlra_run_dir }}/report.txt"
+    mode: "0640"
+
+- name: Report written
+  ansible.builtin.debug:
+    msg: "Report written to {{ zdlra_run_dir }}/report.txt"

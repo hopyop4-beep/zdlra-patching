@@ -1,0 +1,66 @@
+---
+# verify: after the OEM backup jobs are resumed, wait for new backups to arrive, and
+# replication too if this run paused it, counted from when resume ran. Nothing arriving
+# within zdlra_verify_timeout_minutes is a warning only. The result is added to the report.
+
+- name: Re-read the run's records (when resume ran)
+  ansible.builtin.include_tasks: read_state.yml
+
+- name: Read the node's clock
+  ansible.builtin.command: date '+%F %T'
+  register: zdlra_vf_now
+  changed_when: false
+
+- name: Work out what to check
+  ansible.builtin.set_fact:
+    zdlra_vf_since: "{{ zdlra_resumed or zdlra_vf_now.stdout }}"
+    zdlra_vf_sql_ready: "{{ zdlra_ra_sql_connect | length > 0 and '<password>' not in zdlra_ra_sql_connect }}"
+
+- name: Did this run pause any replication?
+  ansible.builtin.command:
+    argv: [/bin/bash, -c, 'cat "$1"/replication_paused*.txt 2>/dev/null | grep -c . || true', x, "{{ zdlra_run_dir }}"]
+  register: zdlra_vf_paused
+  changed_when: false
+
+- name: Set the checks
+  vars:
+    _since_sql: "to_date('{{ zdlra_vf_since }}', 'YYYY-MM-DD HH24:MI:SS')"
+  ansible.builtin.set_fact:
+    zdlra_vf_checks: >-
+      {{ ([{'name': 'backups', 'sql': zdlra_verify_backups_sql | replace('{since}', _since_sql)}]
+          if zdlra_vf_sql_ready and zdlra_verify_backups_sql | length > 0 else [])
+         + ([{'name': 'replication', 'sql': zdlra_verify_replication_sql | replace('{since}', _since_sql)}]
+          if zdlra_vf_sql_ready and zdlra_verify_replication_sql | length > 0 and zdlra_vf_paused.stdout | int > 0 else []) }}
+    zdlra_vf_notes: >-
+      {{ (['not checked: zdlra_ra_sql_connect is not set up'] if not zdlra_vf_sql_ready else [])
+         + (['backups: not checked (zdlra_verify_backups_sql not set)'] if zdlra_vf_sql_ready and zdlra_verify_backups_sql | length == 0 else [])
+         + (['replication: not checked (this run paused none)'] if zdlra_vf_sql_ready and zdlra_vf_paused.stdout | int == 0 else [])
+         + (['replication: not checked (zdlra_verify_replication_sql not set)'] if zdlra_vf_sql_ready and zdlra_vf_paused.stdout | int > 0 and zdlra_verify_replication_sql | length == 0 else []) }}
+
+- name: Wait for each to arrive
+  ansible.builtin.include_tasks: verify_one.yml
+  loop: "{{ zdlra_vf_checks }}"
+  loop_control:
+    loop_var: zdlra_vf_check
+
+- name: Write the results
+  ansible.builtin.copy:
+    dest: "{{ zdlra_run_dir }}/verify.txt"
+    content: |
+      Since {{ zdlra_vf_since }} (up to {{ zdlra_verify_timeout_minutes }} min):
+      {% for n in zdlra_vf_notes %}
+        {{ n }}
+      {% endfor %}
+    mode: "0640"
+
+- name: Add them to the report
+  ansible.builtin.shell: |
+    [ -f report.txt ] || exit 0
+    { echo; echo "Backups and replication after patching:"; cat verify.txt; } >> report.txt
+  args:
+    chdir: "{{ zdlra_run_dir }}"
+  changed_when: true
+
+- name: Show the results
+  ansible.builtin.debug:
+    msg: "{{ ['Since ' ~ zdlra_vf_since ~ ':'] + zdlra_vf_notes }}"

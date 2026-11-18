@@ -1,0 +1,23 @@
+---
+# Every switch's version now, through zdlra_switch_version_cmd, for the switches in
+# zdlra_sw_group_file. Sets zdlra_sw_names and zdlra_sw_results: one entry per switch with
+# name, ok (its version could be read) and text (the output).
+
+- name: "Read {{ zdlra_sw_group_file }}"
+  ansible.builtin.slurp:
+    src: "{{ zdlra_sw_group_file }}"
+  register: zdlra_swg
+  failed_when: false
+
+- name: Ask each switch its version
+  ansible.builtin.command:
+    argv: [/bin/bash, -c, "{{ zdlra_switch_version_cmd | replace('{switch}', item) }} </dev/null 2>&1"]
+  loop: "{{ zdlra_swg.content | default('') | b64decode | zdlra_lines }}"
+  register: zdlra_swv
+  changed_when: false
+  failed_when: false
+
+- name: Read the switch versions
+  ansible.builtin.set_fact:
+    zdlra_sw_names: "{{ zdlra_swg.content | default('') | b64decode | zdlra_lines }}"
+    zdlra_sw_results: "{{ zdlra_swv.results | default([]) | zdlra_switch_results }}"

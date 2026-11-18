@@ -1,0 +1,48 @@
+---
+# (Re)reads what the phases decide on: the staged record, the conf file staging set up
+# (patch.conf_<SR>), and the run's own records. Sets:
+#   zdlra_staged   the staged record, as a dict (archive, sha256, patch_conf, ra_release, ...)
+#   zdlra_conf     patch.conf_<SR>, as a dict (TARGET_*_VERSION, SWITCH_TYPE, FILES_*, ...)
+#   zdlra_done     phases finished in this run (phases_done)
+#   zdlra_skipped  phases that ran but did nothing (phases_skipped)
+#   zdlra_steps    steps that must not run twice once they worked (steps_done)
+#   zdlra_resumed  the time resume ran, or empty
+
+- name: Read the staged record
+  ansible.builtin.slurp:
+    src: "{{ zdlra_staged_record }}"
+  register: zdlra_staged_raw
+  failed_when: false
+
+- name: Parse the staged record
+  ansible.builtin.set_fact:
+    zdlra_staged: "{{ (zdlra_staged_raw.content | default('') | b64decode) | zdlra_kv }}"
+    zdlra_staged_text: "{{ zdlra_staged_raw.content | default('') | b64decode }}"
+
+- name: Read the conf file staging set up
+  ansible.builtin.slurp:
+    src: "{{ zdlra_staged.patch_conf }}"
+  register: zdlra_conf_raw
+  failed_when: false
+  when: zdlra_staged.patch_conf | default('') | length > 0
+
+- name: Parse the conf file
+  ansible.builtin.set_fact:
+    zdlra_conf: "{{ (zdlra_conf_raw.content | default('') | b64decode) | zdlra_kv }}"
+
+- name: Read the run's records
+  ansible.builtin.slurp:
+    src: "{{ zdlra_run_dir }}/{{ item }}"
+  register: zdlra_records
+  failed_when: false
+  loop: [phases_done, phases_skipped, steps_done, resumed_at]
+
+- name: Parse the run's records
+  vars:
+    _rec: "{{ dict(zdlra_records.results | map(attribute='item') | zip(zdlra_records.results | map(attribute='content', default='') | map('b64decode'))) }}"
+  ansible.builtin.set_fact:
+    zdlra_done: "{{ _rec.phases_done | zdlra_lines }}"
+    zdlra_skipped: "{{ _rec.phases_skipped | zdlra_lines }}"
+    zdlra_steps: "{{ _rec.steps_done | zdlra_lines }}"
+    zdlra_resumed: "{{ _rec.resumed_at | trim }}"
+    zdlra_switch_type: "{{ zdlra_conf.SWITCH_TYPE | default('') | lower }}"

@@ -1,0 +1,36 @@
+---
+# postcheck: snapshot again and compare, run Oracle's precheck again, then the version table.
+
+- name: Create the after snapshot folder
+  ansible.builtin.file:
+    path: "{{ zdlra_run_dir }}/snapshot_after"
+    state: directory
+    mode: "0750"
+
+- name: Save racli version and appliance status
+  ansible.builtin.shell: "{{ zdlra_racli }} {{ item.args }} > {{ zdlra_run_dir }}/snapshot_after/{{ item.file }} 2>&1"
+  loop:
+    - { args: version, file: racli_version.txt }
+    - { args: status appliance, file: racli_status.txt }
+  changed_when: false
+  failed_when: false
+
+- name: Compare with the snapshot before patching
+  ansible.builtin.shell: |
+    [ -d snapshot_before ] || exit 0
+    diff -ru snapshot_before snapshot_after > snapshot.diff
+    echo "Before/after diff: {{ zdlra_run_dir }}/snapshot.diff"
+  args:
+    chdir: "{{ zdlra_run_dir }}"
+  register: zdlra_snap_diff
+  changed_when: false
+  failed_when: false
+
+- name: Run Oracle's precheck again
+  ansible.builtin.include_tasks: precheck_script.yml
+  vars:
+    zdlra_precheck_label: after
+  when: zdlra_postcheck_rerun_precheck | bool
+
+- name: Make the version table
+  ansible.builtin.include_tasks: versions.yml

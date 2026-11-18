@@ -1,0 +1,37 @@
+---
+# Run one racli upgrade step, never cut short, then check its log.
+# In: zdlra_ra_name (preinstall, alter, update; log ra_<name>.log), zdlra_ra_args,
+#     zdlra_ra_warn, zdlra_ra_success (a line the log must contain)
+
+- name: "racli {{ zdlra_ra_name }}: run it"
+  ansible.builtin.include_tasks: detached.yml
+  vars:
+    zdlra_job_what: "racli {{ zdlra_ra_name }}"
+    zdlra_job_log: "{{ zdlra_run_dir }}/ra_{{ zdlra_ra_name }}.log"
+    zdlra_job_dir: "{{ zdlra_run_dir }}"
+    zdlra_job_cmd: "{{ [zdlra_racli] + zdlra_ra_args }}"
+    zdlra_job_warn_minutes: "{{ zdlra_ra_warn }}"
+
+- name: "racli {{ zdlra_ra_name }}: look for the success line"
+  ansible.builtin.command:
+    argv: [grep, -qF, -e, "{{ zdlra_ra_success }}", "{{ zdlra_run_dir }}/ra_{{ zdlra_ra_name }}.log"]
+  register: zdlra_ra_ok
+  changed_when: false
+  failed_when: false
+
+- name: "racli {{ zdlra_ra_name }}: failed"
+  when: zdlra_job_rc | int != 0 or zdlra_ra_ok.rc != 0
+  block:
+    - name: "racli {{ zdlra_ra_name }}: mark the result as used"
+      ansible.builtin.command: "{{ zdlra_detached }} collect {{ zdlra_run_dir }}/ra_{{ zdlra_ra_name }}.log"
+      changed_when: false
+    - name: "racli {{ zdlra_ra_name }}: stop"
+      ansible.builtin.fail:
+        msg: >-
+          {{ ('racli ' ~ zdlra_ra_name ~ ' exited with code ' ~ zdlra_job_rc) if zdlra_job_rc | int != 0
+             else ('racli ' ~ zdlra_ra_name ~ " did not report '" ~ zdlra_ra_success ~ "'") }}.
+          Log: {{ zdlra_run_dir }}/ra_{{ zdlra_ra_name }}.log
+
+- name: "racli {{ zdlra_ra_name }}: completed"
+  ansible.builtin.debug:
+    msg: "racli {{ zdlra_ra_name }}: completed ('{{ zdlra_ra_success }}')."

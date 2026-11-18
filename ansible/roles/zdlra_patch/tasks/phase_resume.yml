@@ -1,0 +1,37 @@
+---
+# resume: resume only the replication servers this run paused. Each comes off
+# replication_paused.txt as it resumes, so another attempt only retries the rest.
+
+# The node's clock, as the database counts by it.
+- name: Record when resume ran (verify counts from then)
+  ansible.builtin.shell: date '+%F %T' > resumed_at
+  args:
+    chdir: "{{ zdlra_run_dir }}"
+  changed_when: true
+  when: not zdlra_dry_run
+
+- name: Read which servers this run paused
+  ansible.builtin.slurp:
+    src: "{{ zdlra_run_dir }}/replication_paused.txt"
+  register: zdlra_paused_raw
+  failed_when: false
+
+- name: Set the list
+  ansible.builtin.set_fact:
+    zdlra_paused: "{{ zdlra_paused_raw.content | default('') | b64decode | zdlra_lines }}"
+
+- name: Nothing to resume
+  ansible.builtin.debug:
+    msg: This run paused no replication servers; nothing to resume.
+  when: zdlra_paused | length == 0
+
+- name: Check the resume statement is set
+  ansible.builtin.fail:
+    msg: "zdlra_replication_resume_sql is not set; resume these by hand: {{ zdlra_paused | join(' ') }}"
+  when: zdlra_paused | length > 0 and zdlra_replication_resume_sql | length == 0
+
+- name: Resume each one
+  ansible.builtin.include_tasks: resume_one.yml
+  loop: "{{ zdlra_paused }}"
+  loop_control:
+    loop_var: zdlra_server

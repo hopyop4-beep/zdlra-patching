@@ -1,0 +1,29 @@
+---
+# Wait for one verify count (zdlra_vf_check: name, sql) to go above 0. A dry run checks once.
+- name: "Wait for {{ zdlra_vf_check.name }} since {{ zdlra_vf_since }} (up to {{ zdlra_verify_timeout_minutes }} min)"
+  ansible.builtin.command:
+    argv: ["{{ zdlra_sql }}", query]
+    stdin: "{{ zdlra_ra_sql_connect }}\n{{ zdlra_vf_check.sql }}"
+  environment:
+    SQLPLUS: "{{ zdlra_sqlplus }}"
+    RA_ORACLE_HOME: "{{ zdlra_ra_oracle_home }}"
+    RA_ORACLE_SID: "{{ zdlra_ra_oracle_sid }}"
+  register: zdlra_vf_count
+  until: (zdlra_vf_count.rc == 0 and zdlra_vf_count.stdout | trim is match('^[0-9]+$') and zdlra_vf_count.stdout | trim | int > 0) or zdlra_dry_run
+  retries: "{{ ((zdlra_verify_timeout_minutes | int) * 60 / (zdlra_verify_poll_seconds | int)) | int }}"
+  delay: "{{ zdlra_verify_poll_seconds | int }}"
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: "Note the result for {{ zdlra_vf_check.name }}"
+  vars:
+    _n: "{{ zdlra_vf_count.stdout | default('') | trim }}"
+  ansible.builtin.set_fact:
+    zdlra_vf_notes: >-
+      {{ zdlra_vf_notes + [
+           (zdlra_vf_check.name ~ ': OK (' ~ _n ~ ' since ' ~ zdlra_vf_since ~ ', after about ' ~ ((zdlra_vf_count.attempts | default(1) | int - 1) * (zdlra_verify_poll_seconds | int) / 60) | int ~ ' min)')
+           if (_n is match('^[0-9]+$') and _n | int > 0) else
+           (zdlra_vf_check.name ~ ': none yet (dry run, no wait)') if zdlra_dry_run else
+           (zdlra_vf_check.name ~ ': WARNING - none since ' ~ zdlra_vf_since ~ ' within ' ~ zdlra_verify_timeout_minutes ~ ' min')
+         ] }}

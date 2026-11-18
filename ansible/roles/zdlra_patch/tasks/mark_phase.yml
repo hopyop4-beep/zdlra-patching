@@ -1,0 +1,46 @@
+---
+# Record zdlra_phase as done or skipped (zdlra_mark), or as not done (zdlra_mark: undone).
+# A dry run records nothing, except "undone", which only takes away.
+
+- name: "Record {{ zdlra_phase }} as done"
+  when: zdlra_mark == 'done' and not zdlra_dry_run
+  block:
+    - name: "Add {{ zdlra_phase }} to phases_done"
+      ansible.builtin.lineinfile:
+        path: "{{ zdlra_run_dir }}/phases_done"
+        line: "{{ zdlra_phase }}"
+        create: true
+        mode: "0640"
+    # Done now, even if an earlier attempt skipped it.
+    - name: "Take {{ zdlra_phase }} off phases_skipped"
+      ansible.builtin.lineinfile:
+        path: "{{ zdlra_run_dir }}/phases_skipped"
+        line: "{{ zdlra_phase }}"
+        state: absent
+    # Recorded as done, so the racli step's result has been used.
+    - name: "Mark the result of {{ zdlra_phase }} as used"
+      ansible.builtin.command: "{{ zdlra_detached }} collect {{ zdlra_run_dir }}/{{ zdlra_phase }}.log"
+      changed_when: false
+      when: zdlra_phase is match('ra_')
+
+- name: "Record {{ zdlra_phase }} as skipped"
+  ansible.builtin.lineinfile:
+    path: "{{ zdlra_run_dir }}/phases_skipped"
+    line: "{{ zdlra_phase }}"
+    create: true
+    mode: "0640"
+  when: zdlra_mark == 'skipped' and not zdlra_dry_run
+
+- name: "Record {{ zdlra_phase }} as not done"
+  ansible.builtin.lineinfile:
+    path: "{{ zdlra_run_dir }}/phases_done"
+    line: "{{ zdlra_phase }}"
+    state: absent
+  when: zdlra_mark == 'undone' and zdlra_phase in zdlra_done
+
+- name: Update the list of finished phases
+  ansible.builtin.set_fact:
+    zdlra_done: >-
+      {{ (zdlra_done | union([zdlra_phase])) if (zdlra_mark == 'done' and not zdlra_dry_run)
+         else (zdlra_done | difference([zdlra_phase])) if zdlra_mark == 'undone'
+         else zdlra_done }}

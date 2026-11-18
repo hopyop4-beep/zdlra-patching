@@ -1,0 +1,168 @@
+---
+# The OEM blackout for an appliance (zdlra). oem_action: targets | check | start | status | stop
+#   check   what start checks, without creating anything (the login, the reason, the targets)
+#   start   creates it; the name is kept in <oem_state_dir>/<appliance>.blackout. With
+#           oem_blackout_reuse set to a blackout name, that one is kept if it is still on
+#   stop    ends the recorded one
+# oem_dry_run: only show what would change. Sets oem_blackout_name.
+
+- name: Settle the blackout record
+  ansible.builtin.set_fact:
+    oem_blackout_file: "{{ oem_state_dir }}/{{ zdlra }}.blackout"
+    oem_dry: "{{ oem_dry_run | default(true) | bool }}"
+
+- name: Log in to EM
+  ansible.builtin.include_tasks: login.yml
+
+- name: List the EM targets of {{ zdlra }}
+  when: oem_action == 'targets'
+  block:
+    - name: Ask EM
+      ansible.builtin.command: "{{ oem_emcli }} get_targets -targets=%{{ zdlra }}%:%"
+      delegate_to: "{{ oem_host }}"
+      register: oem_targets
+      changed_when: false
+    - name: Show them
+      ansible.builtin.debug:
+        var: oem_targets.stdout_lines
+
+- name: Read the recorded blackout
+  ansible.builtin.slurp:
+    src: "{{ oem_blackout_file }}"
+  delegate_to: "{{ oem_host }}"
+  register: oem_bo_raw
+  failed_when: false
+  when: oem_action in ['start', 'check', 'status', 'stop']
+
+- name: Is it over?
+  when: oem_action in ['start', 'check', 'status', 'stop'] and oem_bo_raw.content is defined
+  block:
+    - name: Remember its name
+      ansible.builtin.set_fact:
+        oem_blackout_name: "{{ oem_bo_raw.content | b64decode | trim }}"
+    # Only a clear answer from emcli counts: if it fails, or in any doubt, it is still on.
+    - name: Ask EM about it
+      ansible.builtin.command: "{{ oem_emcli }} get_blackout_details -name={{ oem_blackout_name }}"
+      delegate_to: "{{ oem_host }}"
+      register: oem_bo_details
+      changed_when: false
+      failed_when: false
+    - name: Read the answer
+      ansible.builtin.set_fact:
+        oem_blackout_over: "{{ oem_bo_details.rc == 0 and oem_bo_details.stdout is search('(?i)(^|[^a-z])(ended|stopped|expired)([^a-z]|$)') }}"
+
+- name: Start
+  when: oem_action in ['start', 'check']
+  block:
+    - name: Check the targets and the reason are set
+      ansible.builtin.assert:
+        that:
+          - oem_blackout_targets | length > 0 and '<' not in oem_blackout_targets
+          - oem_blackout_reason | length > 0 and '<' not in oem_blackout_reason
+        fail_msg: >-
+          Set oem_blackout_targets for {{ zdlra }} (find them with -e oem_action=targets) and
+          oem_blackout_reason (see: emcli get_blackout_reasons).
+        quiet: true
+
+    - name: Read the blackout reasons
+      ansible.builtin.command: "{{ oem_emcli }} get_blackout_reasons"
+      delegate_to: "{{ oem_host }}"
+      register: oem_reasons
+      changed_when: false
+
+    - name: Check the reason is a known one
+      ansible.builtin.assert:
+        that: oem_blackout_reason in (oem_reasons.stdout_lines | map('trim') | list)
+        fail_msg: "oem_blackout_reason '{{ oem_blackout_reason }}' is not a known reason. See: emcli get_blackout_reasons"
+        quiet: true
+
+    - name: Keep this run's blackout
+      ansible.builtin.debug:
+        msg: "Blackout {{ oem_blackout_name }} from this run is still on: keeping it."
+      when:
+        - oem_action == 'start'
+        - oem_bo_raw.content is defined
+        - oem_blackout_name == oem_blackout_reuse | default('')
+        - not oem_blackout_over
+
+    - name: Refuse while another blackout is recorded
+      ansible.builtin.fail:
+        msg: "A blackout is already recorded for {{ zdlra }}: {{ oem_blackout_name }}. Stop it first (-e oem_action=stop -e zdlra_execute=true)."
+      when:
+        - oem_bo_raw.content is defined
+        - not oem_blackout_over
+        - oem_action == 'start'
+        - oem_blackout_name != oem_blackout_reuse | default('')
+
+    - name: Create the blackout
+      when: oem_bo_raw.content is not defined or oem_blackout_over
+      vars:
+        _name: "PATCH_{{ zdlra }}_{{ now(fmt='%Y%m%d_%H%M') }}"
+        _args: >-
+          {{ [oem_emcli, 'create_blackout', '-name=' ~ _name, '-add_targets=' ~ oem_blackout_targets,
+              '-reason=' ~ oem_blackout_reason,
+              '-schedule=' ~ ('duration:-1' if oem_blackout_hours | int < 0 else 'duration:' ~ oem_blackout_hours ~ ':00')]
+             + (['-propagate_targets'] if oem_blackout_propagate | bool else []) }}
+      block:
+        - name: "{{ '[dry-run] ' if oem_dry or oem_action == 'check' else '' }}create_blackout"
+          ansible.builtin.debug:
+            msg: "{{ '[dry-run] ' if oem_dry or oem_action == 'check' else '[exec] ' }}{{ _args | join(' ') }}"
+        - name: Retire the record of the ended blackout
+          ansible.builtin.command: mv {{ oem_blackout_file }} {{ oem_blackout_file }}.stopped_{{ now(fmt='%Y%m%d_%H%M%S') }}
+          delegate_to: "{{ oem_host }}"
+          changed_when: true
+          when: oem_bo_raw.content is defined and not oem_dry and oem_action == 'start'
+        - name: Create it
+          when: not oem_dry and oem_action == 'start'
+          block:
+            - name: Run create_blackout
+              ansible.builtin.command:
+                argv: "{{ _args }}"
+              delegate_to: "{{ oem_host }}"
+              changed_when: true
+            - name: Record it
+              ansible.builtin.copy:
+                dest: "{{ oem_blackout_file }}"
+                content: "{{ _name }}\n"
+                mode: "0600"
+              delegate_to: "{{ oem_host }}"
+            - name: Remember its name
+              ansible.builtin.set_fact:
+                oem_blackout_name: "{{ _name }}"
+            - name: Started
+              ansible.builtin.debug:
+                msg: "Blackout {{ _name }} started for {{ zdlra }} (ends by itself after {{ oem_blackout_hours }}h; -1 = never)."
+
+- name: Status
+  when: oem_action == 'status'
+  ansible.builtin.debug:
+    msg: "{{ ['No blackout recorded for ' ~ zdlra ~ ' in ' ~ oem_blackout_file] if oem_bo_raw.content is not defined else ['Blackout ' ~ oem_blackout_name ~ ':'] + oem_bo_details.stdout_lines }}"
+
+- name: Stop
+  when: oem_action == 'stop'
+  block:
+    - name: Check one is recorded
+      ansible.builtin.assert:
+        that: oem_bo_raw.content is defined
+        fail_msg: "No blackout recorded for {{ zdlra }} in {{ oem_blackout_file }}"
+        quiet: true
+      when: not oem_dry
+    - name: "{{ '[dry-run] ' if oem_dry else '' }}stop_blackout"
+      ansible.builtin.debug:
+        msg: "{{ '[dry-run] ' if oem_dry else '[exec] ' }}{{ oem_emcli }} stop_blackout -name={{ oem_blackout_name | default('<the recorded blackout>') }}"
+    - name: End it
+      when: not oem_dry
+      block:
+        - name: Run stop_blackout
+          ansible.builtin.command: "{{ oem_emcli }} stop_blackout -name={{ oem_blackout_name }}"
+          delegate_to: "{{ oem_host }}"
+          register: oem_stop
+          changed_when: oem_stop.rc == 0
+          failed_when: oem_stop.rc != 0 and not oem_blackout_over
+        - name: Retire the record
+          ansible.builtin.command: mv {{ oem_blackout_file }} {{ oem_blackout_file }}.stopped_{{ now(fmt='%Y%m%d_%H%M%S') }}
+          delegate_to: "{{ oem_host }}"
+          changed_when: true
+        - name: Stopped
+          ansible.builtin.debug:
+            msg: "Blackout {{ oem_blackout_name }} {{ 'stopped' if oem_stop.rc == 0 else 'had already ended' }}."

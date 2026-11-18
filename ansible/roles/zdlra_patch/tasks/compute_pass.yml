@@ -1,0 +1,187 @@
+---
+# One compute pass: on zdlra_c_runner, upgrade zdlra_c_tgt. Picking up works from what the
+# runner holds for this run (zdlra_compute_work_dir/<run id>): a patchmgr still running is
+# waited for, a result left behind is used, a failed one is started again. A node is never
+# upgraded twice: its version is read before any upgrade starts.
+
+- name: "Pass {{ zdlra_c_runner }} -> {{ zdlra_c_tgt }} already done"
+  ansible.builtin.debug:
+    msg: "Pass {{ zdlra_c_runner }} -> {{ zdlra_c_tgt }} already done."
+  when: zdlra_c_pass in zdlra_cstate.compute_done | default([])
+
+- name: "Pass: {{ zdlra_c_runner }} upgrades {{ zdlra_c_tgt }}"
+  when: zdlra_c_pass not in zdlra_cstate.compute_done | default([])
+  vars:
+    _common: >-
+      {{ ['-dbnodes', zdlra_c_work ~ '/db_nodes_' ~ zdlra_c_tgt, '-log_dir', 'auto',
+          '-target_version', zdlra_c_target, '-iso_repo', zdlra_c_iso] }}
+    _pre: "precheck_{{ zdlra_c_tgt }}"
+    _upg: "upgrade_{{ zdlra_c_tgt }}"
+  block:
+    - name: "{{ zdlra_c_runner }}: create the run's compute folder"
+      ansible.builtin.file:
+        path: "{{ zdlra_c_work }}"
+        state: directory
+        mode: "0750"
+      delegate_to: "{{ zdlra_c_runner }}"
+
+    - name: "{{ zdlra_c_runner }}: write the db_nodes file with only {{ zdlra_c_tgt }}"
+      ansible.builtin.copy:
+        dest: "{{ zdlra_c_work }}/db_nodes_{{ zdlra_c_tgt }}"
+        content: "{{ zdlra_c_tgt }}\n"
+        mode: "0640"
+      delegate_to: "{{ zdlra_c_runner }}"
+
+    - name: "{{ zdlra_c_runner }}: where its jobs stand, and {{ zdlra_c_tgt }}'s version"
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -c
+          - |
+            echo "PRE=$("$1" state "$2/$4.log" "$2/$4.pid")"
+            echo "UPG=$("$1" state "$2/$5.log" "$2/$5.pid")"
+            out="$("$3" -g "$2/db_nodes_$6" -l root 'imageinfo -ver' 2>/dev/null)"
+            echo "VER=$(sed -n "s/^$6:[[:space:]]*//p" <<<"$out" | head -1 | tr -d '[:space:]')"
+          - x
+          - "{{ zdlra_detached }}"
+          - "{{ zdlra_c_work }}"
+          - "{{ zdlra_dcli }}"
+          - "{{ _pre }}"
+          - "{{ _upg }}"
+          - "{{ zdlra_c_tgt }}"
+      delegate_to: "{{ zdlra_c_runner }}"
+      register: zdlra_cp_look
+      changed_when: false
+
+    - name: Read where it stands
+      ansible.builtin.set_fact:
+        zdlra_cp_pre: "{{ zdlra_cp_look.stdout | regex_search('^PRE=(.*)$', '\\1', multiline=True) | first }}"
+        zdlra_cp_upg: "{{ zdlra_cp_look.stdout | regex_search('^UPG=(.*)$', '\\1', multiline=True) | first }}"
+        zdlra_cp_ver: "{{ zdlra_cp_look.stdout | regex_search('^VER=(.*)$', '\\1', multiline=True) | first }}"
+        zdlra_cp_upg_fresh: false
+
+    # Picking up an upgrade that is running or has finished: go straight to it.
+    - name: Decide where to start
+      ansible.builtin.set_fact:
+        zdlra_cp_from: >-
+          {{ 'upgrade' if zdlra_cp_upg is match('running|pending 0$')
+             else 'verify' if zdlra_cp_ver == zdlra_c_target
+             else 'precheck' }}
+
+    - name: "{{ zdlra_c_tgt }} is already on target"
+      ansible.builtin.debug:
+        msg: "{{ zdlra_c_tgt }} is already on {{ zdlra_c_target }}: not running patchmgr."
+      when: zdlra_cp_from == 'verify'
+
+    - name: "{{ zdlra_c_runner }}: patchmgr -precheck for {{ zdlra_c_tgt }}"
+      when: zdlra_cp_from == 'precheck'
+      block:
+        - name: "{{ zdlra_c_runner }}: prepare a new precheck"
+          when: zdlra_cp_pre is not match('running|pending 0$')
+          block:
+            # Unzipping over a running patchmgr would change its files underneath it.
+            - name: "{{ zdlra_c_runner }}: refuse if a patchmgr is running there"
+              ansible.builtin.command: "{{ zdlra_detached }} running"
+              delegate_to: "{{ zdlra_c_runner }}"
+              register: zdlra_cp_busy
+              changed_when: false
+              failed_when: zdlra_cp_busy.rc == 0
+            - name: "{{ zdlra_c_runner }}: unzip dbnodeupdate.zip"
+              ansible.builtin.shell: "[ ! -f dbnodeupdate.zip ] || unzip -q -o dbnodeupdate.zip"
+              args:
+                chdir: "{{ zdlra_c_dir }}"
+              delegate_to: "{{ zdlra_c_runner }}"
+              changed_when: true
+
+        - name: "{{ zdlra_c_runner }}: run patchmgr -precheck"
+          ansible.builtin.include_tasks: detached.yml
+          vars:
+            zdlra_job_what: "patchmgr -precheck on {{ zdlra_c_runner }} for {{ zdlra_c_tgt }}"
+            zdlra_job_host: "{{ zdlra_c_runner }}"
+            zdlra_job_log: "{{ zdlra_c_work }}/{{ _pre }}.log"
+            zdlra_job_pidfile: "{{ zdlra_c_work }}/{{ _pre }}.pid"
+            zdlra_job_dir: "{{ zdlra_c_dir }}"
+            zdlra_job_cmd: "{{ ['./patchmgr'] + _common + ['-precheck', '-nomodify_at_prereq'] }}"
+            zdlra_job_warn_minutes: "{{ zdlra_compute_warn_minutes }}"
+            zdlra_job_fresh: "{{ zdlra_cp_pre is not match('running|pending 0$') }}"
+            zdlra_job_alive_re: "[p]atchmgr .*-dbnodes"
+
+        - name: "{{ zdlra_c_runner }}: check the precheck"
+          ansible.builtin.include_tasks: compute_check.yml
+          vars:
+            zdlra_cc_job: "{{ _pre }}"
+            zdlra_cc_what: "patchmgr -precheck on {{ zdlra_c_runner }} for {{ zdlra_c_tgt }}"
+
+        # Never upgrade a node twice: look again just before starting.
+        - name: "{{ zdlra_c_runner }}: read {{ zdlra_c_tgt }}'s version again"
+          ansible.builtin.command:
+            argv: [/bin/bash, -c, "{{ zdlra_dcli }} -g {{ zdlra_c_work }}/db_nodes_{{ zdlra_c_tgt }} -l root 'imageinfo -ver' 2>/dev/null | sed -n 's/^{{ zdlra_c_tgt }}:[[:space:]]*//p' | head -1 | tr -d '[:space:]'"]
+          delegate_to: "{{ zdlra_c_runner }}"
+          register: zdlra_cp_ver2
+          changed_when: false
+
+        - name: Stop if a failed upgrade left a version that can't be read
+          ansible.builtin.fail:
+            msg: "The last patchmgr -upgrade for {{ zdlra_c_tgt }} failed ({{ zdlra_cp_upg }}), and its version can't be read now. Check {{ zdlra_c_tgt }} before picking up."
+          when: zdlra_cp_upg != 'none' and zdlra_cp_ver2.stdout | length == 0
+
+        - name: Go on to the upgrade
+          ansible.builtin.set_fact:
+            zdlra_cp_from: "{{ 'verify' if zdlra_cp_ver2.stdout == zdlra_c_target else 'upgrade' }}"
+            zdlra_cp_upg_fresh: true
+
+    - name: "{{ zdlra_c_runner }}: patchmgr -upgrade for {{ zdlra_c_tgt }} ({{ zdlra_c_tgt }} reboots)"
+      when: zdlra_cp_from == 'upgrade'
+      block:
+        - name: "{{ zdlra_c_runner }}: run patchmgr -upgrade"
+          ansible.builtin.include_tasks: detached.yml
+          vars:
+            zdlra_job_what: "patchmgr -upgrade on {{ zdlra_c_runner }} for {{ zdlra_c_tgt }}"
+            zdlra_job_host: "{{ zdlra_c_runner }}"
+            zdlra_job_log: "{{ zdlra_c_work }}/{{ _upg }}.log"
+            zdlra_job_pidfile: "{{ zdlra_c_work }}/{{ _upg }}.pid"
+            zdlra_job_dir: "{{ zdlra_c_dir }}"
+            zdlra_job_cmd: "{{ ['./patchmgr'] + _common + ['-upgrade'] }}"
+            zdlra_job_warn_minutes: "{{ zdlra_compute_warn_minutes }}"
+            zdlra_job_fresh: "{{ zdlra_cp_upg_fresh | default(false) }}"
+            zdlra_job_alive_re: "[p]atchmgr .*-dbnodes"
+
+        - name: "{{ zdlra_c_runner }}: check the upgrade"
+          ansible.builtin.include_tasks: compute_check.yml
+          vars:
+            zdlra_cc_job: "{{ _upg }}"
+            zdlra_cc_what: "patchmgr -upgrade on {{ zdlra_c_runner }} for {{ zdlra_c_tgt }}"
+
+    # The patched node may still be coming up, so this retries.
+    - name: "{{ zdlra_c_tgt }}: must be on {{ zdlra_c_target }}"
+      ansible.builtin.command:
+        argv: [/bin/bash, -c, "{{ zdlra_dcli }} -g {{ zdlra_c_work }}/db_nodes_{{ zdlra_c_tgt }} -l root 'imageinfo -ver' 2>/dev/null | sed -n 's/^{{ zdlra_c_tgt }}:[[:space:]]*//p' | head -1 | tr -d '[:space:]'"]
+      delegate_to: "{{ zdlra_c_runner }}"
+      register: zdlra_cp_after
+      until: zdlra_cp_after.stdout | length > 0
+      retries: "{{ ((zdlra_compute_version_wait_minutes | int) * 60 / 60) | int }}"
+      delay: 60
+      changed_when: false
+      failed_when: false
+
+    - name: "{{ zdlra_c_tgt }}: check its version"
+      ansible.builtin.assert:
+        that:
+          - zdlra_cp_after.stdout | length > 0
+          - zdlra_cp_after.stdout == zdlra_c_target
+        fail_msg: >-
+          {{ ('No image version from ' ~ zdlra_c_tgt ~ ' after ' ~ zdlra_compute_version_wait_minutes ~ ' min. patchmgr itself has finished: check ' ~ zdlra_c_tgt ~ '.')
+             if zdlra_cp_after.stdout | length == 0 else zdlra_c_tgt ~ ' is on ' ~ zdlra_cp_after.stdout ~ ', expected ' ~ zdlra_c_target ~ '.' }}
+        success_msg: "{{ zdlra_c_tgt }} is on {{ zdlra_c_target }}."
+
+    # Before the next pass takes another node down, and before going on.
+    - name: "{{ zdlra_c_tgt }}: wait until it is ready"
+      ansible.builtin.include_tasks: node_ready.yml
+      vars:
+        zdlra_ready_node: "{{ zdlra_c_tgt }}"
+
+    - name: Record the pass as done
+      ansible.builtin.include_tasks: controller_state.yml
+      vars:
+        zdlra_cstate_set:
+          compute_done: "{{ zdlra_cstate.compute_done | default([]) | union([zdlra_c_pass]) }}"

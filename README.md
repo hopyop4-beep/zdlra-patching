@@ -4,6 +4,8 @@ A phased Bash script to automate patching of the Oracle Zero Data Loss Recovery 
 
 > **Status: not yet run on a real appliance.** Everything has been tested with stand-ins only. See [docs/testing-notes.md](docs/testing-notes.md) for what to test, and [docs/known-bugs.md](docs/known-bugs.md) for what was found and fixed. Do not run it against a production appliance yet.
 
+> **Ansible version.** The [ansible/](ansible/) folder holds an Ansible version of the same patch, run from the jump server. It is a separate version: the scripts here are unchanged. See [ansible/README.md](ansible/README.md). It has not been run on a real appliance either.
+
 ## How it works
 
 For a detailed walkthrough with diagrams, see [docs/how-it-works.html](docs/how-it-works.html). It covers how the scripts and functions connect, the stages, failure handling and the files they leave behind, and section 13 traces a real run step by step through the code. GitHub shows HTML as source, so download it and open it in a browser. It describes v0.7.8, so its line numbers may drift as the scripts change.

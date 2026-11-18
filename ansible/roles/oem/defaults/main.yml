@@ -1,0 +1,37 @@
+---
+# Defaults for the oem role: the OEM blackout and the OEM backup jobs around a patch. Its
+# tasks run on oem_host (the OMS, which is normally the jump server running Ansible). The
+# names follow jump/zdlra_jump.conf, lower-cased with an oem_ prefix.
+
+oem_host: localhost
+oem_emcli: emcli
+# Set to log in when emcli is not logged in. The password comes from the vault
+# (oem_em_password); emcli is never left waiting at a prompt.
+oem_em_user: ""
+oem_em_password: ""
+
+# Must be one of: emcli get_blackout_reasons
+oem_blackout_reason: ""
+# Safety net: the blackout ends by itself after this many hours. -1 = no end time.
+oem_blackout_hours: 12
+oem_blackout_propagate: true
+# Per appliance (in its inventory group vars): EM "name:type" pairs separated by ";".
+# Find them with: ansible-playbook oem_blackout.yml -e zdlra=<appliance> -e oem_action=targets
+oem_blackout_targets: ""
+
+# sr_jobs_new.ksh suspends (-a s) and resumes (-a r) the appliance's OEM backup jobs.
+# {jobs_db} = oem_jobs_db, {zdlra} = the appliance. Empty = skip that step (a warning).
+oem_jobs_dir: /odb/oem01/swlib/softwarelibrary/automation/ZDLRA_Automation/ZDLRA_Suspend_Resume_Jobs
+oem_jobs_suspend_cmd: [./sr_jobs_new.ksh, -z, "{jobs_db}", -a, s]
+oem_jobs_resume_cmd: [./sr_jobs_new.ksh, -z, "{jobs_db}", -a, r]
+# Per appliance: its zdlra db value for sr_jobs_new.ksh (e.g. RA1GF2). A real run stops
+# before it starts if it isn't set.
+oem_jobs_db: ""
+# Output that means the command failed even with exit 0 (its usage text).
+oem_jobs_fail_re: 'zdlra db values must be|ksh -z <zdlra db>'
+# The script sr_jobs_new.ksh writes, with one emcli command per job; it is then run, with
+# its output in <same name>.log. Empty = do not run it. {action} = suspend or resume.
+oem_jobs_generated: "{jobs_db}_{action}_job_*.ksh"
+
+# Where the blackout name is kept, so status and stop know which one to use.
+oem_state_dir: "{{ lookup('env', 'HOME') }}/zdlra_ansible_state"

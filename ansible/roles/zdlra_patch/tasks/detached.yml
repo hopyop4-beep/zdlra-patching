@@ -1,0 +1,134 @@
+---
+# Run a command that must never be cut short (patchmgr, a racli upgrade step, Oracle's
+# precheck) through zdlra_detached.sh, and wait for it. Nothing here ever stops it.
+#
+# In:  zdlra_job_what       label for messages
+#      zdlra_job_log        its log on the node (its exit status goes to <log>.rc)
+#      zdlra_job_dir        folder to run it from
+#      zdlra_job_cmd        the command, as a list
+#      zdlra_job_warn_minutes  past this, a warning only
+#      zdlra_job_fresh      true = always run it, never use a result left by an earlier attempt
+#      zdlra_job_host       the node it runs on (default: this play's host)
+#      zdlra_job_pidfile    its pid file (default: <run dir>/detached.pid, which --status reads)
+#      zdlra_job_alive_re   optional: it counts as running while a process matching this runs
+# Out: zdlra_job_rc         its exit status
+#
+# If an earlier attempt left it running, this waits for it. If it finished after an earlier
+# attempt stopped watching, that result is used and it is not run again (unless fresh).
+# Past zdlra_wait_max_hours this stops watching and fails; the command keeps running, and
+# running the playbook again with the same zdlra_run_id picks it up.
+
+- name: "{{ zdlra_job_what }}: settle where it runs"
+  ansible.builtin.set_fact:
+    _job_host: "{{ zdlra_job_host | default(inventory_hostname) }}"
+    _job_pid: "{{ zdlra_job_pidfile | default(zdlra_run_dir ~ '/detached.pid') }}"
+    _job_own: "{{ zdlra_job_pidfile is not defined }}"
+
+- name: "{{ zdlra_job_what }}: name its log for the status"
+  ansible.builtin.copy:
+    dest: "{{ zdlra_run_dir }}/detached.log"
+    content: "{{ zdlra_job_log }}\n"
+    mode: "0640"
+  when: _job_own
+
+- name: "{{ zdlra_job_what }}: start it in a session of its own"
+  ansible.builtin.command:
+    argv: >-
+      {{ [zdlra_detached, 'start'] + (['--fresh'] if zdlra_job_fresh | default(false) | bool else [])
+         + [zdlra_job_log, _job_pid, zdlra_job_dir, '--'] + zdlra_job_cmd }}
+  delegate_to: "{{ _job_host }}"
+  register: zdlra_job_start
+  changed_when: zdlra_job_start.stdout is match('STARTED')
+
+- name: "{{ zdlra_job_what }}: what happened"
+  ansible.builtin.debug:
+    msg: >-
+      {% if zdlra_job_start.stdout is match('STARTED') %}Started (pid {{ zdlra_job_start.stdout.split()[1] }}): cd {{ zdlra_job_dir }} && {{ zdlra_job_cmd | join(' ') }}. Log on {{ _job_host }}: {{ zdlra_job_log }}
+      {% elif zdlra_job_start.stdout is match('RUNNING') %}Already running from an earlier attempt (pid {{ zdlra_job_start.stdout.split()[1] }}): waiting for it, not starting it again. Log: {{ zdlra_job_log }}
+      {% else %}Already finished in an earlier attempt (exit {{ zdlra_job_start.stdout.split()[1] }}): using that result, not running it again. Log: {{ zdlra_job_log }}{% endif %}
+
+- name: "{{ zdlra_job_what }}: wait (up to {{ zdlra_job_warn_minutes }} min before a warning)"
+  ansible.builtin.command:
+    argv: "{{ [zdlra_detached, 'poll', zdlra_job_log, _job_pid] + ([zdlra_job_alive_re] if zdlra_job_alive_re is defined else []) }}"
+  delegate_to: "{{ _job_host }}"
+  register: zdlra_job_poll
+  until: zdlra_job_poll.stdout is not search('STATE=running')
+  retries: "{{ ((zdlra_job_warn_minutes | int) * 60 / (zdlra_poll_seconds | int)) | round(0, 'ceil') | int }}"
+  delay: "{{ zdlra_poll_seconds | int }}"
+  changed_when: false
+  failed_when: false
+
+- name: "{{ zdlra_job_what }}: still running past {{ zdlra_job_warn_minutes }} min"
+  when: zdlra_job_poll.stdout is search('STATE=running')
+  block:
+    - name: "{{ zdlra_job_what }}: warn, and keep waiting"
+      ansible.builtin.debug:
+        msg: "WARNING: {{ zdlra_job_what }} has run for over {{ zdlra_job_warn_minutes }} min; still waiting (not stopping it). Log: {{ zdlra_job_log }}"
+
+    - name: "{{ zdlra_job_what }}: wait (up to {{ zdlra_wait_max_hours }}h)"
+      ansible.builtin.command:
+        argv: "{{ [zdlra_detached, 'poll', zdlra_job_log, _job_pid] + ([zdlra_job_alive_re] if zdlra_job_alive_re is defined else []) }}"
+      delegate_to: "{{ _job_host }}"
+      register: zdlra_job_poll2
+      until: zdlra_job_poll2.stdout is not search('STATE=running')
+      retries: "{{ ((zdlra_wait_max_hours | int) * 3600 / (zdlra_poll_seconds | int)) | round(0, 'ceil') | int }}"
+      delay: "{{ zdlra_poll_seconds | int }}"
+      changed_when: false
+      failed_when: false
+
+    - name: "{{ zdlra_job_what }}: stop watching"
+      ansible.builtin.fail:
+        msg: >-
+          Stopped watching {{ zdlra_job_what }} after {{ zdlra_wait_max_hours }}h. It is NOT stopped: it
+          keeps running on {{ _job_host }} (log {{ zdlra_job_log }}). Run the playbook again
+          with -e zdlra_run_id={{ zdlra_run }} to pick it up.
+      when: zdlra_job_poll2.stdout is search('STATE=running')
+
+# A task skipped above still registers, so the last poll is kept apart.
+- name: "{{ zdlra_job_what }}: the last poll"
+  ansible.builtin.set_fact:
+    zdlra_job_state: "{{ zdlra_job_poll2.stdout if zdlra_job_poll2.stdout is defined else zdlra_job_poll.stdout }}"
+
+# Recorded as exit 99, so the next attempt starts it again rather than waiting for it.
+- name: "{{ zdlra_job_what }}: ended without an exit status"
+  when: zdlra_job_state is search('STATE=gone')
+  block:
+    - name: "{{ zdlra_job_what }}: record it as killed"
+      ansible.builtin.shell: echo 99 > {{ zdlra_job_log | quote }}.rc
+      delegate_to: "{{ _job_host }}"
+      changed_when: true
+    - name: "{{ zdlra_job_what }}: stop"
+      ansible.builtin.fail:
+        msg: "{{ zdlra_job_what }} on {{ _job_host }} ended without an exit status (was it killed?). Log: {{ zdlra_job_log }}"
+
+- name: "{{ zdlra_job_what }}: read its exit status"
+  ansible.builtin.set_fact:
+    zdlra_job_rc: "{{ zdlra_job_state | regex_search('RC=([0-9]+)', '\\1') | first | int }}"
+
+- name: "{{ zdlra_job_what }}: tidy up"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ [_job_pid] + ([zdlra_run_dir ~ '/detached.log'] if _job_own else []) }}"
+  delegate_to: "{{ _job_host }}"
+
+- name: "{{ zdlra_job_what }}: last lines of its log"
+  ansible.builtin.command: "tail -n 25 {{ zdlra_job_log }}"
+  delegate_to: "{{ _job_host }}"
+  register: zdlra_job_tail
+  changed_when: false
+
+- name: "{{ zdlra_job_what }}: exit status {{ zdlra_job_rc }}"
+  ansible.builtin.debug:
+    var: zdlra_job_tail.stdout_lines
+
+- name: "{{ zdlra_job_what }}: could not enter the folder"
+  when: zdlra_job_rc | int == 97
+  block:
+    - name: "{{ zdlra_job_what }}: mark the result as used"
+      ansible.builtin.command: "{{ zdlra_detached }} collect {{ zdlra_job_log }}"
+      delegate_to: "{{ _job_host }}"
+      changed_when: false
+    - name: "{{ zdlra_job_what }}: stop"
+      ansible.builtin.fail:
+        msg: "{{ zdlra_job_what }}: cannot enter {{ zdlra_job_dir }}. Log: {{ zdlra_job_log }}"

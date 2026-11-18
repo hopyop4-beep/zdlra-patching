@@ -1,0 +1,65 @@
+---
+# The OEM blackout and backup jobs of one appliance, on their own (the Ansible version of
+# jump/oem_blackout.sh, plus the OEM job steps of zdlra_patch_run.sh).
+#
+#   ansible-playbook oem.yml -e zdlra=zdlra01 -e oem_action=targets        # find EM targets
+#   ansible-playbook oem.yml -e zdlra=zdlra01 -e oem_action=status
+#   ansible-playbook oem.yml -e zdlra=zdlra01 -e oem_action=start -e zdlra_execute=true
+#   ansible-playbook oem.yml -e zdlra=zdlra01 -e oem_action=stop -e zdlra_execute=true
+#   ansible-playbook oem.yml -e zdlra=zdlra01 -e oem_action=suspend_jobs -e zdlra_execute=true
+#   ansible-playbook oem.yml -e zdlra=zdlra01 -e oem_action=resume_jobs -e zdlra_execute=true
+#   ansible-playbook oem.yml -e zdlra=zdlra01 -e oem_action=finish -e zdlra_execute=true
+#                                                    # resume the jobs, then end the blackout
+# Without -e zdlra_execute=true, nothing is changed: the read-only checks still run.
+
+- name: OEM blackout and backup jobs
+  hosts: localhost
+  gather_facts: false
+  check_mode: false
+  vars:
+    zdlra_execute: false
+    oem_dry_run: "{{ ansible_check_mode or not (zdlra_execute | bool) }}"
+  tasks:
+    - name: Check the appliance and the action
+      ansible.builtin.assert:
+        that:
+          - zdlra is defined and zdlra in groups
+          - oem_action | default('') in ['targets', 'check', 'start', 'status', 'stop', 'suspend_jobs', 'resume_jobs', 'finish']
+        fail_msg: "Use -e zdlra=<inventory group> -e oem_action=targets|check|start|status|stop|suspend_jobs|resume_jobs|finish"
+        quiet: true
+
+    # The appliance's settings (oem_blackout_targets, oem_jobs_db) are in its group vars.
+    - name: Load the appliance's settings
+      ansible.builtin.set_fact:
+        oem_blackout_targets: "{{ hostvars[groups[zdlra][0]].oem_blackout_targets | default(oem_blackout_targets | default('')) }}"
+        oem_jobs_db: "{{ hostvars[groups[zdlra][0]].oem_jobs_db | default(oem_jobs_db | default('')) }}"
+
+    - name: Blackout
+      ansible.builtin.include_role:
+        name: oem
+        tasks_from: blackout
+      when: oem_action in ['targets', 'check', 'start', 'status', 'stop']
+
+    - name: Suspend the OEM jobs
+      ansible.builtin.include_role:
+        name: oem
+        tasks_from: jobs
+      vars:
+        oem_jobs_action: suspend
+      when: oem_action == 'suspend_jobs'
+
+    - name: Resume the OEM jobs
+      ansible.builtin.include_role:
+        name: oem
+        tasks_from: jobs
+      vars:
+        oem_jobs_action: resume
+      when: oem_action in ['resume_jobs', 'finish']
+
+    - name: End the blackout
+      ansible.builtin.include_role:
+        name: oem
+        tasks_from: blackout
+      vars:
+        oem_action: stop
+      when: oem_action == 'finish'

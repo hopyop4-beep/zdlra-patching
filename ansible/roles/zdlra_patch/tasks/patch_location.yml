@@ -1,0 +1,35 @@
+---
+# Where staging unzipped a patch (zdlra_loc_var: FILES_CELL or FILES_SWITCH): the zip is
+# named in the staged record (unpacked=<var>:<zip>:...), and the folder is the zip's one top
+# entry, under zdlra_patch_tmp_dir (its name changes with every release).
+# Sets zdlra_loc_dir, or zdlra_loc_problem (and zdlra_loc_dir empty).
+
+- name: "Find the {{ zdlra_loc_var }} patch folder"
+  vars:
+    _zip: "{{ zdlra_staged_text | regex_search('^unpacked=' ~ zdlra_loc_var ~ ':([^:\\n]*):', '\\1', multiline=True) | default([''], true) | first }}"
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - -c
+      - |
+        [ -n "$2" ] || { echo "ERROR the staged record names no unpacked $4 file"; exit 0; }
+        zip="$1/$2"
+        [ -f "$zip" ] || { echo "ERROR patch zip not found: $zip"; exit 0; }
+        top="$(unzip -Z1 "$zip" 2>/dev/null | sed 's#^\./##; s#/.*##' | grep -v '^$' | sort -u)"
+        [ -n "$top" ] && [ "$(wc -l <<<"$top")" -eq 1 ] || { echo "ERROR cannot tell the patch folder from $zip (top entries: $(tr '\n' ' ' <<<"$top"))"; exit 0; }
+        [ -x "$3/$top/patchmgr" ] || { echo "ERROR no patchmgr in $3/$top"; exit 0; }
+        echo "DIR=$3/$top"
+        echo "ZIP=$zip"
+      - location
+      - "{{ zdlra_patch_files_dir }}"
+      - "{{ _zip }}"
+      - "{{ zdlra_patch_tmp_dir }}"
+      - "{{ zdlra_loc_var }}"
+  register: zdlra_loc
+  changed_when: false
+
+- name: "Read the {{ zdlra_loc_var }} patch folder"
+  ansible.builtin.set_fact:
+    zdlra_loc_dir: "{{ zdlra_loc.stdout | regex_search('^DIR=(.*)$', '\\1', multiline=True) | default([''], true) | first }}"
+    zdlra_loc_zip: "{{ zdlra_loc.stdout | regex_search('^ZIP=(.*)$', '\\1', multiline=True) | default([''], true) | first }}"
+    zdlra_loc_problem: "{{ zdlra_loc.stdout | regex_replace('^ERROR ', '') if zdlra_loc.stdout is match('ERROR') else '' }}"

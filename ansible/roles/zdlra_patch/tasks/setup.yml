@@ -1,0 +1,122 @@
+---
+# Runs first, whatever the tags: settles the run, reads the staged record and the conf
+# file staging set up, and copies the helper scripts to the compute nodes.
+
+- name: Check the appliance was named
+  ansible.builtin.assert:
+    that:
+      - zdlra is defined
+      - zdlra is match('^[A-Za-z0-9][A-Za-z0-9.-]*$')
+      - zdlra in groups
+    fail_msg: "Name the appliance with -e zdlra=<inventory group>, e.g. -e zdlra=zdlra01."
+    quiet: true
+
+- name: Settle dry run or real run
+  ansible.builtin.set_fact:
+    # --check is a dry run too. The play runs with check_mode off, so read-only commands
+    # give real answers in both.
+    zdlra_dry_run: "{{ ansible_check_mode or not (zdlra_execute | bool) }}"
+    zdlra_nodes: "{{ groups[zdlra] }}"
+    zdlra_detached: "{{ zdlra_helper_dir }}/zdlra_detached.sh"
+    zdlra_sql: "{{ zdlra_helper_dir }}/zdlra_sql.sh"
+    zdlra_precheck_name: "{{ zdlra_precheck_script | basename }}"
+    zdlra_current_phase: setup
+    zdlra_preserve_status: true
+
+- name: Check the user on the node
+  ansible.builtin.command: id -un
+  register: zdlra_id
+  changed_when: false
+  failed_when: zdlra_id.stdout != zdlra_required_user
+
+- name: Check racli is there
+  ansible.builtin.stat:
+    path: "{{ zdlra_racli }}"
+  register: zdlra_racli_stat
+  failed_when: not (zdlra_racli_stat.stat.executable | default(false))
+
+- name: Copy the helper scripts to every compute node
+  ansible.builtin.copy:
+    src: "{{ item.1 }}"
+    dest: "{{ zdlra_helper_dir }}/{{ item.1 }}"
+    mode: "0750"
+  delegate_to: "{{ item.0 }}"
+  loop: "{{ zdlra_nodes | product(['zdlra_detached.sh', 'zdlra_sql.sh']) | list }}"
+  loop_control:
+    label: "{{ item.0 }}:{{ item.1 }}"
+
+# --- The run --------------------------------------------------------------------------
+- name: Use the run given
+  when: zdlra_run_id | length > 0
+  block:
+    - name: Check the run folder exists
+      ansible.builtin.stat:
+        path: "{{ zdlra_work_dir }}/{{ zdlra_run_id }}"
+      register: zdlra_run_stat
+      failed_when: not zdlra_run_stat.stat.exists
+    - name: Continue run {{ zdlra_run_id }}
+      ansible.builtin.set_fact:
+        zdlra_run: "{{ zdlra_run_id }}"
+        zdlra_run_new: false
+
+- name: Start a new run
+  when: zdlra_run_id | length == 0
+  block:
+    - name: Make a run id from the node's clock
+      ansible.builtin.command: date +%Y%m%d_%H%M%S
+      register: zdlra_new_id
+      changed_when: false
+    - name: Remember the new run id
+      ansible.builtin.set_fact:
+        zdlra_run: "{{ zdlra_new_id.stdout }}"
+        zdlra_run_new: true
+
+- name: Set the run folder
+  ansible.builtin.set_fact:
+    zdlra_run_dir: "{{ zdlra_work_dir }}/{{ zdlra_run }}"
+    zdlra_controller_state: "{{ zdlra_state_dir }}/{{ zdlra }}_{{ zdlra_run }}.json"
+    zdlra_controller_logs: "{{ zdlra_log_dir }}/{{ zdlra }}_{{ zdlra_run }}"
+
+- name: Create the run folder
+  ansible.builtin.file:
+    path: "{{ zdlra_run_dir }}"
+    state: directory
+    mode: "0750"
+
+- name: Note how this run is driven
+  ansible.builtin.lineinfile:
+    path: "{{ zdlra_run_dir }}/zdlra_patch.log"
+    line: "{{ now(fmt='%Y-%m-%d %H:%M:%S') }} [INFO ] ansible run={{ zdlra_run }} dry_run={{ zdlra_dry_run | int }} tags={{ ansible_run_tags | join(',') }}"
+    create: true
+    mode: "0640"
+
+- name: Record that this run upgrades the compute nodes
+  ansible.builtin.file:
+    path: "{{ zdlra_run_dir }}/expect_compute"
+    state: touch
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+  when: zdlra_compute_enabled | bool and ('all' in ansible_run_tags or 'compute' in ansible_run_tags)
+
+- name: Create the controller folders
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  run_once: true
+  loop:
+    - "{{ zdlra_state_dir }}"
+    - "{{ zdlra_controller_logs }}"
+
+- name: Show the run
+  ansible.builtin.debug:
+    msg:
+      - "Appliance {{ zdlra }}, patch node {{ inventory_hostname }}, run {{ zdlra_run }} ({{ 'new' if zdlra_run_new else 'continued' }})"
+      - "{{ 'DRY RUN: commands that change something are only shown. Add -e zdlra_execute=true for a real run.' if zdlra_dry_run else 'REAL RUN.' }}"
+      - "Run folder on the node: {{ zdlra_run_dir }}"
+
+# --- What was staged --------------------------------------------------------------------
+- name: Read the staged record and the run's records
+  ansible.builtin.import_tasks: read_state.yml

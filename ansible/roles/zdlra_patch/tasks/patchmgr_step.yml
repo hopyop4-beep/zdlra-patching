@@ -1,0 +1,65 @@
+---
+# Run one patchmgr command from the patch folder, never cut short, and check it.
+# Success: exit 0, "SUCCESS: Completed run of command", "Exit status:0", and no FAILED lines.
+# In:  zdlra_pm_prefix  cells | switches | admin_switches (log <prefix>_<name>.log)
+#      zdlra_pm_name    the step's name (patch, upgrade, precheck, ...)
+#      zdlra_pm_dir     the patch folder
+#      zdlra_pm_args    patchmgr's arguments
+#      zdlra_pm_fresh   true = always run it (checks); false = use a result an earlier
+#                       attempt left (the patch and the upgrade)
+#      zdlra_pm_fatal   true (default) = a failure stops the run
+# Out: zdlra_pm_ok, zdlra_pm_problem
+
+- name: "patchmgr {{ zdlra_pm_prefix }} {{ zdlra_pm_name }}: run it"
+  ansible.builtin.include_tasks: detached.yml
+  vars:
+    zdlra_job_what: "{{ zdlra_pm_prefix }} patchmgr -{{ zdlra_pm_name }}"
+    zdlra_job_log: "{{ zdlra_run_dir }}/{{ zdlra_pm_prefix }}_{{ zdlra_pm_name }}.log"
+    zdlra_job_dir: "{{ zdlra_pm_dir }}"
+    zdlra_job_cmd: "{{ ['./patchmgr'] + zdlra_pm_args }}"
+    zdlra_job_warn_minutes: "{{ zdlra_switch_patch_warn_minutes if zdlra_pm_prefix is search('switches') else zdlra_cell_patch_warn_minutes }}"
+    zdlra_job_fresh: "{{ zdlra_pm_fresh | default(false) }}"
+
+- name: "patchmgr {{ zdlra_pm_prefix }} {{ zdlra_pm_name }}: check its log"
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - -c
+      - |
+        grep -E 'FAILED' "$1" | head -10 | sed 's/^/FAILED_LINE /'
+        grep -q 'SUCCESS: Completed run of command' "$1" && grep -q 'Exit status:0' "$1" && echo COMPLETED
+        true
+      - x
+      - "{{ zdlra_run_dir }}/{{ zdlra_pm_prefix }}_{{ zdlra_pm_name }}.log"
+  register: zdlra_pm_check
+  changed_when: false
+
+- name: "patchmgr {{ zdlra_pm_prefix }} {{ zdlra_pm_name }}: result"
+  vars:
+    _failed: "{{ zdlra_pm_check.stdout_lines | select('match', '^FAILED_LINE ') | map('regex_replace', '^FAILED_LINE ', '') | list }}"
+    _log: "{{ zdlra_run_dir }}/{{ zdlra_pm_prefix }}_{{ zdlra_pm_name }}.log"
+  ansible.builtin.set_fact:
+    zdlra_pm_problem: >-
+      {%- if _failed -%}patchmgr -{{ zdlra_pm_name }} reported failures: {{ _failed | join(' | ') }}. Log: {{ _log }}
+      {%- elif zdlra_job_rc | int != 0 -%}patchmgr -{{ zdlra_pm_name }} exited with code {{ zdlra_job_rc }}. Log: {{ _log }}
+      {%- elif 'COMPLETED' not in zdlra_pm_check.stdout_lines -%}patchmgr -{{ zdlra_pm_name }} did not report a completed run (no 'SUCCESS: Completed run of command' / 'Exit status:0'). Log: {{ _log }}
+      {%- endif -%}
+
+- name: "patchmgr {{ zdlra_pm_prefix }} {{ zdlra_pm_name }}: ok?"
+  ansible.builtin.set_fact:
+    zdlra_pm_ok: "{{ not zdlra_pm_problem }}"
+
+# The steps recorded in steps_done keep their result until they are recorded there.
+- name: "patchmgr {{ zdlra_pm_prefix }} {{ zdlra_pm_name }}: mark the result as used"
+  ansible.builtin.command: "{{ zdlra_detached }} collect {{ zdlra_run_dir }}/{{ zdlra_pm_prefix }}_{{ zdlra_pm_name }}.log"
+  changed_when: false
+  when: not zdlra_pm_ok or zdlra_pm_name not in ['patch', 'upgrade']
+
+- name: "patchmgr {{ zdlra_pm_prefix }} {{ zdlra_pm_name }}: failed"
+  ansible.builtin.fail:
+    msg: "{{ zdlra_pm_problem }}"
+  when: not zdlra_pm_ok and zdlra_pm_fatal | default(true) | bool
+
+- name: "patchmgr {{ zdlra_pm_prefix }} {{ zdlra_pm_name }}: completed"
+  ansible.builtin.debug:
+    msg: "{{ ('patchmgr -' ~ zdlra_pm_name ~ ': completed.') if zdlra_pm_ok else 'WARNING: ' ~ zdlra_pm_problem }}"

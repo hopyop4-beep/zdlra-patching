@@ -1,0 +1,24 @@
+---
+# Settings for every appliance. Each zdlra_patch / oem role default can be set here, or per
+# appliance in inventory/group_vars/<appliance>.yml. See roles/*/defaults/main.yml for all
+# of them, with what they do.
+
+# Must be one of: emcli get_blackout_reasons
+oem_blackout_reason: "<reason from emcli get_blackout_reasons>"
+oem_blackout_hours: 12
+
+# Known, accepted precheck failures: each entry matches part of a failure name.
+zdlra_precheck_waivers: []
+
+# TODO(site): both queries print one number; {since} is when resume ran.
+zdlra_verify_backups_sql: ""
+zdlra_verify_replication_sql: ""
+
+# TODO(site): the admin switch commands are placeholders until this is true.
+zdlra_admin_switch_enabled: false
+
+# The raAutomation connect string, from the vault file next to this one.
+zdlra_ra_sql_connect: "{{ vault_zdlra_ra_sql_connect | default('') }}"
+# Only needed when emcli is not logged in on the OMS.
+oem_em_user: ""
+oem_em_password: "{{ vault_oem_em_password | default('') }}"

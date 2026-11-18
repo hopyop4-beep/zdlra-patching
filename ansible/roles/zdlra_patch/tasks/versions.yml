@@ -1,0 +1,125 @@
+---
+# Every component's version against its target, shown and saved to versions.txt.
+# A component this run patched that is on another version fails (cells, switches and admin
+# switches once their phase is done, compute nodes when this run upgrades them). Anything
+# else off target is CHECK, a warning, as is the RA line. In a dry run, only a warning.
+
+- name: Read racli version
+  ansible.builtin.command: "{{ zdlra_racli }} version"
+  register: zdlra_vt_ra
+  changed_when: false
+  failed_when: false
+
+- name: Does this run upgrade the compute nodes?
+  ansible.builtin.stat:
+    path: "{{ zdlra_run_dir }}/expect_compute"
+  register: zdlra_vt_expect
+
+- name: Ask the compute nodes their image version
+  vars:
+    _names: "{{ zdlra_staged.component_COMPUTE_NODE | default('') | replace(' ', '') }}"
+  ansible.builtin.command: "{{ zdlra_dcli }} -l root -c {{ _names }} 'imageinfo -ver'"
+  register: zdlra_vt_compute
+  changed_when: false
+  failed_when: false
+  when: _names | length > 0
+
+- name: Read the cell versions
+  ansible.builtin.include_tasks: cell_versions.yml
+
+- name: Read the switch versions
+  ansible.builtin.include_tasks: switch_versions.yml
+  vars:
+    zdlra_sw_group_file: "{{ zdlra_switch_group_file }}"
+  when: zdlra_switch_type == 'roce'
+
+- name: Keep the switch versions
+  ansible.builtin.set_fact:
+    zdlra_vt_switches: "{{ zdlra_sw_results | default([]) if zdlra_switch_type == 'roce' else [] }}"
+
+- name: Read the admin switch versions
+  ansible.builtin.include_tasks: switch_versions.yml
+  vars:
+    zdlra_sw_group_file: "{{ zdlra_admin_switch_group_file }}"
+  when: zdlra_admin_switch_enabled | bool and zdlra_switch_type != 'ib'
+
+- name: Build the table
+  vars:
+    _ra_target: "{{ zdlra_conf.TARGET_RA_VERSION | default('') }}"
+    _ra_text: "{{ zdlra_vt_ra.stdout | default('') }}"
+    _ra_line: >-
+      {{ (_ra_text.splitlines() | select('search', _ra_target | regex_escape) | first | default('') if _ra_target else '')
+         or (_ra_text.splitlines() | select('search', '(?i)version') | first | default('')) }}
+    _compute_names: "{{ zdlra_staged.component_COMPUTE_NODE | default('') | replace(' ', '') | split(',') | select | list }}"
+    _compute_versions: "{{ ((zdlra_vt_compute.stdout | default('')) ~ '\n' ~ (zdlra_vt_compute.stderr | default(''))) | zdlra_image_versions }}"
+    _compute_target: "{{ zdlra_conf.TARGET_COMPUTE_VERSION | default('') }}"
+    _compute_soft: "{{ not zdlra_vt_expect.stat.exists }}"
+    _cell_target: "{{ zdlra_conf.TARGET_CELL_VERSION | default('') }}"
+    _cell_soft: "{{ 'cells' not in zdlra_done }}"
+    _sw_target: "{{ zdlra_conf.TARGET_SWITCH_VERSION | default('') }}"
+    _sw_soft: "{{ 'switches' not in zdlra_done }}"
+    _asw_target: "{{ zdlra_conf.TARGET_ADMIN_SWITCH_VERSION | default('') }}"
+    _asw_soft: "{{ 'admin_switches' not in zdlra_done }}"
+    _rows: >-
+      {%- set rows = [] -%}
+      {%- set _ = rows.append('RA' | zdlra_row(inventory_hostname, _ra_line | trim, _ra_target, _ra_target | length > 0 and _ra_target in _ra_text, true)) -%}
+      {%- for n in _compute_names -%}
+        {%- set v = _compute_versions[n] | default('') -%}
+        {%- set _ = rows.append('compute' | zdlra_row(n, v, _compute_target, v == _compute_target, _compute_soft | bool)) -%}
+      {%- else -%}
+        {%- set _ = rows.append('compute' | zdlra_row('-', '', _compute_target, false)) -%}
+      {%- endfor -%}
+      {%- for n in zdlra_cells -%}
+        {%- set v = zdlra_cell_versions[n] | default('') -%}
+        {%- set _ = rows.append('cell' | zdlra_row(n, v, _cell_target, v == _cell_target, _cell_soft | bool)) -%}
+      {%- else -%}
+        {%- set _ = rows.append('cell' | zdlra_row('-', '', _cell_target, false)) -%}
+      {%- endfor -%}
+      {%- if zdlra_switch_type == 'ib' -%}
+        {%- set _ = rows.append({'component': 'switch', 'name': '-', 'now': '(InfiniBand: not patched here)', 'target': _sw_target or '<not set>', 'result': 'SKIPPED'}) -%}
+      {%- else -%}
+        {%- for s in zdlra_vt_switches -%}
+          {%- set _ = rows.append('switch' | zdlra_row(s.name, (s.text | zdlra_version_line) if s.ok else '', _sw_target, s.ok and (s.text is zdlra_has_version(_sw_target)), _sw_soft | bool)) -%}
+        {%- else -%}
+          {%- set _ = rows.append('switch' | zdlra_row('-', '', _sw_target, false)) -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {%- if zdlra_admin_switch_enabled | bool and zdlra_switch_type != 'ib' -%}
+        {%- for s in zdlra_sw_results | default([]) -%}
+          {%- set _ = rows.append('adminsw' | zdlra_row(s.name, (s.text | zdlra_version_line) if s.ok else '', _asw_target, s.ok and (s.text is zdlra_has_version(_asw_target)), _asw_soft | bool)) -%}
+        {%- else -%}
+          {%- set _ = rows.append('adminsw' | zdlra_row('-', '', _asw_target, false)) -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {{ rows }}
+  ansible.builtin.set_fact:
+    zdlra_version_rows: "{{ _rows }}"
+
+- name: Save the table to versions.txt
+  ansible.builtin.copy:
+    dest: "{{ zdlra_run_dir }}/versions.txt"
+    content: "{{ zdlra_version_rows | zdlra_table }}"
+    mode: "0640"
+
+- name: Show the table
+  ansible.builtin.debug:
+    msg: "{{ (zdlra_version_rows | zdlra_table).splitlines() }}"
+
+- name: Count the results
+  ansible.builtin.set_fact:
+    zdlra_vt_bad: "{{ zdlra_version_rows | selectattr('result', 'equalto', 'MISMATCH') | list | length }}"
+    zdlra_vt_soft: "{{ zdlra_version_rows | selectattr('result', 'equalto', 'CHECK') | list | length }}"
+    zdlra_vt_unread: "{{ zdlra_version_rows | selectattr('result', 'in', ['UNREAD', 'NO TARGET']) | list | length }}"
+
+- name: Warnings
+  ansible.builtin.debug:
+    msg: >-
+      {{ ([zdlra_vt_unread ~ ' version(s) could not be read or have no target; check them by hand.'] if zdlra_vt_unread | int > 0 else [])
+         + ([zdlra_vt_soft ~ ' component(s) marked CHECK are off target or unconfirmed: racli version not showing TARGET_RA_VERSION, or components this run did not patch.'] if zdlra_vt_soft | int > 0 else [])
+         + (['[dry-run] ' ~ zdlra_vt_bad ~ ' component(s) not on target yet (nothing was patched).'] if zdlra_vt_bad | int > 0 and zdlra_dry_run else []) }}
+  when: zdlra_vt_unread | int > 0 or zdlra_vt_soft | int > 0 or (zdlra_vt_bad | int > 0 and zdlra_dry_run)
+
+- name: Fail on components not on target
+  ansible.builtin.fail:
+    msg: "{{ zdlra_vt_bad }} component(s) not on their target version (see the table above, saved to {{ zdlra_run_dir }}/versions.txt)."
+  when: zdlra_vt_bad | int > 0 and not zdlra_dry_run

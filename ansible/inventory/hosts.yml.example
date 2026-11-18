@@ -1,0 +1,30 @@
+# Copy to inventory/hosts.yml (not committed) and edit.
+#
+# One group per appliance, named as you will pass it with -e zdlra=<name>. Its hosts are the
+# appliance's compute nodes, named exactly as in /root/dbs_group (the staged record lists
+# them that way); use ansible_host if they are reached by another address. The first host is
+# the patch node: the precheck, the RA upgrade, cells, switches and SQL run there.
+#
+# Ansible connects as root, without a password (key authentication), like the scripts.
+all:
+  vars:
+    ansible_user: root
+    ansible_python_interpreter: auto_silent
+  children:
+    zdlra01:
+      hosts:
+        zdlra01db01:
+        zdlra01db02:
+      vars:
+        # EM targets to black out, as "name:type" pairs separated by ";".
+        # Find them with: ansible-playbook oem.yml -e zdlra=zdlra01 -e oem_action=targets
+        oem_blackout_targets: "<target name>:<target type>;<host name>:host"
+        # The appliance's zdlra db value for sr_jobs_new.ksh, e.g. RA1GF2.
+        oem_jobs_db: "RA1GF2"
+    zdlra02:
+      hosts:
+        zdlra02db01:
+        zdlra02db02:
+      vars:
+        oem_blackout_targets: "<target name>:<target type>;<host name>:host"
+        oem_jobs_db: "RA2GF2"

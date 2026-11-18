@@ -1,0 +1,27 @@
+---
+# Wait until a node (zdlra_ready_node) is back up, database included (zdlra_node_ready_cmd),
+# for up to zdlra_node_ready_minutes.
+- name: "{{ zdlra_ready_node }}: wait for ssh"
+  ansible.builtin.wait_for_connection:
+    timeout: "{{ (zdlra_node_ready_minutes | int) * 60 }}"
+    sleep: 15
+  delegate_to: "{{ zdlra_ready_node }}"
+
+- name: "{{ zdlra_ready_node }}: wait until it is ready"
+  ansible.builtin.shell: "{{ zdlra_node_ready_cmd }}"  # noqa: command-instead-of-shell (a site-set command line)
+  delegate_to: "{{ zdlra_ready_node }}"
+  register: zdlra_ready
+  until: zdlra_ready.rc == 0
+  retries: "{{ ((zdlra_node_ready_minutes | int) * 60 / 30) | int }}"
+  delay: 30
+  changed_when: false
+  failed_when: false
+
+- name: "{{ zdlra_ready_node }}: not ready"
+  ansible.builtin.fail:
+    msg: "{{ zdlra_ready_node }} isn't ready: after {{ zdlra_node_ready_minutes }} min, this still fails there: {{ zdlra_node_ready_cmd }}"
+  when: zdlra_ready.rc != 0
+
+- name: "{{ zdlra_ready_node }}: ready"
+  ansible.builtin.debug:
+    msg: "{{ zdlra_ready_node }} is ready."

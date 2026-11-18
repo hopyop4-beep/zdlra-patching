@@ -1,0 +1,17 @@
+---
+# Record a step that must not run twice once it has worked (zdlra_step: cells_patch,
+# switches_upgrade, admin_switches_upgrade) in steps_done, then mark its result as used.
+- name: "Record {{ zdlra_step }} in steps_done"
+  ansible.builtin.lineinfile:
+    path: "{{ zdlra_run_dir }}/steps_done"
+    line: "{{ zdlra_step }}"
+    create: true
+    mode: "0640"
+
+- name: "Mark the result of {{ zdlra_step }} as used"
+  ansible.builtin.command: "{{ zdlra_detached }} collect {{ zdlra_run_dir }}/{{ zdlra_step }}.log"
+  changed_when: false
+
+- name: Update the list of finished steps
+  ansible.builtin.set_fact:
+    zdlra_steps: "{{ zdlra_steps | union([zdlra_step]) }}"

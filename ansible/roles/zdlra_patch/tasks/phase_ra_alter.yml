@@ -1,0 +1,60 @@
+---
+# ra_alter: racli alter appliance --online_updates, with the gold images the precheck moved
+# to zdlra_ra_gold_images_path. Installs the new grid and DB homes.
+
+- name: Work out the alter command and the gold images
+  ansible.builtin.set_fact:
+    zdlra_ra_cmd_args: "{{ zdlra_ra_alter_args | zdlra_fill({'ra_release': zdlra_staged.ra_release | default(''), 'gold_images_path': zdlra_ra_gold_images_path}) }}"
+    zdlra_gold_images: "{{ zdlra_staged.ra_gold_images | default('') | split(',') | select | map('basename') | list }}"
+
+- name: Look for the gold images and an earlier attempt's result
+  vars:
+    _script: >-
+      d=$1 h=$2 r=$3; shift 3;
+      for f in "$@"; do [ -f "${d%/}/$f" ] || echo "MISSING $f"; done;
+      "$h" state "$r/ra_alter.log" "$r/detached.pid"
+  ansible.builtin.command:
+    argv: "{{ ['/bin/bash', '-c', _script, 'x', zdlra_ra_gold_images_path, zdlra_detached, zdlra_run_dir] + zdlra_gold_images }}"
+  register: zdlra_alter_look
+  changed_when: false
+
+- name: Note what's missing
+  ansible.builtin.set_fact:
+    zdlra_gold_missing: "{{ zdlra_alter_look.stdout_lines | select('match', '^MISSING ') | map('regex_replace', '^MISSING ', '') | list }}"
+
+- name: "[dry-run] alter"
+  ansible.builtin.debug:
+    msg:
+      - "[dry-run] {{ zdlra_racli }} {{ zdlra_ra_cmd_args | join(' ') }}  (success: '{{ zdlra_ra_alter_success }}')"
+      - "{{ ('WARNING: gold images not in ' ~ zdlra_ra_gold_images_path ~ ': ' ~ zdlra_gold_missing | join(' ')) if zdlra_gold_missing else 'Gold images: ' ~ zdlra_gold_images | join(' ') }}"
+  when: zdlra_dry_run
+
+- name: Alter
+  when: not zdlra_dry_run
+  block:
+    # With a result or a run left by an earlier attempt, nothing starts, so its files don't matter.
+    - name: Check the gold images, and confirm
+      when: zdlra_alter_look.stdout_lines[-1] == 'none'
+      block:
+        - name: Check the gold images are there
+          ansible.builtin.assert:
+            that:
+              - zdlra_gold_images | length > 0
+              - zdlra_gold_missing | length == 0
+            fail_msg: >-
+              {{ 'The staged record names no gold images (ra_gold_images). Stage again with the current staging script.'
+                 if zdlra_gold_images | length == 0 else
+                 'Gold images not in ' ~ zdlra_ra_gold_images_path ~ ': ' ~ zdlra_gold_missing | join(' ') ~ '. The precheck moves them there; check its output.' }}
+            quiet: true
+        - name: Confirm the alter
+          ansible.builtin.include_tasks: confirm.yml
+          vars:
+            zdlra_confirm_text: "Run '{{ zdlra_racli }} {{ zdlra_ra_cmd_args | join(' ') }}'?"
+
+    - name: Run racli alter appliance
+      ansible.builtin.include_tasks: racli_step.yml
+      vars:
+        zdlra_ra_name: alter
+        zdlra_ra_args: "{{ zdlra_ra_cmd_args }}"
+        zdlra_ra_warn: "{{ zdlra_ra_alter_warn_minutes }}"
+        zdlra_ra_success: "{{ zdlra_ra_alter_success }}"

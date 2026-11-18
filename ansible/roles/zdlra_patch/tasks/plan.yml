@@ -1,0 +1,122 @@
+---
+# For the precheck review: a read-only look at what the next phases will deal with.
+# Nothing here stops the run, except SQL that is set up but fails.
+
+- name: Which SQL settings are still empty
+  ansible.builtin.set_fact:
+    zdlra_sql_missing: >-
+      {{ (['zdlra_ra_sql_connect'] if zdlra_ra_sql_connect | length == 0 else [])
+         + (['zdlra_ra_sql_connect (password)'] if '<password>' in zdlra_ra_sql_connect else [])
+         + (['zdlra_replication_servers_sql'] if zdlra_replication_servers_sql | length == 0 else [])
+         + (['zdlra_replication_pause_sql'] if zdlra_replication_pause_sql | length == 0 else [])
+         + (['zdlra_replication_resume_sql'] if zdlra_replication_resume_sql | length == 0 else [])
+         + (['zdlra_active_backups_sql'] if zdlra_active_backups_sql | length == 0 else []) }}
+
+- name: Replication and incoming backups
+  when: zdlra_sql_missing | length == 0
+  block:
+    - name: Read the replication pairs
+      ansible.builtin.include_tasks: sql.yml
+      vars:
+        zdlra_sql_text: "{{ zdlra_replication_status_sql }}"
+      when: zdlra_replication_status_sql | length > 0
+    - name: Show the replication pairs
+      ansible.builtin.debug:
+        msg: "{{ ['Replication pairs (ra_replication_pair):'] + (zdlra_sql_rows or ['(no replication servers)']) }}"
+      when: zdlra_replication_status_sql | length > 0
+    - name: List the replication servers quiesce will pause
+      ansible.builtin.include_tasks: sql.yml
+      vars:
+        zdlra_sql_text: "{{ zdlra_replication_servers_sql }}"
+    - name: Show them
+      ansible.builtin.debug:
+        msg: "Replication servers to pause (running, upstream or paired): {{ zdlra_sql_rows | join(' ') or 'none' }}"
+    - name: Count incoming backups
+      ansible.builtin.include_tasks: sql.yml
+      vars:
+        zdlra_sql_text: "{{ zdlra_active_backups_sql }}"
+    - name: Show the count
+      ansible.builtin.debug:
+        msg: "Incoming backups running now: {{ zdlra_sql_rows | join(' ') }}"
+    - name: List the incoming backup sessions
+      ansible.builtin.include_tasks: sql.yml
+      vars:
+        zdlra_sql_text: "{{ zdlra_active_backups_list_sql }}"
+        zdlra_sql_fatal: false
+      when: zdlra_sql_rows | join('') != '0' and zdlra_active_backups_list_sql | length > 0
+
+- name: Replication and incoming backups not set up
+  ansible.builtin.debug:
+    msg: "WARNING: replication/backup checks not set up yet (still empty: {{ zdlra_sql_missing | join(', ') }})."
+  when: zdlra_sql_missing | length > 0
+
+# --- RA upgrade ---------------------------------------------------------------------------
+- name: Check the RA software and the gold images
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: >-
+    {{ ([zdlra_staged.ra_release] if zdlra_staged.ra_release | default('') | length > 0 else [])
+       + (zdlra_staged.ra_gold_images | default('') | split(',') | select | map('basename')
+          | map('regex_replace', '^', zdlra_ra_gold_images_path | regex_replace('/$', '') ~ '/') | list) }}
+  register: zdlra_ra_files
+
+- name: Show the RA upgrade plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['RA software:  ' ~ (zdlra_staged.ra_release | default('<the staged record names no ra_release>'))]
+         + (zdlra_ra_files.results | map(attribute='item') | zip(zdlra_ra_files.results | map(attribute='stat.exists'))
+            | map('join', ' present: ') | list)
+         + ['RA target:    ' ~ zdlra_conf.TARGET_RA_VERSION | default('<not set>')] }}
+
+# --- Cells --------------------------------------------------------------------------------
+- name: Find the cell patch
+  ansible.builtin.include_tasks: patch_location.yml
+  vars:
+    zdlra_loc_var: FILES_CELL
+
+- name: Read the cell versions
+  ansible.builtin.include_tasks: cell_versions.yml
+
+- name: Show the cell plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['Cell patch:   ' ~ (zdlra_loc_dir or 'NOT READY (' ~ zdlra_loc_problem ~ ')'),
+          'Cell target:  ' ~ zdlra_conf.TARGET_CELL_VERSION | default('<TARGET_CELL_VERSION not set in the conf file>')]
+         + (zdlra_cells | map('regex_replace', '^(.*)$', '    now \1: ') | zip(zdlra_cells | map('extract', zdlra_cell_versions) | map('default', '?'))
+            | map('join', '') | list) }}
+
+# --- Switches -----------------------------------------------------------------------------
+- name: Show the switch plan (not RoCE)
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'WARNING: SWITCH_TYPE is IB: only RoCE switches are patched here; the switches phase will skip them'
+         if zdlra_switch_type == 'ib' else
+         "WARNING: SWITCH_TYPE is '" ~ (zdlra_switch_type or 'not set') ~ "', not roce or ib: the switches phase will stop" }}
+  when: zdlra_switch_type != 'roce'
+
+- name: RoCE switches
+  when: zdlra_switch_type == 'roce'
+  block:
+    - name: Find the switch patch
+      ansible.builtin.include_tasks: patch_location.yml
+      vars:
+        zdlra_loc_var: FILES_SWITCH
+    - name: Read the switch versions
+      ansible.builtin.include_tasks: switch_versions.yml
+      vars:
+        zdlra_sw_group_file: "{{ zdlra_switch_group_file }}"
+    - name: Show the switch plan
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['Switch patch: ' ~ (zdlra_loc_dir or 'NOT READY (' ~ zdlra_loc_problem ~ ')'),
+              'Switches:     ' ~ (zdlra_sw_names | join(' ') or zdlra_switch_group_file ~ ' is missing or empty'),
+              'Switch target: ' ~ zdlra_conf.TARGET_SWITCH_VERSION | default('<not set>')]
+             + zdlra_sw_results | map(attribute='name') | map('regex_replace', '^', '    now ')
+               | zip(zdlra_sw_results | map(attribute='text') | map('zdlra_version_line')) | map('join', ': ') | list }}
+
+- name: Show the admin switch plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'WARNING: zdlra_admin_switch_enabled is false: this run will NOT patch the admin switches; the commands are still placeholders'
+         if not (zdlra_admin_switch_enabled | bool) else
+         'Admin switches: from ' ~ zdlra_admin_switch_group_file ~ ', target ' ~ zdlra_conf.TARGET_ADMIN_SWITCH_VERSION | default('<not set>') }}

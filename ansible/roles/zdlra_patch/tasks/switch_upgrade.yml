@@ -1,0 +1,140 @@
+---
+# Upgrade a group of switches with patchmgr from the switch patch folder: the precheck,
+# then the upgrade. Afterwards each switch must show the target version; one that can't be
+# read is a warning. An upgrade that worked is never run again.
+# In: zdlra_sw_prefix (switches | admin_switches), zdlra_sw_label, zdlra_sw_group_file,
+#     zdlra_sw_precheck_args, zdlra_sw_upgrade_args (both without the group), zdlra_sw_target
+
+- name: "{{ zdlra_sw_label }}: find the switch patch"
+  ansible.builtin.include_tasks: patch_location.yml
+  vars:
+    zdlra_loc_var: FILES_SWITCH
+
+- name: "{{ zdlra_sw_label }}: read the versions now"
+  ansible.builtin.include_tasks: switch_versions.yml
+
+- name: "{{ zdlra_sw_label }}: check what the phase needs"
+  ansible.builtin.assert:
+    that:
+      - zdlra_loc_dir | length > 0
+      - zdlra_sw_names | length > 0
+      - zdlra_sw_target | length > 0
+    fail_msg: >-
+      {{ ('Switch patch: ' ~ zdlra_loc_problem) if zdlra_loc_dir | length == 0
+         else (zdlra_sw_group_file ~ ' is missing or empty.') if zdlra_sw_names | length == 0
+         else 'The target version is not set in ' ~ zdlra_staged.patch_conf | default('the conf file') ~ '.' }}
+    quiet: true
+
+- name: "{{ zdlra_sw_label }}: show the plan"
+  ansible.builtin.debug:
+    msg:
+      - "Switch patch folder: {{ zdlra_loc_dir }}; {{ zdlra_sw_label }}: {{ zdlra_sw_names | join(' ') }}; target: {{ zdlra_sw_target }}"
+      - "{{ '[dry-run] ' if zdlra_dry_run else '' }}cd {{ zdlra_loc_dir }} && ./patchmgr {{ zdlra_sw_precheck_args | join(' ') }}"
+      - "{{ '[dry-run] ' if zdlra_dry_run else '' }}cd {{ zdlra_loc_dir }} && ./patchmgr {{ zdlra_sw_upgrade_args | join(' ') }}"
+      - "{{ '[dry-run] ' if zdlra_dry_run else '' }}{{ zdlra_switch_version_cmd }}  (on each switch; must show {{ zdlra_sw_target }})"
+
+- name: "{{ zdlra_sw_label }}: upgrade"
+  when: not zdlra_dry_run
+  vars:
+    _step: "{{ zdlra_sw_prefix }}_upgrade"
+  block:
+    - name: "{{ zdlra_sw_label }}: look for an earlier attempt's upgrade"
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -c
+          - '"$1" state "$2/$3.log" "$2/detached.pid"; [ -f "$2/$3.log" ] && echo log=yes || echo log=no'
+          - x
+          - "{{ zdlra_detached }}"
+          - "{{ zdlra_run_dir }}"
+          - "{{ _step }}"
+      register: zdlra_su_look
+      changed_when: false
+
+    # 0 = every switch on target, 1 = not all, 2 = one can't be read.
+    - name: "{{ zdlra_sw_label }}: on target already?"
+      ansible.builtin.set_fact:
+        zdlra_su_state: "{{ zdlra_su_look.stdout_lines[0] }}"
+        zdlra_su_on: >-
+          {{ 2 if zdlra_sw_results | rejectattr('ok') | list | length > 0
+             else 0 if zdlra_sw_results | map(attribute='text') | map('zdlra_has_version', zdlra_sw_target) | reject | list | length == 0
+             else 1 }}
+
+    - name: "{{ zdlra_sw_label }}: the upgrade already worked in this run"
+      ansible.builtin.debug:
+        msg: The upgrade already succeeded in this run; only checking the versions.
+      when: _step in zdlra_steps
+
+    - name: "{{ zdlra_sw_label }}: decide"
+      when: _step not in zdlra_steps
+      block:
+        - name: "{{ zdlra_sw_label }}: stop if a version can't be read after an earlier attempt"
+          ansible.builtin.fail:
+            msg: >-
+              The {{ zdlra_sw_label }} upgrade: a version can't be read, and an earlier attempt ran
+              (log: {{ zdlra_run_dir }}/{{ _step }}.log). Not running it again until they can all be read.
+          when: zdlra_su_state == 'none' and zdlra_su_on | int == 2 and 'log=yes' in zdlra_su_look.stdout_lines
+
+        - name: "{{ zdlra_sw_label }}: every switch is already on target"
+          when: zdlra_su_state == 'none' and zdlra_su_on | int == 0
+          block:
+            - name: "{{ zdlra_sw_label }}: say so"
+              ansible.builtin.debug:
+                msg: "Every switch is already on {{ zdlra_sw_target }}: not running the upgrade."
+            - name: "{{ zdlra_sw_label }}: record the upgrade as done"
+              ansible.builtin.include_tasks: step_mark_done.yml
+              vars:
+                zdlra_step: "{{ _step }}"
+
+        - name: "{{ zdlra_sw_label }}: upgrade"
+          when: zdlra_su_state != 'none' or zdlra_su_on | int != 0
+          block:
+            - name: "{{ zdlra_sw_label }}: precheck and confirmation, for a new upgrade"
+              when: zdlra_su_state == 'none'
+              block:
+                - name: "{{ zdlra_sw_label }}: run the patchmgr precheck"
+                  ansible.builtin.include_tasks: patchmgr_step.yml
+                  vars:
+                    zdlra_pm_prefix: "{{ zdlra_sw_prefix }}"
+                    zdlra_pm_name: precheck
+                    zdlra_pm_dir: "{{ zdlra_loc_dir }}"
+                    zdlra_pm_args: "{{ zdlra_sw_precheck_args }}"
+                    zdlra_pm_fresh: true
+                - name: "{{ zdlra_sw_label }}: confirm"
+                  ansible.builtin.include_tasks: confirm.yml
+                  vars:
+                    zdlra_confirm_text: "Upgrade the {{ zdlra_sw_label }} now (patchmgr {{ zdlra_sw_upgrade_args | join(' ') }})?"
+
+            - name: "{{ zdlra_sw_label }}: run the upgrade"
+              ansible.builtin.include_tasks: patchmgr_step.yml
+              vars:
+                zdlra_pm_prefix: "{{ zdlra_sw_prefix }}"
+                zdlra_pm_name: upgrade
+                zdlra_pm_dir: "{{ zdlra_loc_dir }}"
+                zdlra_pm_args: "{{ zdlra_sw_upgrade_args }}"
+
+            - name: "{{ zdlra_sw_label }}: record the upgrade as done"
+              ansible.builtin.include_tasks: step_mark_done.yml
+              vars:
+                zdlra_step: "{{ _step }}"
+
+    - name: "{{ zdlra_sw_label }}: read the versions after the upgrade"
+      ansible.builtin.include_tasks: switch_versions.yml
+
+    - name: "{{ zdlra_sw_label }}: check the versions"
+      vars:
+        _read: "{{ zdlra_sw_results | selectattr('ok') | list }}"
+        _bad: "{{ _read | rejectattr('text', 'zdlra_has_version', zdlra_sw_target) | list }}"
+        _unread: "{{ zdlra_sw_results | rejectattr('ok') | map(attribute='name') | list }}"
+      block:
+        - name: "{{ zdlra_sw_label }}: every switch read must be on target"
+          ansible.builtin.assert:
+            that: _bad | length == 0
+            fail_msg: >-
+              {{ _bad | length }} switch(es) not on {{ zdlra_sw_target }}:
+              {{ _bad | map(attribute='name') | zip(_bad | map(attribute='text') | map('zdlra_version_line')) | map('join', ': ') | join('; ') }}
+            success_msg: "{{ _read | map(attribute='name') | join(', ') or 'No switch' }} on {{ zdlra_sw_target }}."
+        - name: "{{ zdlra_sw_label }}: switches that could not be read"
+          ansible.builtin.debug:
+            msg: "WARNING: {{ _unread | length }} switch(es) could not be checked: {{ _unread | join(', ') }}. Check them by hand (patchmgr reported success)."
+          when: _unread | length > 0

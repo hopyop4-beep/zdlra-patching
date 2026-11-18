@@ -1,0 +1,40 @@
+---
+# Nothing starts over a patchmgr run, a racli upgrade step or Oracle's precheck. The one
+# exception: this run's own racli step, cell patch or switch upgrade of this very phase,
+# left running by an earlier attempt. The phase then waits for it rather than starting it.
+
+- name: "{{ zdlra_phase }}: look for this run's own command"
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - -c
+      - 'p=$(tr -dc 0-9 < "$1/detached.pid" 2>/dev/null); [ -n "$p" ] && kill -0 "$p" 2>/dev/null && cat "$1/detached.log" 2>/dev/null; true'
+      - own
+      - "{{ zdlra_run_dir }}"
+  register: zdlra_own_running
+  changed_when: false
+
+- name: "{{ zdlra_phase }}: look for any long command on the node"
+  ansible.builtin.command: "{{ zdlra_detached }} running {{ zdlra_precheck_name }}"
+  register: zdlra_any_running
+  changed_when: false
+  failed_when: false
+
+- name: "{{ zdlra_phase }}: refuse"
+  vars:
+    _own_log: "{{ zdlra_own_running.stdout | trim | basename }}"
+    _pickup: >-
+      {{ _own_log in [zdlra_phase ~ '.log', 'cells_patch.log', 'switches_upgrade.log', 'admin_switches_upgrade.log']
+         and _own_log is match(zdlra_phase ~ '[._]') }}
+  ansible.builtin.fail:
+    msg: >-
+      Still running: {{ zdlra_any_running.stdout if zdlra_any_running.rc == 0 else 'this run\'s ' ~ _own_log }}.
+      Wait for it to finish before starting {{ zdlra_phase }}.
+  when:
+    - zdlra_own_running.stdout | trim | length > 0 or zdlra_any_running.rc == 0
+    - not (zdlra_own_running.stdout | trim | length > 0 and _pickup | bool)
+
+- name: "{{ zdlra_phase }}: picking up this run's own command"
+  ansible.builtin.debug:
+    msg: "{{ zdlra_own_running.stdout | trim }} is still running from an earlier attempt: waiting for it, not starting it again."
+  when: zdlra_own_running.stdout | trim | length > 0

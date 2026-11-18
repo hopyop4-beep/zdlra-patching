@@ -1,0 +1,22 @@
+ZDLRA patch run {{ zdlra_run }} (Ansible)
+Appliance: {{ zdlra }}
+Host:      {{ inventory_hostname }}
+Done:      {{ zdlra_done | join(' ') }}
+{% if _skipped %}
+SKIPPED:   {{ _skipped | join(' ') }} (nothing was done in these)
+{% endif %}
+Staged:    {{ zdlra_staged.archive | default('?') }} (SHA-256 {{ zdlra_staged.sha256 | default('?') }})
+Dry run:   {{ zdlra_dry_run | int }}
+Tags:      {{ ansible_run_tags | join(',') }}
+{% if _approval.approved_by is defined %}
+Approved:  {{ _approval.approved_by }} at {{ _approval.approved_at | default('?') }}
+{% endif %}
+Paused:    {{ _paused | join(' ') or 'no replication servers' }}
+Log:       {{ zdlra_run_dir }}/zdlra_patch.log
+{% if _f['versions.txt'] %}
+
+Versions after patching:
+{% for line in _f['versions.txt'].splitlines() %}
+  {{ line }}
+{% endfor %}
+{% endif %}

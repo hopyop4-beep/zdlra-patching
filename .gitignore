@@ -10,3 +10,11 @@ jump/zdlra_jump.conf
 staging/zdlra_stage.conf
 staging/components/*.conf
 !staging/components/example.conf
+
+# Ansible: real inventory, secrets, logs and run state stay local
+ansible/inventory/hosts.yml
+ansible/inventory/group_vars/all/vault.yml
+ansible/inventory/group_vars/*.yml
+ansible/inventory/host_vars/
+ansible/logs/*
+!ansible/logs/.gitkeep

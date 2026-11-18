@@ -1,0 +1,156 @@
+---
+# Suspend or resume the appliance's OEM backup jobs (oem_jobs_action: suspend | resume).
+# sr_jobs_new.ksh only writes a script, <jobs_db>_<action>_job_<stamp>.ksh, with one emcli
+# command per job; that script (only the one just written) is then run, with its output in
+# <same name>.log, as when run by hand. About 30 minutes is normal. It runs every command even
+# if some fail, so each job it names must have a line Job "<name>" <action>ed successfully in
+# the log. Jobs without one are warnings; none at all, or no jobs named, is a failure.
+# oem_dry_run: only show what would run. Sets oem_jobs_problem (a warning to repeat at the end).
+
+- name: Work out the {{ oem_jobs_action }} command
+  vars:
+    _fill: {jobs_db: "{{ oem_jobs_db or zdlra }}", zdlra: "{{ zdlra }}", action: "{{ oem_jobs_action }}"}
+  ansible.builtin.set_fact:
+    oem_jobs_cmd: "{{ (oem_jobs_suspend_cmd if oem_jobs_action == 'suspend' else oem_jobs_resume_cmd) | zdlra_fill(_fill) }}"
+    oem_jobs_pattern: "{{ [oem_jobs_generated] | zdlra_fill(_fill) | first if oem_jobs_generated | length > 0 else '' }}"
+    oem_jobs_problem: ""
+
+- name: No command set
+  ansible.builtin.debug:
+    msg: "WARNING: no OEM job command set for '{{ oem_jobs_action }}'; skipping."
+  when: oem_jobs_cmd | length == 0
+
+- name: "[dry-run] {{ oem_jobs_action }} OEM jobs"
+  ansible.builtin.debug:
+    msg:
+      - "[dry-run] {{ oem_jobs_action }} OEM jobs: cd {{ oem_jobs_dir }} && {{ oem_jobs_cmd | join(' ') }}"
+      - "[dry-run] then run the script it writes ({{ oem_jobs_pattern }}) and check its log"
+  when: oem_jobs_cmd | length > 0 and oem_dry_run | default(true) | bool
+
+- name: "{{ oem_jobs_action | capitalize }} the OEM jobs"
+  when: oem_jobs_cmd | length > 0 and not (oem_dry_run | default(true) | bool)
+  block:
+    - name: Log in to EM
+      ansible.builtin.include_tasks: login.yml
+
+    # Files newer than the marker were made by this call. It goes in the folder they appear
+    # in, so both times come from the same clock. The pause is for a filesystem that only
+    # keeps whole seconds.
+    - name: Mark the time
+      ansible.builtin.shell: "m=$(mktemp {{ oem_jobs_dir | quote }}/.zdlra_marker.XXXXXX) && sleep 1 && echo $m"
+      delegate_to: "{{ oem_host }}"
+      register: oem_marker
+      changed_when: true
+      when: oem_jobs_pattern | length > 0
+
+    - name: "Run {{ oem_jobs_cmd | join(' ') }}"
+      ansible.builtin.command:
+        argv: "{{ oem_jobs_cmd }}"
+        chdir: "{{ oem_jobs_dir }}"
+      delegate_to: "{{ oem_host }}"
+      register: oem_jobs_run
+      changed_when: true
+      failed_when: false
+
+    - name: Show its output
+      ansible.builtin.debug:
+        var: oem_jobs_run.stdout_lines
+
+    - name: Check it worked
+      ansible.builtin.fail:
+        msg: >-
+          {{ oem_jobs_action }} OEM jobs: {{ ('exit status ' ~ oem_jobs_run.rc) if oem_jobs_run.rc != 0
+             else 'the output shows an error (matches oem_jobs_fail_re), although the exit status was 0' }}.
+      when: >-
+        oem_jobs_run.rc != 0
+        or (oem_jobs_fail_re | length > 0 and (oem_jobs_run.stdout ~ oem_jobs_run.stderr) is search(oem_jobs_fail_re))
+
+    - name: Run the script it wrote
+      when: oem_jobs_pattern | length > 0
+      block:
+        - name: Find the one new script
+          ansible.builtin.command:
+            argv: [find, "{{ oem_jobs_dir }}", -maxdepth, "1", -type, f, -name, "{{ oem_jobs_pattern }}", -newer, "{{ oem_marker.stdout }}"]
+          delegate_to: "{{ oem_host }}"
+          register: oem_found
+          changed_when: false
+
+        - name: Remove the marker
+          ansible.builtin.file:
+            path: "{{ oem_marker.stdout }}"
+            state: absent
+          delegate_to: "{{ oem_host }}"
+
+        - name: Check there is exactly one
+          ansible.builtin.assert:
+            that: oem_found.stdout_lines | length == 1
+            fail_msg: "{{ oem_jobs_action }} OEM jobs: expected one new {{ oem_jobs_pattern }} in {{ oem_jobs_dir }}; found {{ oem_found.stdout_lines | length }} {{ oem_found.stdout_lines | map('basename') | join(' ') }}"
+            quiet: true
+
+        - name: "Run {{ oem_found.stdout_lines[0] | basename }} (about 30 min is normal)"
+          vars:
+            _f: "{{ oem_found.stdout_lines[0] | basename }}"
+          ansible.builtin.shell: "set -o pipefail; if [ -x \"./$F\" ]; then \"./$F\"; else ksh \"./$F\"; fi > \"${F%.ksh}.log\" 2>&1"
+          args:
+            chdir: "{{ oem_jobs_dir }}"
+            executable: /bin/bash
+          environment:
+            F: "{{ _f }}"
+          delegate_to: "{{ oem_host }}"
+          register: oem_gen_run
+          changed_when: true
+          failed_when: false
+
+        - name: Check each job in its log
+          ansible.builtin.command:
+            argv:
+              - /bin/bash
+              - -c
+              - |
+                f=$1; log="${f%.ksh}.log"
+                echo "LOG=$(pwd)/$log"
+                sed -n 's/.*-name="\([^"]*\)".*/\1/p' "$f" | while IFS= read -r j; do
+                  if grep -F "Job \"$j\" " "$log" | grep -q 'successfully'; then echo "OK $j"; else echo "MISSING $j"; fi
+                done
+              - x
+              - "{{ oem_found.stdout_lines[0] | basename }}"
+            chdir: "{{ oem_jobs_dir }}"
+          delegate_to: "{{ oem_host }}"
+          register: oem_gen_check
+          changed_when: false
+
+        - name: Count the jobs
+          vars:
+            _missing: "{{ oem_gen_check.stdout_lines | select('match', '^MISSING ') | map('regex_replace', '^MISSING ', '') | list }}"
+            _ok: "{{ oem_gen_check.stdout_lines | select('match', '^OK ') | list }}"
+          ansible.builtin.set_fact:
+            oem_jobs_missing: "{{ _missing }}"
+            oem_jobs_total: "{{ _missing | length + _ok | length }}"
+            oem_jobs_log: "{{ oem_gen_check.stdout_lines[0] | regex_replace('^LOG=', '') }}"
+
+        - name: Jobs not reported successfully
+          ansible.builtin.debug:
+            msg: >-
+              {{ ['WARNING: ' ~ oem_jobs_action ~ ' OEM jobs: ' ~ oem_jobs_missing | length ~ ' of ' ~ oem_jobs_total
+                  ~ " job(s) not reported 'successfully' in " ~ oem_jobs_log ~ ' (carrying on):']
+                 + oem_jobs_missing[:20]
+                 + (['... and ' ~ (oem_jobs_missing | length - 20) ~ ' more (see the log)'] if oem_jobs_missing | length > 20 else [])
+                 + (['The script exited with status ' ~ oem_gen_run.rc] if oem_gen_run.rc != 0 else []) }}
+          when: oem_jobs_missing | length > 0 or oem_gen_run.rc != 0
+
+        - name: Fail if no job worked
+          ansible.builtin.fail:
+            msg: >-
+              {{ oem_jobs_action }} OEM jobs:
+              {{ 'the script names no jobs (no -name="..." lines)' if oem_jobs_total | int == 0
+                 else 'none of the ' ~ oem_jobs_total ~ " job(s) reported 'successfully'" }} (see {{ oem_jobs_log }}).
+          when: oem_jobs_total | int == 0 or oem_jobs_missing | length == oem_jobs_total | int
+
+        - name: Note jobs not resumed
+          ansible.builtin.set_fact:
+            oem_jobs_problem: "{{ oem_jobs_missing | length }} of {{ oem_jobs_total }} job(s) not resumed; see {{ oem_jobs_log }}"
+          when: oem_jobs_action == 'resume' and oem_jobs_missing | length > 0
+
+        - name: Done
+          ansible.builtin.debug:
+            msg: "{{ oem_jobs_action }} OEM jobs: {{ oem_jobs_total | int - oem_jobs_missing | length }} of {{ oem_jobs_total }} job(s) {{ oem_jobs_action | regex_replace('e$', '') }}ed successfully; log {{ oem_jobs_log }}"
