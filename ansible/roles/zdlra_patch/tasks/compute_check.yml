@@ -1,0 +1,76 @@
+---
+# Check a finished compute patchmgr (zdlra_cc_job on zdlra_c_runner): no FAILED lines,
+# exit 0, "SUCCESS: Completed run of command" and "Exit status:0", every node in state
+# SUCCESS. "SUCCESS WITH WARNING(S)" is accepted and the warnings listed, unless
+# zdlra_compute_pause_on_warnings (then zdlra_accept_warnings, once reviewed).
+# A step that ended badly with exit 0 is recorded on the node as exit 98, so picking up
+# starts it again. A copy of the log is kept on the controller.
+
+- name: "{{ zdlra_cc_what }}: keep a copy of the log"
+  ansible.builtin.fetch:
+    src: "{{ zdlra_c_work }}/{{ zdlra_cc_job }}.log"
+    dest: "{{ zdlra_controller_logs }}/compute_{{ zdlra_c_runner }}_{{ zdlra_cc_job }}.log"
+    flat: true
+  delegate_to: "{{ zdlra_c_runner }}"
+
+- name: "{{ zdlra_cc_what }}: read the log"
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - -c
+      - |
+        grep -E 'FAILED' "$1" | head -10 | sed 's/^/FAILED_LINE /'
+        grep -q 'SUCCESS: Completed run of command' "$1" && grep -q 'Exit status:0' "$1" && echo COMPLETED
+        grep -E 'has state: ' "$1" | grep -vE 'has state: SUCCESS' | head -5 | sed 's/^/BAD_STATE /'
+        grep -E '^[A-Za-z0-9._-]+: WARNING:' "$1" | cut -c1-200 | sed 's/^/WARNING_LINE /'
+        true
+      - x
+      - "{{ zdlra_c_work }}/{{ zdlra_cc_job }}.log"
+  delegate_to: "{{ zdlra_c_runner }}"
+  register: zdlra_cc
+  changed_when: false
+
+- name: "{{ zdlra_cc_what }}: result"
+  vars:
+    _lines: "{{ zdlra_cc.stdout_lines }}"
+    _failed: "{{ _lines | select('match', '^FAILED_LINE ') | map('regex_replace', '^FAILED_LINE ', '') | list }}"
+    _bad_state: "{{ _lines | select('match', '^BAD_STATE ') | map('regex_replace', '^BAD_STATE ', '') | list }}"
+  ansible.builtin.set_fact:
+    zdlra_cc_warnings: "{{ _lines | select('match', '^WARNING_LINE ') | map('regex_replace', '^WARNING_LINE ', '') | list }}"
+    zdlra_cc_problem: >-
+      {%- if _failed -%}{{ zdlra_cc_what }} reported failures: {{ _failed | join(' | ') }}
+      {%- elif zdlra_job_rc | int != 0 -%}{{ zdlra_cc_what }} exited with code {{ zdlra_job_rc }}
+      {%- elif 'COMPLETED' not in _lines -%}{{ zdlra_cc_what }} did not report a completed run
+      {%- elif _bad_state -%}{{ zdlra_cc_what }}: a node did not reach state SUCCESS: {{ _bad_state | join(' | ') }}
+      {%- endif -%}
+
+- name: "{{ zdlra_cc_what }}: failed"
+  when: zdlra_cc_problem | default('', true) | length > 0
+  block:
+    - name: "{{ zdlra_cc_what }}: record a bad exit 0 as 98, so it starts again next time"
+      ansible.builtin.shell: echo 98 > {{ (zdlra_c_work ~ '/' ~ zdlra_cc_job ~ '.log.rc') | quote }}
+      delegate_to: "{{ zdlra_c_runner }}"
+      changed_when: true
+      when: zdlra_job_rc | int == 0
+    - name: "{{ zdlra_cc_what }}: stop"
+      ansible.builtin.fail:
+        msg: "{{ zdlra_cc_problem }}. Log: {{ zdlra_c_runner }}:{{ zdlra_c_work }}/{{ zdlra_cc_job }}.log (copy: {{ zdlra_controller_logs }})"
+
+- name: "{{ zdlra_cc_what }}: SUCCESS WITH WARNING(S)"
+  ansible.builtin.debug:
+    msg: "{{ ['WARNING: ' ~ zdlra_cc_what ~ ': SUCCESS WITH WARNING(S):'] + zdlra_cc_warnings }}"
+  when: zdlra_cc_warnings | length > 0
+
+- name: "{{ zdlra_cc_what }}: stop on warnings for review"
+  ansible.builtin.fail:
+    msg: >-
+      {{ zdlra_cc_what }} has warnings and zdlra_compute_pause_on_warnings is set. Once reviewed, accept them:
+      run the playbook again with -e zdlra_run_id={{ zdlra_run }} -e zdlra_accept_warnings=true
+  when:
+    - zdlra_cc_warnings | length > 0
+    - zdlra_compute_pause_on_warnings | bool
+    - not (zdlra_accept_warnings | bool)
+
+- name: "{{ zdlra_cc_what }}: completed"
+  ansible.builtin.debug:
+    msg: "{{ zdlra_cc_what }}: completed."

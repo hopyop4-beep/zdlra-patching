@@ -1,0 +1,28 @@
+---
+# Make sure emcli has a session: emcli sync fails without one. A window takes hours and the
+# session can expire, so this runs before each OEM step.
+- name: Check the emcli session
+  ansible.builtin.command: "{{ oem_emcli }} sync"
+  delegate_to: "{{ oem_host }}"
+  register: oem_sync
+  changed_when: false
+  failed_when: false
+
+- name: Log in to EM
+  when: oem_sync.rc != 0
+  block:
+    - name: Check a login is set up
+      ansible.builtin.assert:
+        that: oem_em_user | length > 0 and oem_em_password | length > 0
+        fail_msg: "emcli is not logged in. Run 'emcli login -username=<user>' on {{ oem_host }}, or set oem_em_user and oem_em_password (vault)."
+        quiet: true
+    - name: Log in as {{ oem_em_user }}
+      ansible.builtin.command:
+        argv: ["{{ oem_emcli }}", login, "-username={{ oem_em_user }}", "-password={{ oem_em_password }}"]
+      delegate_to: "{{ oem_host }}"
+      no_log: true
+      changed_when: true
+    - name: Sync after login
+      ansible.builtin.command: "{{ oem_emcli }} sync"
+      delegate_to: "{{ oem_host }}"
+      changed_when: false

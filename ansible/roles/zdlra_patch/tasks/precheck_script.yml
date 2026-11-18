@@ -1,0 +1,181 @@
+---
+# Run Oracle's precheck (zdlra_precheck_label: before or after) and read its summary:
+#   FAILURE SUMMARY
+#   ***********************************
+#   <date> [FAIL] <failure name>
+#   <date> [WARN] <warning name>
+# It fails on any failure not waived (and warnings too with zdlra_precheck_fail_on_warn),
+# if the script is killed, or on a non-zero exit with no summary. It runs in a dry run
+# too, so a dry run gives real answers. It is not read-only (it installs and rolls back an
+# RPM and moves the gold images), so it runs detached and is never cut short.
+# Results go to <run dir>/precheck_<label>/, as with zdlra_patch.sh.
+
+- name: Check the precheck script is set
+  ansible.builtin.fail:
+    msg: zdlra_precheck_script is not set.
+  when: zdlra_precheck_script | length == 0 and zdlra_precheck_required | bool
+
+- name: Run the precheck
+  when: zdlra_precheck_script | length > 0
+  vars:
+    _out_dir: "{{ zdlra_run_dir }}/precheck_{{ zdlra_precheck_label }}"
+  block:
+    - name: Check the precheck script is there
+      ansible.builtin.stat:
+        path: "{{ zdlra_precheck_script }}"
+      register: zdlra_pc_stat
+      failed_when: not (zdlra_pc_stat.stat.executable | default(false))
+
+    - name: Check SR_NUMBER and the conf file, if the arguments use them
+      ansible.builtin.assert:
+        that:
+          - zdlra_staged.patch_conf | default('') | length > 0
+          - zdlra_conf | length > 0
+          - "'{sr_number}' not in zdlra_precheck_args | join(' ') or zdlra_conf.SR_NUMBER | default('') is match('^[A-Za-z0-9-]+$')"
+        fail_msg: >-
+          The precheck arguments need the conf file staging set up ({{ zdlra_staged.patch_conf | default('none named in the staged record') }})
+          and a valid SR_NUMBER= in it (found: '{{ zdlra_conf.SR_NUMBER | default('') }}').
+        quiet: true
+      when: "'{sr_number}' in zdlra_precheck_args | join(' ') or '{patch_conf}' in zdlra_precheck_args | join(' ')"
+
+    - name: Work out the command
+      ansible.builtin.set_fact:
+        zdlra_pc_cmd: >-
+          {{ [('./' ~ zdlra_precheck_name) if zdlra_precheck_cwd | length == 0 else zdlra_precheck_script]
+             + (zdlra_precheck_args | zdlra_fill({'sr_number': zdlra_conf.SR_NUMBER | default(''), 'patch_conf': zdlra_staged.patch_conf | default('')}))
+             + ([] if zdlra_dry_run else zdlra_precheck_event_args) }}
+
+    - name: Create the results folder
+      ansible.builtin.file:
+        path: "{{ _out_dir }}"
+        state: directory
+        mode: "0750"
+
+    # A new precheck run: never reuse the result of an earlier one.
+    - name: Run the precheck, detached
+      ansible.builtin.include_tasks: detached.yml
+      vars:
+        zdlra_job_what: "precheck ({{ zdlra_precheck_label }})"
+        zdlra_job_log: "{{ _out_dir }}/output.txt"
+        zdlra_job_dir: "{{ zdlra_precheck_cwd if zdlra_precheck_cwd | length > 0 else zdlra_precheck_script | dirname }}"
+        zdlra_job_cmd: "{{ zdlra_pc_cmd }}"
+        zdlra_job_warn_minutes: "{{ zdlra_precheck_warn_minutes }}"
+        zdlra_job_fresh: true
+
+    - name: Record its exit code
+      ansible.builtin.copy:
+        dest: "{{ _out_dir }}/exit_code"
+        content: "{{ zdlra_job_rc }}\n"
+        mode: "0640"
+
+    - name: Mark its result as used
+      ansible.builtin.command: "{{ zdlra_detached }} collect {{ _out_dir }}/output.txt"
+      changed_when: false
+
+    - name: Stop if it was killed
+      ansible.builtin.fail:
+        msg: "The precheck was killed by a signal (exit code {{ zdlra_job_rc }}), so its results can't be trusted. See {{ _out_dir }}/output.txt"
+      when: zdlra_job_rc | int >= 128
+
+    # The last summary section, colour codes removed; the whole output if there is none.
+    - name: Read the summary
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -c
+          - |
+            plain="$(sed 's/\x1b\[[0-9;]*m//g' "$1")"
+            if grep -qF -- "$2" <<<"$plain"; then
+              echo "HAVE_SUMMARY=1"
+              awk -v h="$2" 'index($0, h) { buf = ""; next } { buf = buf $0 "\n" } END { printf "%s", buf }' <<<"$plain"
+            else
+              echo "HAVE_SUMMARY=0"
+              printf '%s\n' "$plain"
+            fi
+          - summary
+          - "{{ _out_dir }}/output.txt"
+          - "{{ zdlra_precheck_summary_header }}"
+      register: zdlra_pc_summary
+      changed_when: false
+
+    - name: Sort the summary into failures and warnings
+      vars:
+        _text: "{{ zdlra_pc_summary.stdout_lines[1:] | join('\n') }}"
+      ansible.builtin.set_fact:
+        zdlra_pc_have_summary: "{{ zdlra_pc_summary.stdout_lines[0] == 'HAVE_SUMMARY=1' }}"
+        zdlra_pc_fail: "{{ _text | zdlra_summary_items(zdlra_precheck_fail_pattern) }}"
+        zdlra_pc_warn: "{{ _text | zdlra_summary_items(zdlra_precheck_warn_pattern) }}"
+
+    - name: Save the failure and warning lists
+      ansible.builtin.copy:
+        dest: "{{ _out_dir }}/{{ item.file }}"
+        content: "{{ (item.lines | join('\n') ~ '\n') if item.lines else '' }}"
+        mode: "0640"
+      loop:
+        - { file: failures.txt, lines: "{{ zdlra_pc_fail.lines }}" }
+        - { file: failure_names.txt, lines: "{{ zdlra_pc_fail.names }}" }
+        - { file: warnings.txt, lines: "{{ zdlra_pc_warn.lines }}" }
+        - { file: warning_names.txt, lines: "{{ zdlra_pc_warn.names }}" }
+      loop_control:
+        label: "{{ item.file }}"
+
+    # Each item is waived if a waiver is part of its name. Warnings only count when
+    # zdlra_precheck_fail_on_warn is set (and then waivers apply to them too).
+    - name: Decide what blocks
+      vars:
+        _items: >-
+          {{ zdlra_pc_fail.names | map('regex_replace', '^', 'FAIL ') | list
+             + (zdlra_pc_warn.names | map('regex_replace', '^', 'WARN ') | list if zdlra_precheck_fail_on_warn | bool else []) }}
+        _waived: "{{ _items | zdlra_waived(zdlra_precheck_waivers) }}"
+      ansible.builtin.set_fact:
+        zdlra_pc_blocking: "{{ _items | difference(_waived) }}"
+        zdlra_pc_waived: "{{ _waived }}"
+
+    - name: Show the precheck results
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['Precheck (' ~ zdlra_precheck_label ~ '): exit ' ~ zdlra_job_rc ~ ', '
+              ~ zdlra_pc_blocking | length ~ ' blocking, ' ~ zdlra_pc_waived | length ~ ' waived, '
+              ~ zdlra_pc_warn.names | length ~ ' warning(s). Lists: ' ~ _out_dir]
+             + (zdlra_pc_blocking | map('regex_replace', '^(\S+) ', '[\1] ') | list)
+             + (zdlra_pc_waived | map('regex_replace', '^(\S+) ', '[waived \1] ') | list)
+             + ([] if zdlra_precheck_fail_on_warn | bool else zdlra_pc_warn.names | map('regex_replace', '^', '[WARN] ') | list)
+             + ([] if zdlra_pc_have_summary else ["No '" ~ zdlra_precheck_summary_header ~ "' section found; searched the whole output."]) }}
+
+    - name: Compare with before patching
+      when: zdlra_precheck_label == 'after'
+      block:
+        - name: Read the before lists
+          ansible.builtin.slurp:
+            src: "{{ zdlra_run_dir }}/precheck_before/{{ item }}"
+          register: zdlra_pc_before
+          failed_when: false
+          loop: [failure_names.txt, warning_names.txt]
+        - name: Show what changed
+          vars:
+            _bf: "{{ zdlra_pc_before.results[0].content | default('') | b64decode | zdlra_lines }}"
+            _bw: "{{ zdlra_pc_before.results[1].content | default('') | b64decode | zdlra_lines }}"
+          ansible.builtin.debug:
+            msg: >-
+              {{ (zdlra_pc_fail.names | difference(_bf) | map('regex_replace', '^', 'new failure since before patching: ') | list)
+                 + (_bf | difference(zdlra_pc_fail.names) | map('regex_replace', '^', 'failure resolved by patching: ') | list)
+                 + (zdlra_pc_warn.names | difference(_bw) | map('regex_replace', '^', 'new warning since before patching: ') | list)
+                 + (_bw | difference(zdlra_pc_warn.names) | map('regex_replace', '^', 'warning resolved by patching: ') | list)
+                 or ['No change in failures or warnings since before patching.'] }}
+          when: zdlra_pc_before.results[0].content is defined
+
+    - name: Stop on blocking items
+      ansible.builtin.fail:
+        msg: "Precheck ({{ zdlra_precheck_label }}) found {{ zdlra_pc_blocking | length }} blocking item(s) that are not waived: {{ zdlra_pc_blocking | join('; ') }}"
+      when: zdlra_pc_blocking | length > 0
+
+    # With a summary, the summary decides: the script may exit non-zero for warnings or waived failures.
+    - name: Stop on a non-zero exit with no summary
+      ansible.builtin.fail:
+        msg: "The precheck exited with code {{ zdlra_job_rc }} and printed no summary. See {{ _out_dir }}/output.txt"
+      when: zdlra_job_rc | int != 0 and not zdlra_pc_have_summary
+
+    - name: Precheck passed
+      ansible.builtin.debug:
+        msg: >-
+          Precheck ({{ zdlra_precheck_label }}) passed.{{ ' It exited with code ' ~ zdlra_job_rc ~ '; nothing in its summary is blocking.' if zdlra_job_rc | int != 0 else '' }}

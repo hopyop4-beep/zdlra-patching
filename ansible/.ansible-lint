@@ -1,0 +1,7 @@
+# ansible-lint settings for these playbooks.
+skip_list:
+  # Variables are prefixed zdlra_ (or oem_), shared across both roles and the playbooks.
+  - var-naming[no-role-prefix]
+  # Task names carry the step or node they act on, wherever it reads best.
+  - name[template]
+  - name[casing]

@@ -1,0 +1,54 @@
+---
+# Runs one phase (zdlra_phase), with the checks around it that zdlra_patch.sh makes:
+#   - a phase this run already finished is skipped (the include's "when", in main.yml)
+#   - a phase that changes the appliance needs an approved, recent, unchanged precheck
+#   - a patch phase refuses to run once resume has run (replication is not paused)
+#   - a phase that starts a long command refuses while another one runs on the node
+# Then the phase is recorded as done, or as skipped when it did nothing this time.
+
+- name: "{{ zdlra_phase }}: would it do nothing, as things are set?"
+  ansible.builtin.set_fact:
+    zdlra_phase_skips: >-
+      {{ (zdlra_phase == 'admin_switches' and (not (zdlra_admin_switch_enabled | bool) or zdlra_switch_type == 'ib'))
+         or (zdlra_phase == 'switches' and zdlra_switch_type == 'ib') }}
+    zdlra_phase_skipped: false
+    # A refusal before the phase starts changes nothing, so it leaves the run's status as it is.
+    zdlra_preserve_status: true
+
+- name: "{{ zdlra_phase }}: checks before it starts"
+  when: not zdlra_phase_skips
+  block:
+    - name: "{{ zdlra_phase }}: needs an approved precheck"
+      ansible.builtin.include_tasks: require_approval.yml
+      when: zdlra_phase in ['quiesce', 'ra_preinstall', 'ra_alter', 'ra_update', 'cells', 'switches', 'admin_switches']
+
+    - name: "{{ zdlra_phase }}: refuse once resume has run"
+      ansible.builtin.fail:
+        msg: >-
+          Run {{ zdlra_run }}'s resume has already run, so replication isn't paused. Not running
+          {{ zdlra_phase }}. Start a new run, or run quiesce again first.
+      when:
+        - zdlra_phase in ['ra_preinstall', 'ra_alter', 'ra_update', 'cells', 'switches', 'admin_switches']
+        - zdlra_resumed | length > 0
+
+    - name: "{{ zdlra_phase }}: refuse while a long command runs"
+      ansible.builtin.include_tasks: refuse_if_running.yml
+      when: zdlra_phase in ['precheck', 'postcheck', 'ra_preinstall', 'ra_alter', 'ra_update', 'cells', 'switches', 'admin_switches']
+
+- name: "{{ zdlra_phase }}: starts"
+  ansible.builtin.set_fact:
+    zdlra_current_phase: "{{ zdlra_phase }}"
+    zdlra_preserve_status: false
+
+- name: "{{ zdlra_phase }}: set the run's status"
+  ansible.builtin.include_tasks: set_status.yml
+  vars:
+    zdlra_status: "running {{ zdlra_phase }}"
+
+- name: "Phase {{ zdlra_phase }}"
+  ansible.builtin.include_tasks: "phase_{{ zdlra_phase }}.yml"
+
+- name: "{{ zdlra_phase }}: record it as done"
+  ansible.builtin.include_tasks: mark_phase.yml
+  vars:
+    zdlra_mark: "{{ 'skipped' if zdlra_phase_skipped else 'done' }}"

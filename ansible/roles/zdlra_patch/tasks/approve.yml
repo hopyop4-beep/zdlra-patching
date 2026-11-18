@@ -1,0 +1,61 @@
+---
+# The operator reviews the precheck results and types APPROVE. Nothing skips this; with no
+# terminal (stdin not interactive) the answer is empty, so the run stops.
+# The approval is saved in <run dir>/precheck_approval.txt, with who approved it, when, and
+# a fingerprint of the results and the staged archive.
+
+- name: Work out the fingerprint of what is approved
+  ansible.builtin.include_tasks: fingerprint.yml
+
+- name: Ask for approval
+  ansible.builtin.pause:
+    prompt: |
+
+      ================ PRECHECK REVIEW ================
+      Appliance:    {{ zdlra }}   run {{ zdlra_run }}   (dry run: {{ zdlra_dry_run }})
+      Failures:     {{ zdlra_pc_fail.names | length }} (all waived, or the precheck would have stopped)
+      {% for n in zdlra_pc_fail.names %}  [FAIL] {{ n }}
+      {% endfor %}
+      Warnings:     {{ zdlra_pc_warn.names | length }}
+      {% for n in zdlra_pc_warn.names %}  [WARN] {{ n }}
+      {% endfor %}
+      Exit code:    {{ zdlra_job_rc }}
+      Full output:  {{ zdlra_run_dir }}/precheck_before/output.txt
+      Staged:       {{ zdlra_staged.archive | default('?') }} (staged {{ zdlra_staged.staged_at | default('?') }})
+        SHA-256     {{ zdlra_staged.sha256 | default('?') }}
+      {% if not zdlra_dry_run and 'precheck' not in ansible_run_tags %}
+
+      After approval the patch runs to the end with the confirmations set by
+      zdlra_confirm_steps ({{ zdlra_confirm_steps }}).
+      {% endif %}
+      =================================================
+      Review the precheck output, then type APPROVE to continue
+  register: zdlra_approve_input
+
+- name: Check the answer
+  ansible.builtin.assert:
+    that: zdlra_approve_input.user_input | default('') | trim == 'APPROVE'
+    fail_msg: Precheck not approved.
+    quiet: true
+
+- name: Find who approved it
+  ansible.builtin.set_fact:
+    zdlra_approver: "{{ lookup('env', 'SUDO_USER') or lookup('env', 'USER') or lookup('pipe', 'id -un') }}@{{ lookup('pipe', 'hostname') }}"
+
+- name: Save the approval
+  ansible.builtin.copy:
+    dest: "{{ zdlra_run_dir }}/precheck_approval.txt"
+    mode: "0640"
+    content: |
+      approved_by={{ zdlra_approver }}
+      approved_at={{ now(fmt='%Y-%m-%d %H:%M:%S %Z') }}
+      approved_epoch={{ now().timestamp() | int }}
+      precheck_dry_run={{ zdlra_dry_run | int }}
+      host={{ inventory_hostname }}
+      failures={{ zdlra_pc_fail.names | length }}
+      warnings={{ zdlra_pc_warn.names | length }}
+      fingerprint={{ zdlra_fingerprint }}
+
+- name: Approved
+  ansible.builtin.debug:
+    msg: "Precheck approved by {{ zdlra_approver }}."

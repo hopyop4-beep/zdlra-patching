@@ -1,0 +1,23 @@
+---
+# Every cell's image version now. Sets zdlra_cells (the names in the cell group file),
+# zdlra_cell_versions (name -> version; a cell that didn't answer is missing) and
+# zdlra_cell_text (dcli's output).
+
+- name: Read the cell group file
+  ansible.builtin.slurp:
+    src: "{{ zdlra_cell_group_file }}"
+  register: zdlra_cg
+  failed_when: false
+
+- name: Ask every cell its image version
+  ansible.builtin.command: "{{ zdlra_dcli }} -g {{ zdlra_cell_group_file }} -l root 'imageinfo -ver'"
+  register: zdlra_cv
+  changed_when: false
+  failed_when: false
+  when: zdlra_cg.content is defined
+
+- name: Read the cell versions
+  ansible.builtin.set_fact:
+    zdlra_cells: "{{ zdlra_cg.content | default('') | b64decode | zdlra_lines }}"
+    zdlra_cell_text: "{{ (zdlra_cv.stdout | default('')) ~ '\n' ~ (zdlra_cv.stderr | default('')) }}"
+    zdlra_cell_versions: "{{ ((zdlra_cv.stdout | default('')) ~ '\n' ~ (zdlra_cv.stderr | default(''))) | zdlra_image_versions }}"

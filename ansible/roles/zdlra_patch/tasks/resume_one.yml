@@ -1,0 +1,25 @@
+---
+- name: "{{ zdlra_server }}: resume"
+  ansible.builtin.include_tasks: sql.yml
+  vars:
+    zdlra_sql_text: "{{ zdlra_replication_resume_sql | replace('{server}', zdlra_server) }}"
+    zdlra_sql_mode: exec
+
+- name: "{{ zdlra_server }}: record it"
+  when: not zdlra_dry_run
+  block:
+    - name: "{{ zdlra_server }}: add it to the resumed list"
+      ansible.builtin.lineinfile:
+        path: "{{ zdlra_run_dir }}/replication_paused_resumed.txt"
+        line: "{{ zdlra_server }}"
+        create: true
+        mode: "0640"
+    - name: "{{ zdlra_server }}: take it off the paused list"
+      ansible.builtin.lineinfile:
+        path: "{{ zdlra_run_dir }}/replication_paused.txt"
+        line: "{{ zdlra_server }}"
+        state: absent
+
+- name: "{{ zdlra_server }}: resumed"
+  ansible.builtin.debug:
+    msg: "Resumed replication server {{ zdlra_server }}"

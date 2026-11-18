@@ -1,0 +1,25 @@
+---
+# The end of a run that worked: its status, the report, and anything to repeat.
+
+- name: Record the run as completed
+  ansible.builtin.include_tasks: set_status.yml
+  vars:
+    zdlra_status: "{{ 'completed (dry run)' if zdlra_dry_run else 'completed' }}"
+  when: not (zdlra_preserve_status | default(false) | bool)
+
+- name: Read the report
+  ansible.builtin.slurp:
+    src: "{{ zdlra_run_dir }}/report.txt"
+  register: zdlra_fin_report
+  failed_when: false
+
+- name: Show the report
+  ansible.builtin.debug:
+    msg: "{{ (zdlra_fin_report.content | b64decode).splitlines() }}"
+  when: zdlra_fin_report.content is defined
+
+- name: Done
+  ansible.builtin.debug:
+    msg:
+      - "Done. Run {{ zdlra_run }}{{ ' (DRY RUN: nothing was changed)' if zdlra_dry_run else '' }}. Run folder on {{ inventory_hostname }}: {{ zdlra_run_dir }}"
+      - "{{ ('WARNING: resuming the OEM jobs: ' ~ oem_jobs_problem) if oem_jobs_problem | default('') | length > 0 else '' }}"

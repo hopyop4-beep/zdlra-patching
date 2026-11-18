@@ -1,0 +1,49 @@
+---
+# ra_update: racli update appliance --ignore_incidents, which patches the appliance (about
+# 2 hours). Run again after a failure, racli carries on from where it stopped. Afterwards
+# racli version should show TARGET_RA_VERSION (a warning if not).
+
+- name: Work out the update command
+  ansible.builtin.set_fact:
+    zdlra_ra_cmd_args: "{{ zdlra_ra_update_args | zdlra_fill({'ra_release': zdlra_staged.ra_release | default(''), 'gold_images_path': zdlra_ra_gold_images_path}) }}"
+    zdlra_ra_target: "{{ zdlra_conf.TARGET_RA_VERSION | default('') }}"
+
+- name: "[dry-run] update"
+  ansible.builtin.debug:
+    msg: "[dry-run] {{ zdlra_racli }} {{ zdlra_ra_cmd_args | join(' ') }}  (success: '{{ zdlra_ra_update_success }}'; target {{ zdlra_ra_target or 'not set' }})"
+  when: zdlra_dry_run
+
+- name: Update
+  when: not zdlra_dry_run
+  block:
+    - name: Look for an earlier attempt's result
+      ansible.builtin.command: "{{ zdlra_detached }} state {{ zdlra_run_dir }}/ra_update.log {{ zdlra_run_dir }}/detached.pid"
+      register: zdlra_up_look
+      changed_when: false
+
+    - name: Confirm the update
+      ansible.builtin.include_tasks: confirm.yml
+      vars:
+        zdlra_confirm_text: "Run '{{ zdlra_racli }} {{ zdlra_ra_cmd_args | join(' ') }}'? It stops the appliance services while it patches (about 2 hours)."
+      when: zdlra_up_look.stdout == 'none'
+
+    - name: Run racli update appliance
+      ansible.builtin.include_tasks: racli_step.yml
+      vars:
+        zdlra_ra_name: update
+        zdlra_ra_args: "{{ zdlra_ra_cmd_args }}"
+        zdlra_ra_warn: "{{ zdlra_ra_update_warn_minutes }}"
+        zdlra_ra_success: "{{ zdlra_ra_update_success }}"
+
+    - name: Read racli version
+      ansible.builtin.command: "{{ zdlra_racli }} version"
+      register: zdlra_up_version
+      changed_when: false
+      failed_when: false
+
+    - name: Compare with the target
+      ansible.builtin.debug:
+        msg: >-
+          {{ ('racli version shows ' ~ zdlra_ra_target ~ '.') if zdlra_ra_target in zdlra_up_version.stdout
+             else 'WARNING: racli version does not show TARGET_RA_VERSION ' ~ zdlra_ra_target ~ '; check: ' ~ zdlra_racli ~ ' version' }}
+      when: zdlra_ra_target | length > 0

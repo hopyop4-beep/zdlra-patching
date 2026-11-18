@@ -1,0 +1,291 @@
+---
+# Patch a ZDLRA: the Ansible version of zdlra_patch.sh and jump/zdlra_patch_run.sh.
+#
+#   ansible-playbook zdlra_patch.yml -e zdlra=zdlra01                        # dry run
+#   ansible-playbook zdlra_patch.yml -e zdlra=zdlra01 -e zdlra_execute=true  # real run
+#   ansible-playbook zdlra_patch.yml -e zdlra=zdlra01 -e zdlra_execute=true -e zdlra_run_id=<id>
+#                                                       # pick up or continue a run
+#
+# The order is the script's: OEM preflight, precheck (then type APPROVE), blackout, OEM jobs
+# suspended, quiesce, snapshot, ra_preinstall, ra_alter, ra_update, cells, compute (from
+# here, through the reboots), switches, admin_switches, postcheck, resume, report, then the
+# OEM jobs resumed and the blackout ended, then verify. Each phase has a tag of its own, and
+# the blackout and OEM jobs the tag "oem": --tags or --skip-tags choose what runs, and the
+# order stays the same. A phase this run already finished is skipped, so running the same
+# command again with -e zdlra_run_id=<id> carries on where it stopped (racli update resumes
+# by itself). List phases in zdlra_rerun to run them again anyway (e.g. [precheck]).
+#
+# The play's host is the first compute node of the appliance's inventory group (the patch
+# node); the compute passes and the OEM steps are delegated from it.
+
+- name: Patch a ZDLRA
+  hosts: "{{ zdlra_patch_host | default((zdlra | default('no_appliance_given')) ~ '[0]') }}"
+  gather_facts: false
+  # Read-only commands must give real answers in --check too: what changes is decided by
+  # zdlra_dry_run, which --check also sets.
+  check_mode: false
+  any_errors_fatal: true
+  vars:
+    oem_dry_run: "{{ zdlra_dry_run }}"
+    zdlra_rerun: []
+    # The phases to skip: those this run already finished, less any listed in zdlra_rerun.
+    zdlra_skip_done: "{{ lookup('ansible.builtin.vars', 'zdlra_done', default=[]) | difference(zdlra_rerun) }}"
+
+  tasks:
+    - name: Set up the run
+      ansible.builtin.import_role:
+        name: zdlra_patch
+        tasks_from: setup
+      tags: [always]
+
+    - name: The patch
+      block:
+        # --- Before anything changes -----------------------------------------------
+        - name: "OEM: check the blackout settings and the emcli login"
+          ansible.builtin.include_role:
+            name: oem
+            tasks_from: blackout
+            apply:
+              tags: [oem]
+          vars:
+            oem_action: check
+          tags: [oem]
+
+        - name: "OEM: refuse a run whose blackout was already ended"
+          tags: [oem]
+          block:
+            - name: Read the controller's record of the run
+              ansible.builtin.include_role:
+                name: zdlra_patch
+                tasks_from: controller_state
+                apply:
+                  tags: [oem]
+            - name: Refuse
+              ansible.builtin.fail:
+                msg: >-
+                  Run {{ zdlra_run }}'s blackout was ended and its OEM jobs resumed at
+                  {{ zdlra_cstate.oem_finished_at }}, but its patching is not finished. Start a new run.
+              when:
+                - zdlra_cstate.oem_finished_at is defined
+                - not zdlra_dry_run
+                - (['quiesce', 'ra_update', 'cells'] | difference(zdlra_done)) | length > 0
+
+        - name: Phase precheck
+          ansible.builtin.include_role:
+            name: zdlra_patch
+            tasks_from: run_phase
+            apply:
+              tags: [precheck]
+          vars:
+            zdlra_phase: precheck
+          when: "'precheck' not in zdlra_skip_done"
+          tags: [precheck]
+
+        # --- Blackout and OEM jobs, after approval, before anything changes ---------
+        - name: "OEM: blackout and backup jobs"
+          tags: [oem]
+          block:
+            - name: "OEM: starts"
+              ansible.builtin.set_fact:
+                zdlra_current_phase: "oem start (blackout, OEM jobs suspend)"
+                zdlra_preserve_status: false
+
+            - name: "OEM: the precheck must be approved first"
+              ansible.builtin.include_role:
+                name: zdlra_patch
+                tasks_from: require_approval
+                apply:
+                  tags: [oem]
+
+            - name: "OEM: check the appliance's jobs db is set"
+              ansible.builtin.assert:
+                that: oem_jobs_db | default('') | length > 0
+                fail_msg: "Set oem_jobs_db for {{ zdlra }} (its zdlra db value for sr_jobs_new.ksh) before a real run."
+                quiet: true
+              when: not zdlra_dry_run
+
+            - name: "OEM: start the blackout"
+              ansible.builtin.include_role:
+                name: oem
+                tasks_from: blackout
+                apply:
+                  tags: [oem]
+              vars:
+                oem_action: start
+                oem_blackout_reuse: "{{ zdlra_cstate.blackout | default('') }}"
+
+            - name: "OEM: record the blackout"
+              ansible.builtin.include_role:
+                name: zdlra_patch
+                tasks_from: controller_state
+                apply:
+                  tags: [oem]
+              vars:
+                zdlra_cstate_set:
+                  blackout: "{{ oem_blackout_name }}"
+              when: not zdlra_dry_run
+
+            - name: "OEM: suspend the backup jobs"
+              ansible.builtin.include_role:
+                name: oem
+                tasks_from: jobs
+                apply:
+                  tags: [oem]
+              vars:
+                oem_jobs_action: suspend
+              when: not (zdlra_cstate.jobs_suspended | default(false))
+
+            - name: "OEM: record the suspended jobs"
+              ansible.builtin.include_role:
+                name: zdlra_patch
+                tasks_from: controller_state
+                apply:
+                  tags: [oem]
+              vars:
+                zdlra_cstate_set:
+                  jobs_suspended: true
+              when: not zdlra_dry_run
+
+        # --- The node phases before compute ------------------------------------------
+        - name: Phase quiesce
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [quiesce]}}
+          vars: {zdlra_phase: quiesce}
+          when: "'quiesce' not in zdlra_skip_done"
+          tags: [quiesce]
+
+        - name: Phase snapshot
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [snapshot]}}
+          vars: {zdlra_phase: snapshot}
+          when: "'snapshot' not in zdlra_skip_done"
+          tags: [snapshot]
+
+        - name: Phase ra_preinstall
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [ra_preinstall, ra]}}
+          vars: {zdlra_phase: ra_preinstall}
+          when: "'ra_preinstall' not in zdlra_skip_done"
+          tags: [ra_preinstall, ra]
+
+        - name: Phase ra_alter
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [ra_alter, ra]}}
+          vars: {zdlra_phase: ra_alter}
+          when: "'ra_alter' not in zdlra_skip_done"
+          tags: [ra_alter, ra]
+
+        - name: Phase ra_update
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [ra_update, ra]}}
+          vars: {zdlra_phase: ra_update}
+          when: "'ra_update' not in zdlra_skip_done"
+          tags: [ra_update, ra]
+
+        - name: Phase cells
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [cells]}}
+          vars: {zdlra_phase: cells}
+          when: "'cells' not in zdlra_skip_done"
+          tags: [cells]
+
+        # --- Compute nodes, from here --------------------------------------------------
+        - name: Phase compute
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [compute]}}
+          vars: {zdlra_phase: compute}
+          when: "'compute' not in zdlra_skip_done and zdlra_compute_enabled | bool"
+          tags: [compute]
+
+        # --- The node phases after compute --------------------------------------------
+        - name: Phase switches
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [switches]}}
+          vars: {zdlra_phase: switches}
+          when: "'switches' not in zdlra_skip_done"
+          tags: [switches]
+
+        - name: Phase admin_switches
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [admin_switches]}}
+          vars: {zdlra_phase: admin_switches}
+          when: "'admin_switches' not in zdlra_skip_done"
+          tags: [admin_switches]
+
+        - name: Phase postcheck
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [postcheck]}}
+          vars: {zdlra_phase: postcheck}
+          when: "'postcheck' not in zdlra_skip_done"
+          tags: [postcheck]
+
+        - name: Phase resume
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [resume]}}
+          vars: {zdlra_phase: resume}
+          when: "'resume' not in zdlra_skip_done"
+          tags: [resume]
+
+        - name: Phase report
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [report]}}
+          vars: {zdlra_phase: report}
+          tags: [report]
+
+        # --- Finish: OEM jobs resumed, then the blackout ended ---------------------------
+        - name: "OEM: resume the backup jobs and end the blackout"
+          when: not (zdlra_keep_blackout | bool)
+          tags: [oem]
+          block:
+            - name: "OEM: finishing"
+              ansible.builtin.set_fact:
+                zdlra_current_phase: "oem finish (OEM jobs resume, blackout end)"
+
+            - name: "OEM: resume the backup jobs"
+              ansible.builtin.include_role:
+                name: oem
+                tasks_from: jobs
+                apply:
+                  tags: [oem]
+              vars:
+                oem_jobs_action: resume
+
+            - name: "OEM: end the blackout"
+              ansible.builtin.include_role:
+                name: oem
+                tasks_from: blackout
+                apply:
+                  tags: [oem]
+              vars:
+                oem_action: stop
+
+            - name: "OEM: record that both are undone"
+              ansible.builtin.include_role:
+                name: zdlra_patch
+                tasks_from: controller_state
+                apply:
+                  tags: [oem]
+              vars:
+                zdlra_cstate_set:
+                  jobs_suspended: false
+                  oem_finished_at: "{{ now(fmt='%Y-%m-%d %H:%M:%S') }}"
+              when: not zdlra_dry_run
+
+        - name: "OEM: left as they are"
+          ansible.builtin.debug:
+            msg: >-
+              zdlra_keep_blackout is set: the blackout and the suspended OEM jobs are left as they are,
+              and verify is not run (the jobs are still suspended). Later: ansible-playbook oem.yml
+              -e zdlra={{ zdlra }} -e oem_action=finish -e zdlra_execute=true, then
+              ansible-playbook zdlra_patch.yml -e zdlra={{ zdlra }} -e zdlra_run_id={{ zdlra_run }} --tags verify
+          when: zdlra_keep_blackout | bool
+          tags: [oem]
+
+        - name: Phase verify
+          ansible.builtin.include_role: {name: zdlra_patch, tasks_from: run_phase, apply: {tags: [verify]}}
+          vars: {zdlra_phase: verify}
+          when: "'verify' not in zdlra_skip_done and not (zdlra_keep_blackout | bool)"
+          tags: [verify]
+
+        - name: The run completed
+          ansible.builtin.include_role:
+            name: zdlra_patch
+            tasks_from: finish
+            apply: {tags: [always]}
+          tags: [always]
+
+      rescue:
+        - name: The run failed
+          ansible.builtin.include_role:
+            name: zdlra_patch
+            tasks_from: failed
+            apply: {tags: [always]}
+          tags: [always]

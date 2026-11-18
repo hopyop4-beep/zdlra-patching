@@ -1,0 +1,45 @@
+---
+# A run that failed: record where, say how to carry on once the problem is fixed, and how to
+# undo what was done instead (only to abandon the run). Then fail. The blackout and the
+# suspended OEM jobs are left as they are while you investigate.
+
+- name: Record where it failed
+  ansible.builtin.include_tasks: set_status.yml
+  vars:
+    zdlra_status: "failed in {{ zdlra_current_phase }}"
+  when: not (zdlra_preserve_status | default(false) | bool) and zdlra_run_dir is defined
+
+- name: Read the controller's record of the run
+  ansible.builtin.include_tasks: controller_state.yml
+  when: zdlra_controller_state is defined
+
+- name: Read which replication servers are still paused
+  ansible.builtin.slurp:
+    src: "{{ zdlra_run_dir }}/replication_paused.txt"
+  register: zdlra_fail_paused
+  failed_when: false
+  ignore_unreachable: true
+  when: zdlra_run_dir is defined
+
+- name: How to go on
+  vars:
+    _base: "ansible-playbook zdlra_patch.yml -e zdlra={{ zdlra | default('?') }} -e zdlra_run_id={{ zdlra_run | default('?') }}{{ '' if zdlra_dry_run | default(true) else ' -e zdlra_execute=true' }}"
+    _paused: "{{ zdlra_fail_paused.content | default('') | b64decode | zdlra_lines }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['FAILED in ' ~ zdlra_current_phase | default('setup') ~ ': ' ~ (ansible_failed_result.msg | default('see above')),
+          '',
+          'Once the problem is fixed, carry on (finished phases are skipped):',
+          '  ' ~ _base]
+         + ((['', 'Only to abandon this run instead (then start a new one):']
+             + (['  Resume replication (' ~ _paused | join(' ') ~ '):  ' ~ _base ~ ' --tags resume'] if _paused else [])
+             + (['  Resume the OEM jobs:  ansible-playbook oem.yml -e zdlra=' ~ zdlra ~ ' -e oem_action=resume_jobs -e zdlra_execute=true']
+                if zdlra_cstate.jobs_suspended | default(false) else [])
+             + (['  End the blackout:     ansible-playbook oem.yml -e zdlra=' ~ zdlra ~ ' -e oem_action=stop -e zdlra_execute=true']
+                if zdlra_cstate.blackout is defined and zdlra_cstate.oem_finished_at is not defined else []))
+            if (_paused or zdlra_cstate.jobs_suspended | default(false) or zdlra_cstate.blackout is defined) and not zdlra_dry_run | default(true)
+            else []) }}
+
+- name: Stop
+  ansible.builtin.fail:
+    msg: "Run {{ zdlra_run | default('?') }} failed in {{ zdlra_current_phase | default('setup') }}."

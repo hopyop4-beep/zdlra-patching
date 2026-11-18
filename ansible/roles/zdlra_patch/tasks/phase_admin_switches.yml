@@ -1,0 +1,46 @@
+---
+# admin_switches: PLACEHOLDER, as in zdlra_patch.sh. TODO(site): the commands are copies of
+# the RoCE ones. A real run skips the phase, with a warning, until
+# zdlra_admin_switch_enabled is true. An InfiniBand rack's admin switch needs manual changes.
+
+- name: Admin switches not enabled
+  when: not (zdlra_admin_switch_enabled | bool)
+  block:
+    - name: Say so
+      ansible.builtin.debug:
+        msg:
+          - "WARNING: zdlra_admin_switch_enabled is false: the admin switch commands are still placeholders. Admin switches NOT patched."
+          - "Placeholder commands: ./patchmgr {{ zdlra_admin_switch_precheck_args | zdlra_fill({'group': zdlra_admin_switch_group_file}) | join(' ') }}"
+          - "                      ./patchmgr {{ zdlra_admin_switch_upgrade_args | zdlra_fill({'group': zdlra_admin_switch_group_file}) | join(' ') }}"
+    - name: Record the phase as skipped
+      ansible.builtin.set_fact:
+        zdlra_phase_skipped: true
+
+- name: Admin switches enabled
+  when: zdlra_admin_switch_enabled | bool
+  block:
+    - name: InfiniBand rack
+      when: zdlra_switch_type == 'ib'
+      block:
+        - name: Skip the admin switches
+          ansible.builtin.debug:
+            msg: "WARNING: SWITCH_TYPE is IB: the admin switch on these racks needs manual changes. Admin switches NOT patched."
+        - name: Record the phase as skipped
+          ansible.builtin.set_fact:
+            zdlra_phase_skipped: true
+
+    - name: Check SWITCH_TYPE
+      ansible.builtin.fail:
+        msg: "SWITCH_TYPE is '{{ zdlra_switch_type or 'not set' }}', not roce or ib: cannot tell what to do with the admin switches."
+      when: zdlra_switch_type not in ['roce', 'ib']
+
+    - name: Upgrade the admin switches
+      ansible.builtin.include_tasks: switch_upgrade.yml
+      vars:
+        zdlra_sw_prefix: admin_switches
+        zdlra_sw_label: admin switches
+        zdlra_sw_group_file: "{{ zdlra_admin_switch_group_file }}"
+        zdlra_sw_precheck_args: "{{ zdlra_admin_switch_precheck_args | zdlra_fill({'group': zdlra_admin_switch_group_file}) }}"
+        zdlra_sw_upgrade_args: "{{ zdlra_admin_switch_upgrade_args | zdlra_fill({'group': zdlra_admin_switch_group_file}) }}"
+        zdlra_sw_target: "{{ zdlra_conf.TARGET_ADMIN_SWITCH_VERSION | default('') }}"
+      when: zdlra_switch_type == 'roce'

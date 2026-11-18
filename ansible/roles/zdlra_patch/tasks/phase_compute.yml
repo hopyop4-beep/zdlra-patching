@@ -1,0 +1,147 @@
+---
+# compute: upgrade the compute nodes, from the controller, as the jump server does.
+# patchmgr runs on one node and upgrades another, which reboots. First the first node
+# upgrades each of the others, one at a time; then the second node upgrades the first.
+# Each patchmgr runs detached on its node, so nothing can cut it short. Every task here is
+# delegated to a runner or a target, never to this play's host, which reboots in the last pass.
+# Each pass: patchmgr -precheck (-nomodify_at_prereq), then -upgrade, then imageinfo on the
+# patched node must show TARGET_COMPUTE_VERSION, and the node must be ready again.
+
+- name: Read the controller's record of this run
+  ansible.builtin.include_tasks: controller_state.yml
+
+- name: Read the compute patch details on a node that answers
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - -c
+      - |
+        rec=$1 files=$2 tmp=$3
+        val() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -1 | tr -d '\r' | sed -E "s/^[\"']//; s/[\"']$//; s/[[:space:]]+$//"; }
+        [ -f "$rec" ] || { echo "ERROR no staged record at $rec"; exit 0; }
+        conf=$(val patch_conf "$rec"); [ -f "$conf" ] || { echo "ERROR conf file not found: $conf"; exit 0; }
+        echo "NODES=$(val component_COMPUTE_NODE "$rec")"
+        echo "TARGET=$(val TARGET_COMPUTE_VERSION "$conf")"
+        echo "SHA=$(val sha256 "$rec")"
+        yum=$(val FILES_YUM "$conf")
+        iso=$(echo "$yum" | cut -d, -f1 | xargs); dbs=$(echo "$yum" | cut -d, -f2 | xargs)
+        echo "ISO=$iso"
+        [ -f "$files/$iso" ] || echo "ERROR computepatch not found: $files/$iso"
+        top=$(unzip -Z1 "$files/$dbs" 2>/dev/null | sed 's#^\./##; s#/.*##' | grep -v '^$' | sort -u)
+        [ "$(echo "$top" | grep -c .)" = 1 ] || echo "ERROR cannot tell the db_server_patch folder from $files/$dbs"
+        echo "DIR=$top"
+        [ -x "$tmp/$top/patchmgr" ] || echo "ERROR no patchmgr in $tmp/$top"
+      - details
+      - "{{ zdlra_staged_record }}"
+      - "{{ zdlra_patch_files_dir }}"
+      - "{{ zdlra_patch_tmp_dir }}"
+  delegate_to: "{{ item }}"
+  loop: "{{ zdlra_nodes }}"
+  register: zdlra_cd
+  changed_when: false
+  failed_when: false
+  ignore_unreachable: true
+
+- name: Parse the compute patch details
+  vars:
+    _out: "{{ zdlra_cd.results | selectattr('stdout', 'defined') | map(attribute='stdout') | first | default('ERROR no node answered') }}"
+    _val: "{{ dict(_out.splitlines() | select('match', '^[A-Z]+=') | map('split', '=', 1) | list) }}"
+  ansible.builtin.set_fact:
+    zdlra_c_errors: "{{ _out.splitlines() | select('match', '^ERROR ') | map('regex_replace', '^ERROR ', '') | list }}"
+    zdlra_c_nodes: "{{ _val.NODES | default('') | replace(' ', '') | split(',') | select | list }}"
+    zdlra_c_target: "{{ _val.TARGET | default('') }}"
+    zdlra_c_sha: "{{ _val.SHA | default('') }}"
+    zdlra_c_iso: "{{ zdlra_patch_files_dir }}/{{ _val.ISO | default('') }}"
+    zdlra_c_dir: "{{ zdlra_patch_tmp_dir }}/{{ _val.DIR | default('') }}"
+    zdlra_c_work: "{{ zdlra_compute_work_dir }}/{{ zdlra_run }}"
+
+- name: Check the compute patch details
+  ansible.builtin.assert:
+    that:
+      - zdlra_c_errors | length == 0
+      - zdlra_c_nodes | length >= 2
+      - zdlra_c_nodes | reject('match', '^[A-Za-z0-9][A-Za-z0-9.-]*$') | list | length == 0
+      - zdlra_c_nodes | difference(zdlra_nodes) | length == 0
+      - zdlra_c_target is match('^[0-9][0-9.]*$')
+      - zdlra_c_iso is match('^/[A-Za-z0-9._/-]+$')
+      - zdlra_c_dir is match('^/[A-Za-z0-9._/-]+$')
+    fail_msg: >-
+      {{ ('Compute patch details are not ready: ' ~ zdlra_c_errors | join('; ')) if zdlra_c_errors
+         else 'The staged record lists fewer than 2 compute nodes: ' ~ zdlra_c_nodes | join(' ') if zdlra_c_nodes | length < 2
+         else 'Compute nodes in the staged record (' ~ zdlra_c_nodes | join(' ') ~ ') must all be in the inventory group ' ~ zdlra ~ ' (' ~ zdlra_nodes | join(' ') ~ ').'
+              if zdlra_c_nodes | difference(zdlra_nodes) | length > 0
+         else 'Unexpected TARGET_COMPUTE_VERSION or compute patch paths: ' ~ zdlra_c_target ~ ', ' ~ zdlra_c_iso ~ ', ' ~ zdlra_c_dir }}
+
+- name: Work out the passes
+  ansible.builtin.set_fact:
+    # runner, target: the first node upgrades each of the others, then the second the first.
+    zdlra_c_passes: >-
+      {{ zdlra_c_nodes[1:] | map('regex_replace', '^', zdlra_c_nodes[0] ~ ' ') | list
+         + [zdlra_c_nodes[1] ~ ' ' ~ zdlra_c_nodes[0]] }}
+
+- name: Show the plan
+  vars:
+    _done: "{{ zdlra_cstate.compute_done | default([]) }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['Compute nodes: ' ~ zdlra_c_nodes | join(' ') ~ '; target ' ~ zdlra_c_target,
+          'ISO repo: ' ~ zdlra_c_iso,
+          'db_server_patch: ' ~ zdlra_c_dir]
+         + zdlra_c_passes | map('regex_replace', '^(\S+) (\S+)$',
+             ('[dry-run] ' if zdlra_dry_run else '') ~ 'on \1: patchmgr -dbnodes <only \2> -precheck, then -upgrade (\2 reboots)') | list
+         + (['Passes already done: ' ~ _done | join(', ')] if _done else []) }}
+
+- name: Upgrade the compute nodes
+  when: not zdlra_dry_run
+  block:
+    # Before the first pass: every node is staged with the same archive and has the patch.
+    - name: Check every compute node's staged patch
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -c
+          - '[ -f "$1" ] || echo "MISSING $1"; [ -x "$2/patchmgr" ] || echo "MISSING $2/patchmgr"; echo "SHA $(sed -n "s/^sha256=//p" "$3" 2>/dev/null)"'
+          - x
+          - "{{ zdlra_c_iso }}"
+          - "{{ zdlra_c_dir }}"
+          - "{{ zdlra_staged_record }}"
+      delegate_to: "{{ item }}"
+      loop: "{{ zdlra_c_nodes }}"
+      register: zdlra_c_check
+      changed_when: false
+      when: zdlra_cstate.compute_done | default([]) | length == 0
+
+    - name: Stop if a node isn't ready for its pass
+      vars:
+        _bad: >-
+          {{ zdlra_c_check.results | default([]) | selectattr('stdout', 'defined')
+             | selectattr('stdout', 'search', 'MISSING|SHA (?!' ~ zdlra_c_sha ~ ')') | map(attribute='item') | list }}
+      ansible.builtin.fail:
+        msg: >-
+          Not ready for the compute passes: {{ _bad | join(', ') }} (the ISO repo or patchmgr is missing, or
+          it is staged with another archive than {{ zdlra_c_sha[:12] }}...). Stage it again.
+      when: zdlra_cstate.compute_done | default([]) | length == 0 and _bad | length > 0
+
+    - name: Run each pass
+      ansible.builtin.include_tasks: compute_pass.yml
+      loop: "{{ zdlra_c_passes }}"
+      loop_control:
+        loop_var: zdlra_c_pass
+      vars:
+        zdlra_c_runner: "{{ zdlra_c_pass.split()[0] }}"
+        zdlra_c_tgt: "{{ zdlra_c_pass.split()[1] }}"
+
+    # The patch node is the last one upgraded: it must be back, database included, before
+    # the next phases start there.
+    - name: Wait for the patch node to come back
+      ansible.builtin.include_tasks: node_ready.yml
+      vars:
+        zdlra_ready_node: "{{ inventory_hostname }}"
+
+    - name: All compute nodes upgraded
+      ansible.builtin.debug:
+        msg: "All compute nodes are on {{ zdlra_c_target }}."
+
+    # The patch node rebooted: read the run's records again from it.
+    - name: Re-read the run's records
+      ansible.builtin.include_tasks: read_state.yml

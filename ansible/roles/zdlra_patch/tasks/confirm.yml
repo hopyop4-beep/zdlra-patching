@@ -1,0 +1,15 @@
+---
+# Ask the operator to type YES before a step that changes the appliance (zdlra_confirm_text).
+# Skipped in a dry run and with zdlra_confirm_steps=false. No answer counts as "no".
+- name: Confirm
+  when: zdlra_confirm_steps | bool and not zdlra_dry_run
+  block:
+    - name: "Confirm: {{ zdlra_confirm_text }}"
+      ansible.builtin.pause:
+        prompt: "{{ zdlra_confirm_text }} [type YES to continue]"
+      register: zdlra_confirm_input
+    - name: Check the answer
+      ansible.builtin.assert:
+        that: zdlra_confirm_input.user_input | default('') | trim == 'YES'
+        fail_msg: Aborted by operator.
+        quiet: true

@@ -1,0 +1,41 @@
+---
+# Run SQL as raAutomation through zdlra_sql.sh. The connect string goes on stdin, and the
+# task is no_log, so it never shows in the process list, the output or Ansible's log.
+# In:  zdlra_sql_text   the SQL
+#      zdlra_sql_mode   query (default) or exec (a statement that changes something; only
+#                       shown in a dry run)
+#      zdlra_sql_fatal  true (default) = fail on an SQL error
+# Out: zdlra_sql_rows   the result rows; zdlra_sql_ok
+
+- name: "SQL (shown): {{ zdlra_sql_text | truncate(160) }}"
+  ansible.builtin.debug:
+    msg: "{{ '[dry-run] ' if (zdlra_sql_mode | default('query') == 'exec' and zdlra_dry_run) else '' }}{{ zdlra_sql_mode | default('query') }}: {{ zdlra_sql_text }}"
+
+- name: Run the SQL
+  ansible.builtin.command:
+    argv: ["{{ zdlra_sql }}", "{{ zdlra_sql_mode | default('query') }}"]
+    stdin: "{{ zdlra_ra_sql_connect }}\n{{ zdlra_sql_text }}"
+  environment:
+    SQLPLUS: "{{ zdlra_sqlplus }}"
+    RA_ORACLE_HOME: "{{ zdlra_ra_oracle_home }}"
+    RA_ORACLE_SID: "{{ zdlra_ra_oracle_sid }}"
+  register: zdlra_sql_res
+  changed_when: zdlra_sql_mode | default('query') == 'exec'
+  failed_when: false
+  no_log: true
+  when: not (zdlra_sql_mode | default('query') == 'exec' and zdlra_dry_run)
+
+- name: Read the result
+  ansible.builtin.set_fact:
+    zdlra_sql_ok: "{{ zdlra_sql_res.skipped | default(false) or zdlra_sql_res.rc | default(1) == 0 }}"
+    zdlra_sql_rows: "{{ zdlra_sql_res.stdout_lines | default([]) }}"
+
+- name: SQL failed
+  ansible.builtin.fail:
+    msg: "SQL failed: {{ zdlra_sql_text }}\n{{ zdlra_sql_res.stderr | default('') }}"
+  when: not zdlra_sql_ok and zdlra_sql_fatal | default(true) | bool
+
+- name: SQL failed (going on)
+  ansible.builtin.debug:
+    msg: "WARNING: SQL failed: {{ zdlra_sql_text }}\n{{ zdlra_sql_res.stderr | default('') }}"
+  when: not zdlra_sql_ok and not (zdlra_sql_fatal | default(true) | bool)

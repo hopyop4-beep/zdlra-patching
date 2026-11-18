@@ -1,0 +1,88 @@
+---
+# precheck: appliance health, what was staged, free space, Oracle's precheck, a read-only
+# look at what the next phases will do, then the operator's approval.
+
+- name: A new precheck replaces the last one
+  ansible.builtin.file:
+    path: "{{ zdlra_run_dir }}/{{ item }}"
+    state: absent
+  loop: [precheck_passed, precheck_approval.txt]
+
+- name: Mark the precheck as not done
+  ansible.builtin.include_tasks: mark_phase.yml
+  vars:
+    zdlra_mark: undone
+
+- name: Read racli version
+  ansible.builtin.command: "{{ zdlra_racli }} version"
+  register: zdlra_pc_version
+  changed_when: false
+  failed_when: false
+
+- name: Show racli version
+  ansible.builtin.debug:
+    var: zdlra_pc_version.stdout_lines
+
+- name: Check the appliance status
+  ansible.builtin.command: "{{ zdlra_racli }} status appliance"
+  register: zdlra_pc_status
+  changed_when: false
+
+- name: Show the appliance status
+  ansible.builtin.debug:
+    var: zdlra_pc_status.stdout_lines
+
+- name: Check the patches were staged
+  ansible.builtin.assert:
+    that: zdlra_staged.archive is defined
+    fail_msg: "No staged record at {{ zdlra_staged_record }}. Stage the patches first (staging/zdlra_stage.sh)."
+    success_msg: >-
+      Staged archive: {{ zdlra_staged.archive | default('?') }}, SHA-256 {{ zdlra_staged.sha256 | default('?') }},
+      staged {{ zdlra_staged.staged_at | default('?') }}
+
+# The precheck rolls back the RPM ra_preinstall installs, so preinstall must run again,
+# unless the upgrade has already finished. A pre-install result left by an earlier attempt
+# no longer counts either.
+- name: The precheck undoes the pre-install
+  when: "'ra_update' not in zdlra_done"
+  block:
+    - name: Mark ra_preinstall as not done
+      ansible.builtin.include_tasks: mark_phase.yml
+      vars:
+        zdlra_phase: ra_preinstall
+        zdlra_mark: undone
+    - name: Drop a pre-install result left by an earlier attempt
+      ansible.builtin.command: "{{ zdlra_detached }} collect {{ zdlra_run_dir }}/ra_preinstall.log"
+      changed_when: false
+
+# What takes seconds to find comes first: the precheck can take an hour.
+- name: Check free space for the work folder
+  ansible.builtin.command: df -BG --output=avail {{ zdlra_work_dir }}
+  register: zdlra_pc_df
+  changed_when: false
+  failed_when: >-
+    (zdlra_pc_df.stdout_lines[-1] | regex_replace('[^0-9]', '') | int) < (zdlra_min_free_gb | int)
+
+- name: Check SQL works as raAutomation
+  ansible.builtin.include_tasks: sql.yml
+  vars:
+    zdlra_sql_text: "select count(*) from dual;"
+  when: zdlra_ra_sql_connect | length > 0 and '<password>' not in zdlra_ra_sql_connect
+
+- name: Run Oracle's precheck
+  ansible.builtin.include_tasks: precheck_script.yml
+  vars:
+    zdlra_precheck_label: before
+
+- name: Show what the next phases will deal with
+  ansible.builtin.include_tasks: plan.yml
+
+- name: Mark the precheck as passed
+  ansible.builtin.copy:
+    dest: "{{ zdlra_run_dir }}/precheck_passed"
+    content: "dry_run={{ zdlra_dry_run | int }}\n"
+    mode: "0640"
+
+- name: Ask the operator to approve the precheck
+  ansible.builtin.include_tasks: approve.yml
+  when: zdlra_precheck_require_approval | bool

@@ -1,0 +1,127 @@
+---
+# quiesce: pause the running upstream/paired replication servers, recording each one so
+# resume undoes only these, then wait for incoming backups (active RMAN sessions) to finish.
+# There is no wait for replication already in progress: pausing is enough.
+
+- name: Resume has to run again after this
+  ansible.builtin.include_tasks: mark_phase.yml
+  vars:
+    zdlra_phase: resume
+    zdlra_mark: undone
+
+# After a resume, everything has to be paused again. Otherwise what's paused stays paused.
+- name: Forget an earlier resume
+  ansible.builtin.file:
+    path: "{{ zdlra_run_dir }}/{{ item }}"
+    state: absent
+  loop: [resumed_at, replication_pause_confirmed.txt]
+  when: not zdlra_dry_run and zdlra_resumed | length > 0
+
+- name: Which SQL settings are still empty
+  ansible.builtin.set_fact:
+    zdlra_sql_missing: >-
+      {{ (['zdlra_ra_sql_connect'] if zdlra_ra_sql_connect | length == 0 else [])
+         + (['zdlra_ra_sql_connect (password)'] if '<password>' in zdlra_ra_sql_connect else [])
+         + (['zdlra_replication_servers_sql'] if zdlra_replication_servers_sql | length == 0 else [])
+         + (['zdlra_replication_pause_sql'] if zdlra_replication_pause_sql | length == 0 else [])
+         + (['zdlra_replication_resume_sql'] if zdlra_replication_resume_sql | length == 0 else [])
+         + (['zdlra_active_backups_sql'] if zdlra_active_backups_sql | length == 0 else []) }}
+
+- name: Stop if quiesce is not set up
+  ansible.builtin.fail:
+    msg: >-
+      Quiesce is not set up (still empty: {{ zdlra_sql_missing | join(', ') }}). Fill these in, or set
+      zdlra_quiesce_allow_unconfigured=true to patch without it.
+  when: zdlra_sql_missing | length > 0 and not zdlra_dry_run and not (zdlra_quiesce_allow_unconfigured | bool)
+
+- name: Skip quiesce, as it is not set up
+  ansible.builtin.debug:
+    msg: "WARNING: quiesce not set up yet (still empty: {{ zdlra_sql_missing | join(', ') }}); skipping."
+  when: zdlra_sql_missing | length > 0
+
+- name: Pause replication and wait for incoming backups
+  when: zdlra_sql_missing | length == 0
+  block:
+    - name: List the replication servers to pause
+      ansible.builtin.include_tasks: sql.yml
+      vars:
+        zdlra_sql_text: "{{ zdlra_replication_servers_sql }}"
+
+    - name: Check their names
+      ansible.builtin.assert:
+        that: zdlra_sql_rows | reject('match', '^[A-Za-z0-9_.$#-]+$') | list | length == 0
+        fail_msg: "Unexpected replication server name(s): {{ zdlra_sql_rows | reject('match', '^[A-Za-z0-9_.$#-]+$') | join(', ') }}"
+        quiet: true
+
+    - name: Read which ones this run already paused
+      ansible.builtin.slurp:
+        src: "{{ zdlra_run_dir }}/replication_pause_confirmed.txt"
+      register: zdlra_confirmed_raw
+      failed_when: false
+
+    - name: Pause each one
+      ansible.builtin.include_tasks: quiesce_pause_one.yml
+      loop: "{{ zdlra_sql_rows }}"
+      loop_control:
+        loop_var: zdlra_server
+      vars:
+        zdlra_confirmed: "{{ zdlra_confirmed_raw.content | default('') | b64decode | zdlra_lines }}"
+
+    - name: Not waiting for incoming backups
+      when: zdlra_skip_backup_wait | bool or not (zdlra_quiesce_wait_for_backups | bool)
+      block:
+        - name: Count incoming backups
+          ansible.builtin.include_tasks: sql.yml
+          vars:
+            zdlra_sql_text: "{{ zdlra_active_backups_sql }}"
+            zdlra_sql_fatal: false
+        - name: Say so
+          ansible.builtin.debug:
+            msg: "WARNING: not waiting for incoming backups (override); {{ zdlra_sql_rows | join(' ') or '?' }} running now."
+
+    - name: Wait for incoming backups to finish
+      when: not (zdlra_skip_backup_wait | bool) and zdlra_quiesce_wait_for_backups | bool
+      block:
+        - name: "Wait until no incoming backups run (up to {{ zdlra_quiesce_timeout_minutes }} min)"
+          ansible.builtin.command:
+            argv: ["{{ zdlra_sql }}", query]
+            stdin: "{{ zdlra_ra_sql_connect }}\n{{ zdlra_active_backups_sql }}"
+          environment:
+            SQLPLUS: "{{ zdlra_sqlplus }}"
+            RA_ORACLE_HOME: "{{ zdlra_ra_oracle_home }}"
+            RA_ORACLE_SID: "{{ zdlra_ra_oracle_sid }}"
+          register: zdlra_backups
+          until: zdlra_backups.rc != 0 or zdlra_backups.stdout | trim == '0' or zdlra_dry_run
+          retries: "{{ ((zdlra_quiesce_timeout_minutes | int) * 60 / (zdlra_quiesce_poll_seconds | int)) | int }}"
+          delay: "{{ zdlra_quiesce_poll_seconds | int }}"
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Could not count incoming backups
+          ansible.builtin.fail:
+            msg: "Could not count incoming backups: {{ zdlra_backups.stderr | default('') }}"
+          when: zdlra_backups.rc != 0 or zdlra_backups.stdout | trim is not match('^[0-9]+$')
+
+        - name: "Incoming backups: {{ zdlra_backups.stdout | trim }}"
+          ansible.builtin.debug:
+            msg: >-
+              {{ 'No incoming backups running.' if zdlra_backups.stdout | trim == '0'
+                 else '[dry-run] ' ~ zdlra_backups.stdout | trim ~ ' incoming backup(s) running; a real run would keep waiting for them to finish.' }}
+
+        - name: Still running after the time limit
+          when: zdlra_backups.stdout | trim != '0' and not zdlra_dry_run
+          block:
+            - name: List them
+              ansible.builtin.include_tasks: sql.yml
+              vars:
+                zdlra_sql_text: "{{ zdlra_active_backups_list_sql }}"
+                zdlra_sql_fatal: false
+              when: zdlra_active_backups_list_sql | length > 0
+            - name: Show them
+              ansible.builtin.debug:
+                var: zdlra_sql_rows
+              when: zdlra_active_backups_list_sql | length > 0
+            - name: Stop before patching
+              ansible.builtin.fail:
+                msg: "{{ zdlra_backups.stdout | trim }} incoming backup(s) still running after {{ zdlra_quiesce_timeout_minutes }} min. Stopping before patching."

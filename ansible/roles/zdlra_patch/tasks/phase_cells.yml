@@ -1,0 +1,175 @@
+---
+# cells: patch the storage cells from the first compute node, in the cell patch folder.
+# The prereq check first; only if it fails, the recovery steps and the check again (a second
+# failure stops for review). Then -patch. Afterwards every cell in the group must be on
+# TARGET_CELL_VERSION according to imageinfo. A -patch that worked is never run again.
+
+- name: Find the cell patch
+  ansible.builtin.include_tasks: patch_location.yml
+  vars:
+    zdlra_loc_var: FILES_CELL
+
+- name: Read the cell versions
+  ansible.builtin.include_tasks: cell_versions.yml
+
+- name: Check what the phase needs
+  ansible.builtin.assert:
+    that:
+      - zdlra_loc_dir | length > 0
+      - zdlra_cells | length > 0
+      - zdlra_conf.TARGET_CELL_VERSION | default('') | length > 0
+    fail_msg: >-
+      {{ ('Cell patch: ' ~ zdlra_loc_problem) if zdlra_loc_dir | length == 0
+         else (zdlra_cell_group_file ~ ' is missing or empty.') if zdlra_cells | length == 0
+         else 'TARGET_CELL_VERSION is not set in ' ~ zdlra_staged.patch_conf | default('the conf file') ~ '.' }}
+    quiet: true
+
+- name: Set the cell target
+  ansible.builtin.set_fact:
+    zdlra_cell_target: "{{ zdlra_conf.TARGET_CELL_VERSION }}"
+    zdlra_cell_dir: "{{ zdlra_loc_dir }}"
+
+- name: Show the plan
+  ansible.builtin.debug:
+    msg: "Cell patch folder: {{ zdlra_cell_dir }}; cells: {{ zdlra_cells | join(' ') }}; target: {{ zdlra_cell_target }}"
+
+- name: "[dry-run] cells"
+  ansible.builtin.debug:
+    msg:
+      - "[dry-run] cd {{ zdlra_cell_dir }} && ./patchmgr -cells {{ zdlra_cell_group_file }} {{ zdlra_cell_prereq_step }}"
+      - "[dry-run]   only if that fails: {{ zdlra_cell_recovery_steps | join(' ') }}, then {{ zdlra_cell_prereq_step }} again (a second failure stops)"
+      - "[dry-run] cd {{ zdlra_cell_dir }} && ./patchmgr -cells {{ zdlra_cell_group_file }} -patch {{ zdlra_cell_patch_extra_args | join(' ') }}"
+      - "[dry-run] {{ zdlra_dcli }} -g {{ zdlra_cell_group_file }} -l root 'imageinfo -ver'  (each cell must be {{ zdlra_cell_target }})"
+  when: zdlra_dry_run
+
+- name: Patch the cells
+  when: not zdlra_dry_run
+  block:
+    - name: Look for an earlier attempt's patch
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -c
+          - '"$1" state "$2/cells_patch.log" "$2/detached.pid"; [ -f "$2/cells_patch.log" ] && echo log=yes || echo log=no'
+          - x
+          - "{{ zdlra_detached }}"
+          - "{{ zdlra_run_dir }}"
+      register: zdlra_cp_look
+      changed_when: false
+
+    # 0 = every cell on target, 1 = not all, 2 = one can't be read.
+    - name: Are the cells on target already?
+      ansible.builtin.set_fact:
+        zdlra_cp_state: "{{ zdlra_cp_look.stdout_lines[0] }}"
+        zdlra_cp_on: >-
+          {{ 2 if (zdlra_cells | difference(zdlra_cell_versions.keys() | list)) | length > 0
+             else 0 if (zdlra_cells | map('extract', zdlra_cell_versions) | unique | list) == [zdlra_cell_target]
+             else 1 }}
+
+    - name: The patch already worked in this run
+      ansible.builtin.debug:
+        msg: patchmgr -patch already succeeded in this run; only checking the versions.
+      when: "'cells_patch' in zdlra_steps"
+
+    - name: Decide
+      when: "'cells_patch' not in zdlra_steps"
+      block:
+        # A version can't be read and an earlier attempt ran: it may have worked, and it
+        # mustn't run twice.
+        - name: Stop if a version can't be read after an earlier attempt
+          ansible.builtin.fail:
+            msg: >-
+              patchmgr -patch: a cell version can't be read, and an earlier attempt ran
+              (log: {{ zdlra_run_dir }}/cells_patch.log). Not running it again until they can all be read.
+          when: zdlra_cp_state == 'none' and zdlra_cp_on | int == 2 and 'log=yes' in zdlra_cp_look.stdout_lines
+
+        # Never patch twice: a -patch that looked failed may still have worked.
+        - name: Every cell is already on target
+          when: zdlra_cp_state == 'none' and zdlra_cp_on | int == 0
+          block:
+            - name: Say so
+              ansible.builtin.debug:
+                msg: "Every cell is already on {{ zdlra_cell_target }}: not running patchmgr -patch."
+            - name: Record the patch as done
+              ansible.builtin.include_tasks: step_mark_done.yml
+              vars:
+                zdlra_step: cells_patch
+
+        - name: Patch
+          when: zdlra_cp_state != 'none' or zdlra_cp_on | int != 0
+          block:
+            - name: Prereq check and confirmation, for a new patch
+              when: zdlra_cp_state == 'none'
+              block:
+                - name: Run the prereq check
+                  ansible.builtin.include_tasks: patchmgr_step.yml
+                  vars:
+                    zdlra_pm_prefix: cells
+                    zdlra_pm_name: "{{ zdlra_cell_prereq_step | regex_replace('^-', '') }}"
+                    zdlra_pm_dir: "{{ zdlra_cell_dir }}"
+                    zdlra_pm_args: ["-cells", "{{ zdlra_cell_group_file }}", "{{ zdlra_cell_prereq_step }}"]
+                    zdlra_pm_fresh: true
+                    zdlra_pm_fatal: false
+
+                - name: The prereq check failed
+                  when: not zdlra_pm_ok
+                  block:
+                    - name: Say what runs next
+                      ansible.builtin.debug:
+                        msg: "WARNING: the prereq check failed: running {{ zdlra_cell_recovery_steps | join(' ') }}, then checking again."
+                    - name: Run the recovery steps
+                      ansible.builtin.include_tasks: patchmgr_step.yml
+                      loop: "{{ zdlra_cell_recovery_steps }}"
+                      loop_control:
+                        loop_var: zdlra_recovery_step
+                      vars:
+                        zdlra_pm_prefix: cells
+                        zdlra_pm_name: "{{ zdlra_recovery_step | regex_replace('^-', '') }}"
+                        zdlra_pm_dir: "{{ zdlra_cell_dir }}"
+                        zdlra_pm_args: ["-cells", "{{ zdlra_cell_group_file }}", "{{ zdlra_recovery_step }}"]
+                        zdlra_pm_fresh: true
+                    - name: Run the prereq check again
+                      ansible.builtin.include_tasks: patchmgr_step.yml
+                      vars:
+                        zdlra_pm_prefix: cells
+                        zdlra_pm_name: "{{ zdlra_cell_prereq_step | regex_replace('^-', '') }}2"
+                        zdlra_pm_dir: "{{ zdlra_cell_dir }}"
+                        zdlra_pm_args: ["-cells", "{{ zdlra_cell_group_file }}", "{{ zdlra_cell_prereq_step }}"]
+                        zdlra_pm_fresh: true
+                        zdlra_pm_fatal: false
+                    - name: Stop for review
+                      ansible.builtin.fail:
+                        msg: "The prereq check failed again after {{ zdlra_cell_recovery_steps | join(' ') }}: stopping for review. {{ zdlra_pm_problem }}"
+                      when: not zdlra_pm_ok
+
+                - name: Confirm the patch
+                  ansible.builtin.include_tasks: confirm.yml
+                  vars:
+                    zdlra_confirm_text: Patch the storage cells now (patchmgr -patch; the cells reboot)?
+
+            - name: Run patchmgr -patch
+              ansible.builtin.include_tasks: patchmgr_step.yml
+              vars:
+                zdlra_pm_prefix: cells
+                zdlra_pm_name: patch
+                zdlra_pm_dir: "{{ zdlra_cell_dir }}"
+                zdlra_pm_args: "{{ ['-cells', zdlra_cell_group_file, '-patch'] + zdlra_cell_patch_extra_args }}"
+
+            - name: Record the patch as done
+              ansible.builtin.include_tasks: step_mark_done.yml
+              vars:
+                zdlra_step: cells_patch
+
+    # What patchmgr printed is only for the log: imageinfo decides.
+    - name: Read the cell versions after patching
+      ansible.builtin.include_tasks: cell_versions.yml
+
+    - name: Check every cell is on target
+      vars:
+        _rows: >-
+          {{ zdlra_cells | zip(zdlra_cells | map('extract', zdlra_cell_versions) | map('default', 'no version reported')) | map('join', ': ') | list }}
+        _bad: "{{ zdlra_cells | reject('in', zdlra_cell_versions | dict2items | selectattr('value', 'equalto', zdlra_cell_target) | map(attribute='key') | list) | list }}"
+      ansible.builtin.assert:
+        that: _bad | length == 0
+        fail_msg: "{{ _bad | length }} cell(s) not on {{ zdlra_cell_target }}: {{ _rows | join('; ') }}"
+        success_msg: "All cells are on {{ zdlra_cell_target }}: {{ _rows | join('; ') }}"

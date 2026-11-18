@@ -1,0 +1,7 @@
+---
+# Copy to vault.yml in this folder, fill in, then encrypt it:
+#   ansible-vault encrypt inventory/group_vars/all/vault.yml
+# and run the playbooks with --ask-vault-pass (or --vault-password-file).
+# vault.yml is in .gitignore; never commit it unencrypted.
+vault_zdlra_ra_sql_connect: "raAutomation/<password>"
+vault_oem_em_password: ""

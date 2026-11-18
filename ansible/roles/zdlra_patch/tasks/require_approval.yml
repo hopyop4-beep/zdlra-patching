@@ -1,0 +1,36 @@
+---
+# The run must have an approved precheck: for this run, a real precheck for a real run,
+# no older than zdlra_precheck_approval_max_age_hours, and matching what was reviewed
+# (the precheck results and the staged archive).
+
+- name: Check the precheck approval
+  when: zdlra_precheck_require_approval | bool
+  block:
+    - name: Read the approval
+      ansible.builtin.slurp:
+        src: "{{ zdlra_run_dir }}/precheck_approval.txt"
+      register: zdlra_approval_raw
+      failed_when: false
+
+    - name: Work out the fingerprint of the precheck results now
+      ansible.builtin.include_tasks: fingerprint.yml
+
+    - name: Read the approval's fields
+      ansible.builtin.set_fact:
+        zdlra_approval: "{{ (zdlra_approval_raw.content | default('') | b64decode) | zdlra_kv }}"
+
+    - name: Check it covers this run as it is now
+      vars:
+        _age: "{{ now().timestamp() | int - (zdlra_approval.approved_epoch | default(0) | int) }}"
+      ansible.builtin.assert:
+        that:
+          - zdlra_approval.approved_by is defined
+          - zdlra_dry_run or zdlra_approval.precheck_dry_run | default('') != '1'
+          - _age | int <= (zdlra_precheck_approval_max_age_hours | int) * 3600
+          - zdlra_approval.fingerprint | default('') == zdlra_fingerprint
+        fail_msg: >-
+          {% if zdlra_approval.approved_by is not defined %}Run {{ zdlra_run }} has no approved precheck. Run the precheck first (--tags precheck), or pass the zdlra_run_id of an approved run.
+          {% elif not zdlra_dry_run and zdlra_approval.precheck_dry_run | default('') == '1' %}The precheck of run {{ zdlra_run }} was a dry run. For a real run, run the precheck again with -e zdlra_execute=true and approve that.
+          {% elif _age | int > (zdlra_precheck_approval_max_age_hours | int) * 3600 %}The precheck approval is {{ (_age | int / 3600) | int }}h old (limit {{ zdlra_precheck_approval_max_age_hours }}h). Run the precheck again.
+          {% else %}The precheck results or the staged archive changed after approval. Run the precheck again.{% endif %}
+        success_msg: "Precheck approved by {{ zdlra_approval.approved_by | default('?') }}, {{ (_age | int / 60) | int }} minute(s) ago."

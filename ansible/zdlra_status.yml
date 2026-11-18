@@ -1,0 +1,54 @@
+---
+# The state of a run: status, finished and skipped phases, approval, the running step's log.
+#
+#   ansible-playbook zdlra_status.yml -e zdlra=zdlra01                    # the latest run
+#   ansible-playbook zdlra_status.yml -e zdlra=zdlra01 -e zdlra_run_id=<id>
+#   ansible-playbook zdlra_status.yml -e zdlra=zdlra01 -e zdlra_run_id=<id> -e show=report
+
+- name: Status of a ZDLRA patch run
+  hosts: "{{ zdlra_patch_host | default((zdlra | default('no_appliance_given')) ~ '[0]') }}"
+  gather_facts: false
+  check_mode: false
+  vars:
+    show: status
+  roles:
+    - role: zdlra_patch
+      # Only the defaults are wanted here.
+      when: false
+  tasks:
+    - name: Show the run
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -c
+          - |
+            work=$1 id=$2 show=$3
+            if [ -n "$id" ]; then dir="$work/$id"; else dir="$(ls -1d "$work"/*/ 2>/dev/null | sort | tail -1)"; dir="${dir%/}"; fi
+            [ -n "$dir" ] && [ -d "$dir" ] || { echo "No such run in $work: ${id:-none yet}"; exit 1; }
+            if [ "$show" = report ]; then cat "$dir/report.txt" 2>/dev/null || echo "No report yet."; exit 0; fi
+            echo "Run:     $(basename "$dir")"
+            echo "Folder:  $dir"
+            echo "Status:  $(cat "$dir/status" 2>/dev/null || echo unknown)"
+            [ -s "$dir/phases_done" ] && echo "Done:    $(paste -sd' ' "$dir/phases_done")"
+            [ -s "$dir/phases_skipped" ] && echo "Skipped: $(paste -sd' ' "$dir/phases_skipped")"
+            [ -f "$dir/resumed_at" ] && echo "Resumed: $(cat "$dir/resumed_at")"
+            if [ -f "$dir/precheck_approval.txt" ]; then echo "Approval:"; sed 's/^/  /' "$dir/precheck_approval.txt"; fi
+            log="$dir/zdlra_patch.log"
+            step="$(cat "$dir/detached.log" 2>/dev/null)"
+            if [ -n "$step" ] && [ -f "$step" ]; then
+              p=$(tr -dc 0-9 < "$dir/detached.pid" 2>/dev/null)
+              if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then echo "Running: pid $p"; fi
+              log="$step"; echo "Step log: $log"
+            fi
+            echo "Last log lines:"
+            tail -n 15 "$log" 2>/dev/null | sed 's/^/  /'
+          - status
+          - "{{ zdlra_work_dir }}"
+          - "{{ zdlra_run_id | default('') }}"
+          - "{{ show }}"
+      register: zdlra_status_out
+      changed_when: false
+
+    - name: Status
+      ansible.builtin.debug:
+        msg: "{{ zdlra_status_out.stdout_lines }}"
