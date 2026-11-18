@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZDLRA Patching Walkthrough: Ansible version</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f4f5f2;--panel:#ffffff;--ink:#1c2422;--muted:#5a6663;--line:#c9cfc9;--accent:#0b5c6b;--accent-soft:#d9ebee;--change:#2f6b3a;--change-soft:#e0efdf;--stop:#a3281f;--stop-soft:#f7e2df;--soft:#eceee9;--code:#e8ebe6;
+--body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;--mono:"IBM Plex Mono",ui-monospace,Consolas,monospace;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#141918;--panel:#1c2321;--ink:#e6ebe8;--muted:#9aa7a2;--line:#3a4542;--accent:#6cc3d4;--accent-soft:#17353b;--change:#7fc98b;--change-soft:#1d3322;--stop:#ef8f85;--stop-soft:#3c1f1c;--soft:#252c2a;--code:#2a322f;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#141918;--panel:#1c2321;--ink:#e6ebe8;--muted:#9aa7a2;--line:#3a4542;--accent:#6cc3d4;--accent-soft:#17353b;--change:#7fc98b;--change-soft:#1d3322;--stop:#ef8f85;--stop-soft:#3c1f1c;--soft:#252c2a;--code:#2a322f;color-scheme:dark}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 var(--body)}
+.wrap{display:grid;grid-template-columns:230px minmax(0,1fr);gap:40px;max-width:1280px;margin:0 auto;padding:32px 24px 80px}
+nav{position:sticky;top:20px;align-self:start;font-size:14px;max-height:calc(100vh - 40px);overflow:auto}nav a{display:block;padding:4px 0;color:var(--muted);text-decoration:none}nav a:hover,nav a:focus-visible{color:var(--accent)}
+nav .v{font:12px var(--mono);color:var(--muted);margin-bottom:12px}
+main{min-width:0}h1{font-size:34px;line-height:1.15;margin:0 0 10px;text-wrap:balance}h2{font-size:24px;margin:52px 0 10px;padding-top:14px;border-top:2px solid var(--line);text-wrap:balance}h3{font-size:17px;margin:28px 0 8px}
+p,ul,ol{max-width:72ch}p{margin:0 0 12px}li{margin-bottom:6px}.lede{font-size:18px;color:var(--muted)}
+code{font:0.88em var(--mono);background:var(--code);padding:1px 4px;border-radius:3px;overflow-wrap:anywhere}.ln{font:11px var(--mono);color:var(--muted)}
+figure{margin:18px 0 24px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}figcaption{font-size:14px;color:var(--muted);margin-top:10px;max-width:80ch}
+.scroll{overflow-x:auto}svg{display:block;width:100%;height:auto;color:var(--ink)}
+.b{fill:var(--panel);stroke:var(--line);stroke-width:1.3}.b.act{fill:var(--accent-soft);stroke:var(--accent)}.b.ch{fill:var(--change-soft);stroke:var(--change);stroke-width:1.8}.b.stop{fill:var(--stop-soft);stroke:var(--stop)}.b.soft{fill:var(--soft)}.b.lane{fill:none;stroke-dasharray:4 4}
+.t{font:600 12px var(--mono);fill:currentColor;text-anchor:middle}.s{font:11px var(--body);fill:var(--muted);text-anchor:middle}.hd{font:600 13px var(--body);fill:currentColor}
+.l{font:11px var(--body);fill:var(--muted);paint-order:stroke;stroke:var(--panel);stroke-width:3px}.l.bad{fill:var(--stop)}
+.a{fill:none;stroke:currentColor;stroke-width:1.2}.a.faint{stroke:var(--line);stroke-dasharray:3 4}.a.dash{stroke-dasharray:5 4}.a.bad{stroke:var(--stop)}
+table{border-collapse:collapse;width:100%;font-size:14px;margin:10px 0 22px;background:var(--panel)}th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}th{background:var(--soft);font-weight:600}
+td:first-child{white-space:nowrap}.rules{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin:18px 0}.rule{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:6px;padding:12px 14px;font-size:15px}.rule b{display:block;margin-bottom:3px}
+.key{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:13px;color:var(--muted);margin:8px 0}.key span{display:inline-flex;align-items:center;gap:6px}.key i{width:14px;height:14px;border-radius:3px;border:1.5px solid;display:inline-block}
+a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@media (max-width:900px){.wrap{grid-template-columns:1fr;padding:20px 16px 60px;gap:16px}nav{position:static;max-height:none;columns:2;font-size:13px}nav .v{column-span:all}h1{font-size:28px}td:first-child{white-space:normal}}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+
+:root{--n:#5b4a8a;--n-soft:#ece7f5;--o:#7a5c12;--o-soft:#f4ecd6}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--n:#b9a7e8;--n-soft:#2c2640;--o:#d8b45a;--o-soft:#3a311a}}
+:root[data-theme="dark"]{--n:#b9a7e8;--n-soft:#2c2640;--o:#d8b45a;--o-soft:#3a311a}
+.traces{counter-reset:t}.trace{list-style:none;padding:0;margin:10px 0 22px;max-width:86ch}
+.trace li{counter-increment:t;background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:6px;padding:9px 14px;margin:0 0 8px}
+.trace li.node,.trace li.bg,.trace li.run{border-left-color:var(--n);margin-left:22px}.trace li.oem{border-left-color:var(--o);margin-left:22px}.trace li.you{border-left-color:var(--muted)}
+.trace .h{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px;margin-bottom:2px}
+.trace .h::before{content:counter(t);font:600 12px var(--mono);color:var(--muted);min-width:2.2em}
+.trace p{margin:0;font-size:15px;max-width:none}
+.who{font:600 11px var(--body);letter-spacing:.03em;text-transform:uppercase;padding:1px 6px;border-radius:3px;background:var(--accent-soft);color:var(--ink)}
+.who.node,.who.bg,.who.run{background:var(--n-soft)}.who.oem{background:var(--o-soft)}.who.you{background:var(--soft)}
+.tag{font:600 11px var(--body);color:var(--change);border:1px solid var(--change);border-radius:3px;padding:0 5px}
+.trace .in{font-size:13px;color:var(--muted)}.trace .in code{font-size:12px}
+.trace .loc{font:11px var(--mono);color:var(--muted);margin-left:auto}
+@media (max-width:900px){.trace li.node,.trace li.bg,.trace li.run,.trace li.oem{margin-left:10px}.trace .in{font-size:13px;color:var(--muted)}.trace .in code{font-size:12px}
+.trace .loc{margin-left:0}}
+.ph td:nth-child(2){min-width:250px}.ph td:nth-child(2) code{white-space:nowrap;overflow-wrap:normal}
+</style></head><body>
+<div class="wrap">
+<nav aria-label="Sections"><div class="v">ansible/ on main</div>
+<a href="#rules">Ground rules</a><a href="#s1">1. Who runs what</a><a href="#s2">2. A full run</a><a href="#s3">3. The playbooks</a><a href="#s4">4. Inside a phase</a><a href="#s5">5. Never killed</a><a href="#s6">6. Patch phases</a><a href="#s7">7. Compute</a><a href="#s8">8. Failures and pickup</a><a href="#s9">9. Approval</a><a href="#s10">10. OEM</a><a href="#s11">11. Files</a><a href="#s12">12. Dry run</a><a href="#s13">13. A run, traced</a><a href="#s14">14. Versus the scripts</a><a href="#ref">Task file reference</a>
+</nav>
+<main>
+<h1>How the Ansible version works</h1>
+<p class="lede">A walkthrough of the <code>ansible/</code> folder on <code>main</code>: what runs where, which task file includes which, and what happens when something breaks. It is the companion to <a href="how-it-works.html">how-it-works.html</a>, which covers the shell scripts. The two versions do the same patch in the same order, and keep the same files on the node. Do not mix them within one run.</p>
+<p><b>Status:</b> tested only on a stand-in appliance, not yet on a real one.</p>
+
+<h2 id="rules" style="border:0;margin-top:24px;padding-top:0">Ground rules the code is built around</h2>
+<div class="rules">
+<div class="rule"><b>Long commands are never killed</b>racli, patchmgr and the Oracle precheck run detached on the node, through <code>zdlra_detached.sh</code>. Ansible only starts them and polls them.</div>
+<div class="rule"><b>Nothing runs twice by accident</b>A command still running is waited for. A result an earlier attempt left is used. Versions are read before any repeat patch.</div>
+<div class="rule"><b>Files hold the state</b>The run folder on the node, plus one JSON file on the jump server. Ansible can stop at any point and be run again.</div>
+<div class="rule"><b>No change without approval</b>Patch phases refuse unless the precheck is approved, under 24 hours old, real, and unchanged.</div>
+<div class="rule"><b>Dry run by default</b>Only <code>-e zdlra_execute=true</code> changes anything. <code>--check</code> is a dry run too.</div>
+<div class="rule"><b>On failure, stop and hold</b>The <code>rescue</code> records where it failed. Blackout and suspended jobs stay in place until you decide.</div>
+</div>
+<div class="key"><span><i style="background:var(--change-soft);border-color:var(--change)"></i>changes something</span><span><i style="background:var(--accent-soft);border-color:var(--accent)"></i>main step</span><span><i style="background:var(--stop-soft);border-color:var(--stop)"></i>guard or stop</span><span><i style="background:var(--soft);border-color:var(--line)"></i>you, or a side note</span></div>
+
+<h2 id="s1">1. Who runs what</h2>
+<p>Everything starts on the jump server (the OMS host). There is no script on the node to drive the run: Ansible connects over ssh as root and runs each task there. Two small helper scripts are copied to every compute node at the start of each run, because some work must outlive the ssh session or must keep a password off the command line.</p>
+<figure><div class="scroll"><svg viewBox="0 0 960 330" style="min-width:760px" role="img" aria-label="The jump server runs the playbooks and connects over ssh to the compute nodes; the patch node drives the cells and switches; compute nodes upgrade each other">
+<defs><marker id="ah1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="currentColor"/></marker></defs>
+<rect class="b lane" x="20" y="20" width="290" height="290" rx="5"/><text class="hd" x="165" y="42" text-anchor="middle">Jump server (OMS)</text>
+<rect class="b act" x="35" y="56" width="260" height="46" rx="5"/><text class="t" x="165" y="75">zdlra_patch.yml</text><text class="s" x="165" y="91">the whole patch, phase by phase</text>
+<rect class="b" x="35" y="110" width="260" height="42" rx="5"/><text class="t" x="165" y="128">oem.yml</text><text class="s" x="165" y="143">blackout and jobs on their own</text>
+<rect class="b" x="35" y="160" width="260" height="42" rx="5"/><text class="t" x="165" y="178">zdlra_status.yml</text><text class="s" x="165" y="193">state or report of a run</text>
+<rect class="b soft" x="35" y="210" width="260" height="42" rx="5"/><text class="t" x="165" y="228">emcli, sr_jobs_new.ksh</text><text class="s" x="165" y="243">run locally by the oem role</text>
+<rect class="b soft" x="35" y="260" width="260" height="38" rx="5"/><text class="t" x="165" y="276">~/zdlra_ansible_state/</text><text class="s" x="165" y="290">controller record of the run</text>
+<rect class="b lane" x="390" y="20" width="260" height="290" rx="5"/><text class="hd" x="520" y="42" text-anchor="middle">Patch node (first host, db01)</text>
+<rect class="b" x="405" y="56" width="230" height="42" rx="5"/><text class="t" x="520" y="74">zdlra_detached.sh</text><text class="s" x="520" y="89">runs long commands detached</text>
+<rect class="b" x="405" y="106" width="230" height="42" rx="5"/><text class="t" x="520" y="124">zdlra_sql.sh</text><text class="s" x="520" y="139">SQL*Plus, login on stdin</text>
+<rect class="b ch" x="405" y="156" width="230" height="42" rx="5"/><text class="t" x="520" y="174">racli, precheck</text><text class="s" x="520" y="189">RA upgrade steps</text>
+<rect class="b ch" x="405" y="206" width="230" height="42" rx="5"/><text class="t" x="520" y="224">patchmgr cells, switches</text><text class="s" x="520" y="239">from the patch folders</text>
+<rect class="b soft" x="405" y="256" width="230" height="42" rx="5"/><text class="t" x="520" y="274">/radump/zdlra_patch_runs/</text><text class="s" x="520" y="289">the run folder</text>
+<rect class="b lane" x="730" y="20" width="210" height="130" rx="5"/><text class="hd" x="835" y="42" text-anchor="middle">Other compute nodes</text>
+<rect class="b" x="745" y="56" width="180" height="42" rx="5"/><text class="t" x="835" y="74">zdlra_detached.sh</text><text class="s" x="835" y="89">copied here too</text>
+<rect class="b ch" x="745" y="104" width="180" height="38" rx="5"/><text class="t" x="835" y="120">patchmgr -dbnodes</text><text class="s" x="835" y="134">upgrades db01 last</text>
+<rect class="b soft" x="730" y="190" width="210" height="110" rx="5"/><text class="hd" x="835" y="214" text-anchor="middle">Cells and switches</text><text class="s" x="835" y="238">patched by patchmgr</text><text class="s" x="835" y="254">from the patch node,</text><text class="s" x="835" y="270">no ssh from Ansible</text>
+<path class="a" d="M310 90 L388 90" marker-end="url(#ah1)"/><text class="l" x="349" y="82" text-anchor="middle">ssh</text>
+<path class="a" d="M310 60 C 500 6, 700 6, 790 54" marker-end="url(#ah1)"/><text class="l" x="560" y="16" text-anchor="middle">ssh (delegate_to), for compute passes</text>
+<path class="a dash" d="M635 227 L728 240" marker-end="url(#ah1)"/>
+<path class="a dash" d="M650 120 L743 120" marker-end="url(#ah1)"/><path class="a dash" d="M743 132 L652 140" marker-end="url(#ah1)"/>
+</svg></div><figcaption>The play's host is the first host of the appliance's inventory group, the patch node. Compute passes and OEM steps are delegated from it: compute to a runner node, OEM to <code>oem_host</code> (localhost by default). Inventory host names must match <code>/root/dbs_group</code>.</figcaption></figure>
+
+<table><thead><tr><th>Piece</th><th>Where it runs</th><th>What it is for</th></tr></thead><tbody>
+<tr><td><code>zdlra_patch.yml</code></td><td>jump server</td><td>The whole patch. Replaces <code>jump/zdlra_patch_run.sh</code> and <code>zdlra_patch.sh</code> together.</td></tr>
+<tr><td><code>oem.yml</code></td><td>jump server (localhost)</td><td>The blackout and the OEM backup jobs on their own. Replaces <code>jump/oem_blackout.sh</code> and the job steps of the jump script.</td></tr>
+<tr><td><code>zdlra_status.yml</code></td><td>patch node</td><td>Shows status, finished and skipped phases, approval and the running step's log, or the report.</td></tr>
+<tr><td><code>roles/zdlra_patch</code></td><td>patch node (and runners)</td><td>Every phase, as task files. Its <code>defaults/main.yml</code> holds every setting of <code>zdlra_patch.conf</code>, with a <code>zdlra_</code> prefix.</td></tr>
+<tr><td><code>roles/oem</code></td><td>jump server</td><td>Login, blackout and jobs.</td></tr>
+<tr><td><code>zdlra_detached.sh</code></td><td>every compute node</td><td>Starts a command in a session of its own and reports on it. Section 5.</td></tr>
+<tr><td><code>zdlra_sql.sh</code></td><td>patch node</td><td>Runs SQL*Plus as <code>raAutomation</code>. The connect string and the SQL arrive on stdin, so neither shows in <code>ps</code> or the Ansible output (the tasks are <code>no_log</code>).</td></tr>
+<tr><td><code>filter_plugins/zdlra.py</code></td><td>jump server</td><td>Small parsers: <code>key=value</code> files, <code>imageinfo</code> versions, precheck summaries, the version table.</td></tr>
+</tbody></table>
+
+<h2 id="s2">2. A full run, start to finish</h2>
+<p>One playbook run goes through every step below, in this order. Each green box is a phase with a tag of its own; you can pick phases with <code>--tags</code> but not reorder them.</p>
+<figure><div class="scroll"><svg viewBox="0 0 960 360" style="min-width:760px" role="img" aria-label="The order of a full run, in four rows">
+<defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="currentColor"/></marker></defs>
+<rect class="b act" x="20" y="20" width="130" height="50" rx="5"/><text class="t" x="85" y="41">setup</text><text class="s" x="85" y="57">always runs</text>
+<rect class="b act" x="175" y="20" width="130" height="50" rx="5"/><text class="t" x="240" y="41">OEM check</text><text class="s" x="240" y="57">login, reason, targets</text>
+<rect class="b act" x="330" y="20" width="130" height="50" rx="5"/><text class="t" x="395" y="41">precheck</text><text class="s" x="395" y="57">Oracle precheck, plan</text>
+<rect class="b soft" x="485" y="20" width="130" height="50" rx="5"/><text class="t" x="550" y="41">APPROVE</text><text class="s" x="550" y="57">you type it</text>
+<rect class="b ch" x="640" y="20" width="140" height="50" rx="5"/><text class="t" x="710" y="41">blackout</text><text class="s" x="710" y="57">OEM jobs suspended</text>
+<rect class="b ch" x="20" y="110" width="130" height="50" rx="5"/><text class="t" x="85" y="131">quiesce</text><text class="s" x="85" y="147">pause replication</text>
+<rect class="b act" x="175" y="110" width="130" height="50" rx="5"/><text class="t" x="240" y="131">snapshot</text><text class="s" x="240" y="147">state before</text>
+<rect class="b ch" x="330" y="110" width="130" height="50" rx="5"/><text class="t" x="395" y="131">ra_preinstall</text><text class="s" x="395" y="147">racli run preinstall</text>
+<rect class="b ch" x="485" y="110" width="130" height="50" rx="5"/><text class="t" x="550" y="131">ra_alter</text><text class="s" x="550" y="147">gold images</text>
+<rect class="b ch" x="640" y="110" width="140" height="50" rx="5"/><text class="t" x="710" y="131">ra_update</text><text class="s" x="710" y="147">about 2 hours</text>
+<rect class="b ch" x="805" y="110" width="135" height="50" rx="5"/><text class="t" x="872" y="131">cells</text><text class="s" x="872" y="147">patchmgr -cells</text>
+<rect class="b ch" x="20" y="200" width="130" height="50" rx="5"/><text class="t" x="85" y="221">compute</text><text class="s" x="85" y="237">node by node, reboots</text>
+<rect class="b ch" x="175" y="200" width="130" height="50" rx="5"/><text class="t" x="240" y="221">switches</text><text class="s" x="240" y="237">RoCE only</text>
+<rect class="b soft" x="330" y="200" width="130" height="50" rx="5"/><text class="t" x="395" y="221">admin_switches</text><text class="s" x="395" y="237">placeholder, off</text>
+<rect class="b act" x="485" y="200" width="130" height="50" rx="5"/><text class="t" x="550" y="221">postcheck</text><text class="s" x="550" y="237">compare, versions</text>
+<rect class="b ch" x="640" y="200" width="140" height="50" rx="5"/><text class="t" x="710" y="221">resume</text><text class="s" x="710" y="237">only what we paused</text>
+<rect class="b act" x="805" y="200" width="135" height="50" rx="5"/><text class="t" x="872" y="221">report</text><text class="s" x="872" y="237">report.txt</text>
+<rect class="b ch" x="20" y="290" width="172" height="50" rx="5"/><text class="t" x="106" y="311">OEM finish</text><text class="s" x="106" y="327">jobs resumed, blackout ended</text>
+<rect class="b act" x="205" y="290" width="130" height="50" rx="5"/><text class="t" x="270" y="311">verify</text><text class="s" x="270" y="327">backups arrive again</text>
+<rect class="b act" x="360" y="290" width="130" height="50" rx="5"/><text class="t" x="425" y="311">finish</text><text class="s" x="425" y="327">status: completed</text>
+<rect class="b stop" x="640" y="290" width="300" height="50" rx="5"/><text class="t" x="790" y="311">any failure: rescue, failed.yml</text><text class="s" x="790" y="327">status "failed in &lt;phase&gt;", how to go on</text>
+<path class="a" d="M150 45 L173 45" marker-end="url(#ah2)"/><path class="a" d="M305 45 L328 45" marker-end="url(#ah2)"/><path class="a" d="M460 45 L483 45" marker-end="url(#ah2)"/><path class="a" d="M615 45 L638 45" marker-end="url(#ah2)"/>
+<path class="a" d="M710 70 L710 88 L85 88 L85 108" marker-end="url(#ah2)"/>
+<path class="a" d="M150 135 L173 135" marker-end="url(#ah2)"/><path class="a" d="M305 135 L328 135" marker-end="url(#ah2)"/><path class="a" d="M460 135 L483 135" marker-end="url(#ah2)"/><path class="a" d="M615 135 L638 135" marker-end="url(#ah2)"/><path class="a" d="M780 135 L803 135" marker-end="url(#ah2)"/>
+<path class="a" d="M872 160 L872 178 L85 178 L85 198" marker-end="url(#ah2)"/>
+<path class="a" d="M150 225 L173 225" marker-end="url(#ah2)"/><path class="a" d="M305 225 L328 225" marker-end="url(#ah2)"/><path class="a" d="M460 225 L483 225" marker-end="url(#ah2)"/><path class="a" d="M615 225 L638 225" marker-end="url(#ah2)"/><path class="a" d="M780 225 L803 225" marker-end="url(#ah2)"/>
+<path class="a" d="M872 250 L872 268 L100 268 L100 288" marker-end="url(#ah2)"/>
+<path class="a" d="M192 315 L203 315" marker-end="url(#ah2)"/><path class="a" d="M335 315 L358 315" marker-end="url(#ah2)"/>
+</svg></div><figcaption>The blackout starts only after approval and before anything changes. <code>zdlra_keep_blackout=true</code> skips "OEM finish" and verify, leaving both for later. <code>zdlra_compute_enabled=false</code> leaves out compute. The switches phase skips itself on an InfiniBand rack.</figcaption></figure>
+
+<h2 id="s3">3. The playbooks</h2>
+<h3>zdlra_patch.yml</h3>
+<p>One play, on <code>&lt;zdlra&gt;[0]</code>, with <code>gather_facts: false</code>, <code>check_mode: false</code> and <code>any_errors_fatal: true</code>. Check mode is off on purpose: read-only commands (<code>racli status</code>, <code>imageinfo</code>, SQL queries) must give real answers in a dry run too. What changes is decided by <code>zdlra_dry_run</code> instead, which <code>--check</code> also sets.</p>
+<ol>
+<li><b>Setup</b> (<code>import_role ... tasks_from: setup</code>, tagged <code>always</code>). Checks the appliance was named and is an inventory group, the user is root and <code>racli</code> is there. Copies the two helpers to every compute node. Picks the run: <code>zdlra_run_id</code> if given (its folder must exist), otherwise a new ID from the node's clock. Creates the run folder and the controller folders, then reads the staged record, the <code>patch.conf_&lt;SR&gt;</code> it names, and the run's own records (<code>read_state.yml</code>).</li>
+<li><b>The patch</b>, one <code>block</code> with a <code>rescue</code>. Each phase is an <code>include_role ... tasks_from: run_phase</code> with <code>apply: {tags: [&lt;phase&gt;]}</code> and the condition <code>'&lt;phase&gt;' not in zdlra_skip_done</code>. <code>zdlra_skip_done</code> is the run's <code>phases_done</code> less anything listed in <code>zdlra_rerun</code>. So running the same command again carries on where it stopped.</li>
+<li><b>OEM steps</b> sit between the phases, tagged <code>oem</code>: a check before the precheck, then (after approval) blackout and jobs suspended, then at the end jobs resumed and blackout ended. A run whose OEM finish already happened is refused, unless its patching is complete.</li>
+<li><b>The end</b>: <code>finish.yml</code> on success, <code>failed.yml</code> in the rescue. Both are applied with tag <code>always</code>, so a run limited with <code>--tags</code> still records its outcome.</li>
+</ol>
+<h3>oem.yml</h3>
+<p>A play on localhost that takes <code>oem_action</code>: <code>targets</code>, <code>check</code>, <code>status</code>, <code>start</code>, <code>stop</code>, <code>suspend_jobs</code>, <code>resume_jobs</code> or <code>finish</code> (resume the jobs, then end the blackout). It reads <code>oem_blackout_targets</code> and <code>oem_jobs_db</code> from the appliance's inventory group. Use it to fix up OEM by hand, for example after abandoning a failed run.</p>
+<h3>zdlra_status.yml</h3>
+<p>Loads the role only for its defaults, then runs one read-only shell script on the patch node. It shows the latest run (or <code>zdlra_run_id</code>): status, done and skipped phases, the approval, and, if a detached command is running, its PID and the last lines of its log. <code>-e show=report</code> prints <code>report.txt</code>.</p>
+
+<h2 id="s4">4. Inside a phase</h2>
+<p>Every phase goes through <code>run_phase.yml</code>, which makes the same checks <code>zdlra_patch.sh</code> makes around a phase, then includes <code>phase_&lt;name&gt;.yml</code>.</p>
+<figure><div class="scroll"><svg viewBox="0 0 960 200" style="min-width:760px" role="img" aria-label="The steps of run_phase.yml">
+<defs><marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="currentColor"/></marker></defs>
+<rect class="b soft" x="20" y="30" width="140" height="56" rx="5"/><text class="t" x="90" y="53">would it skip?</text><text class="s" x="90" y="70">IB rack, admin off</text>
+<rect class="b stop" x="185" y="30" width="150" height="56" rx="5"/><text class="t" x="260" y="53">require_approval</text><text class="s" x="260" y="70">patch phases only</text>
+<rect class="b stop" x="360" y="30" width="150" height="56" rx="5"/><text class="t" x="435" y="53">resume has run?</text><text class="s" x="435" y="70">then refuse to patch</text>
+<rect class="b stop" x="535" y="30" width="150" height="56" rx="5"/><text class="t" x="610" y="53">refuse_if_running</text><text class="s" x="610" y="70">a long command running</text>
+<rect class="b act" x="710" y="30" width="230" height="56" rx="5"/><text class="t" x="825" y="53">status "running &lt;phase&gt;"</text><text class="s" x="825" y="70">then phase_&lt;phase&gt;.yml</text>
+<rect class="b ch" x="710" y="120" width="230" height="56" rx="5"/><text class="t" x="825" y="143">mark_phase.yml</text><text class="s" x="825" y="160">phases_done or phases_skipped</text>
+<rect class="b soft" x="185" y="120" width="500" height="56" rx="5"/><text class="t" x="435" y="143">a refusal here leaves the run's status as it was</text><text class="s" x="435" y="160">zdlra_preserve_status stays true until the phase starts</text>
+<path class="a" d="M160 58 L183 58" marker-end="url(#ah3)"/><path class="a" d="M335 58 L358 58" marker-end="url(#ah3)"/><path class="a" d="M510 58 L533 58" marker-end="url(#ah3)"/><path class="a" d="M685 58 L708 58" marker-end="url(#ah3)"/><path class="a" d="M825 86 L825 118" marker-end="url(#ah3)"/>
+<path class="a faint" d="M435 86 L435 118"/>
+</svg></div><figcaption>A dry run records nothing in <code>phases_done</code>, so a later real run does every phase.</figcaption></figure>
+<p>Within a phase, a step that changes the appliance usually goes: show the command (and stop there in a dry run), look for an earlier attempt's result, ask you to type <code>YES</code> (<code>confirm.yml</code>, unless <code>zdlra_confirm_steps=false</code>), run it through <code>racli_step.yml</code> or <code>patchmgr_step.yml</code>, check its log, then read the versions.</p>
+
+<h2 id="s5">5. How long commands are protected from being killed</h2>
+<p>An Ansible task that runs for hours over ssh would die with the connection, and <code>async</code> jobs are tied to Ansible's own bookkeeping. So patchmgr, the racli upgrade steps and Oracle's precheck run through <code>zdlra_detached.sh</code>, and <code>detached.yml</code> only talks to that helper.</p>
+<figure><div class="scroll"><svg viewBox="0 0 960 250" style="min-width:760px" role="img" aria-label="How detached.yml starts and polls a long command">
+<defs><marker id="ah4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="currentColor"/></marker></defs>
+<rect class="b lane" x="20" y="20" width="300" height="210" rx="5"/><text class="hd" x="170" y="42" text-anchor="middle">Ansible (detached.yml)</text>
+<rect class="b act" x="35" y="56" width="270" height="42" rx="5"/><text class="t" x="170" y="74">start [--fresh] LOG PIDF DIR -- cmd</text><text class="s" x="170" y="89">prints STARTED, RUNNING or PENDING</text>
+<rect class="b act" x="35" y="110" width="270" height="42" rx="5"/><text class="t" x="170" y="128">poll LOG PIDF  (until loop)</text><text class="s" x="170" y="143">up to the warn time, then up to 12h</text>
+<rect class="b" x="35" y="164" width="270" height="52" rx="5"/><text class="t" x="170" y="184">STATE=done RC=n</text><text class="s" x="170" y="200">tail the log, check it, collect</text>
+<rect class="b lane" x="400" y="20" width="540" height="210" rx="5"/><text class="hd" x="670" y="42" text-anchor="middle">Node (zdlra_detached.sh)</text>
+<rect class="b ch" x="415" y="56" width="250" height="42" rx="5"/><text class="t" x="540" y="74">setsid nohup wrapper</text><text class="s" x="540" y="89">no terminal, own session</text>
+<rect class="b ch" x="415" y="110" width="250" height="42" rx="5"/><text class="t" x="540" y="128">cd DIR; cmd &gt; LOG 2&gt;&amp;1</text><text class="s" x="540" y="143">no time limit</text>
+<rect class="b" x="415" y="164" width="250" height="52" rx="5"/><text class="t" x="540" y="184">echo $? &gt; LOG.rc</text><text class="s" x="540" y="200">97 = could not enter DIR</text>
+<rect class="b soft" x="690" y="56" width="235" height="160" rx="5"/><text class="t" x="807" y="78">files beside the log</text><text class="s" x="807" y="102">LOG: the output</text><text class="s" x="807" y="122">LOG.rc: exit status</text><text class="s" x="807" y="142">LOG.rc.collected: result used</text><text class="s" x="807" y="162">detached.pid: wrapper pid</text><text class="s" x="807" y="182">detached.log: which LOG runs</text>
+<path class="a" d="M305 77 L413 77" marker-end="url(#ah4)"/><path class="a" d="M540 98 L540 108" marker-end="url(#ah4)"/><path class="a" d="M540 152 L540 162" marker-end="url(#ah4)"/>
+<path class="a dash" d="M413 131 L307 131" marker-end="url(#ah4)"/><text class="l" x="360" y="124" text-anchor="middle">reads</text>
+</svg></div><figcaption>If Ansible dies, the wrapper and the command carry on. The next attempt's <code>start</code> sees the PID still alive and prints <code>RUNNING</code>, or sees <code>LOG.rc</code> and prints <code>PENDING</code>; either way it does not start the command again.</figcaption></figure>
+<ul>
+<li><b>start</b> refuses to start a second copy. With a result left (<code>LOG.rc</code> not yet collected), it reports <code>PENDING &lt;rc&gt;</code> and that result is used, unless <code>--fresh</code> (always used for checks, such as the precheck and patchmgr prereq checks).</li>
+<li><b>poll</b> prints <code>STATE=running|done|gone RC= LINES= ELAPSED=</code>. <code>gone</code> means no exit status and no live process: it was killed or the node rebooted. Ansible records that as exit 99, so the next attempt starts it again.</li>
+<li><b>Two waits.</b> The first <code>until</code> loop runs to the step's warn time (for example 240 minutes for <code>ra_update</code>). Past that it prints a warning and keeps waiting, up to <code>zdlra_wait_max_hours</code> (12). Past that it stops watching and fails, saying the command is still running and how to pick it up.</li>
+<li><b>collect</b> renames <code>LOG.rc</code> once its result has been used, so a later attempt runs the step again. A successful patch or upgrade is not collected until it is recorded in <code>steps_done</code>, so it can never run twice.</li>
+<li><b>running</b> lists any patchmgr run, racli upgrade step or Oracle precheck on the node (an awk port of the script's <code>find_long_command</code>). <code>refuse_if_running.yml</code> uses it so nothing starts over another long command, except this run's own step of the same phase, which is waited for instead.</li>
+</ul>
+
+<h2 id="s6">6. The patch phases</h2>
+<p>What each phase does and how it decides success matches the shell script; the main <a href="../README.md">README</a> has the full table. Here is where each lives and what to know about the Ansible side.</p>
+<div class="scroll"><table class="ph"><thead><tr><th>Phase</th><th>Task file</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>precheck</code></td><td><code>phase_precheck.yml</code>, <code>precheck_script.yml</code>, <code>plan.yml</code>, <code>approve.yml</code></td><td>Quick checks first (racli version and status, the staged record, free space, SQL login), then Oracle's precheck, detached. Its <code>FAILURE SUMMARY</code> is sorted into failures and warnings; any failure not waived stops. Then a read-only plan (replication, incoming backups, RA files, cell and switch versions) and the approval prompt. It also marks <code>ra_preinstall</code> as not done, because the precheck rolls back its RPM.</td></tr>
+<tr><td><code>quiesce</code></td><td><code>phase_quiesce.yml</code>, <code>quiesce_pause_one.yml</code></td><td>Pauses each replication server from <code>zdlra_replication_servers_sql</code>, adding each to <code>replication_paused.txt</code> as it goes. Then waits for incoming backups, up to <code>zdlra_quiesce_timeout_minutes</code>.</td></tr>
+<tr><td><code>snapshot</code></td><td><code>phase_snapshot.yml</code></td><td>Saves racli version, status and versions to <code>snapshot_before/</code>.</td></tr>
+<tr><td><code>ra_preinstall</code>, <code>ra_alter</code>, <code>ra_update</code></td><td><code>phase_ra_*.yml</code>, <code>racli_step.yml</code></td><td>Each runs one racli step detached, then looks for its success line in the log. A rerun of <code>ra_update</code> after a failure is left to racli, which carries on by itself.</td></tr>
+<tr><td><code>cells</code></td><td><code>phase_cells.yml</code>, <code>patchmgr_step.yml</code>, <code>cell_versions.yml</code></td><td>Reads the versions first: cells already on target, or a patch this run already recorded, are not patched again. Prereq check; only if it fails, <code>-reset_force</code>, <code>-cleanup</code> and the check again. Then <code>-patch</code>, recorded in <code>steps_done</code>.</td></tr>
+<tr><td><code>compute</code></td><td><code>phase_compute.yml</code>, <code>compute_pass.yml</code>, <code>compute_check.yml</code></td><td>Section 7.</td></tr>
+<tr><td><code>switches</code>, <code>admin_switches</code></td><td><code>phase_switches.yml</code>, <code>phase_admin_switches.yml</code>, <code>switch_upgrade.yml</code></td><td>Precheck, then upgrade, then each switch's version. Admin switches are skipped with a warning until <code>zdlra_admin_switch_enabled=true</code>.</td></tr>
+<tr><td><code>postcheck</code></td><td><code>phase_postcheck.yml</code>, <code>versions.yml</code></td><td>Snapshot again and compare, Oracle's precheck again, then the version table (<code>versions.txt</code>).</td></tr>
+<tr><td><code>resume</code></td><td><code>phase_resume.yml</code>, <code>resume_one.yml</code></td><td>Resumes only what is in <code>replication_paused.txt</code>, taking each off as it resumes. Records <code>resumed_at</code> by the node's clock.</td></tr>
+<tr><td><code>report</code></td><td><code>phase_report.yml</code>, <code>templates/report.txt.j2</code></td><td>Always runs (no skip when done), so the report is current.</td></tr>
+<tr><td><code>verify</code></td><td><code>phase_verify.yml</code>, <code>verify_one.yml</code></td><td>After the OEM jobs are resumed. Waits for new backups (and replication, if this run paused it) counted from <code>resumed_at</code>. Not arriving in time is a warning only.</td></tr>
+</tbody></table></div>
+
+<h2 id="s7">7. Compute nodes</h2>
+<p>The compute nodes are patched from the jump server, as the jump script does, because the patch node itself reboots. The play's host stays the patch node, but every compute task is delegated to a runner or a target node.</p>
+<figure><div class="scroll"><svg viewBox="0 0 960 190" style="min-width:760px" role="img" aria-label="Compute passes: db01 upgrades the others, then db02 upgrades db01">
+<defs><marker id="ah5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="currentColor"/></marker></defs>
+<rect class="b act" x="40" y="60" width="150" height="56" rx="5"/><text class="t" x="115" y="83">db01</text><text class="s" x="115" y="100">runner, passes 1..n-1</text>
+<rect class="b ch" x="330" y="20" width="150" height="50" rx="5"/><text class="t" x="405" y="41">db02</text><text class="s" x="405" y="57">upgraded, reboots</text>
+<rect class="b ch" x="330" y="110" width="150" height="50" rx="5"/><text class="t" x="405" y="131">db03 ...</text><text class="s" x="405" y="147">one at a time</text>
+<rect class="b act" x="600" y="20" width="150" height="50" rx="5"/><text class="t" x="675" y="41">db02</text><text class="s" x="675" y="57">runner, last pass</text>
+<rect class="b ch" x="790" y="110" width="150" height="50" rx="5"/><text class="t" x="865" y="131">db01</text><text class="s" x="865" y="147">upgraded last</text>
+<path class="a" d="M190 78 L328 48" marker-end="url(#ah5)"/><path class="a" d="M190 98 L328 132" marker-end="url(#ah5)"/>
+<path class="a dash" d="M480 45 L598 45" marker-end="url(#ah5)"/><text class="l" x="540" y="38" text-anchor="middle">then</text>
+<path class="a" d="M750 55 L815 108" marker-end="url(#ah5)"/>
+</svg></div><figcaption>The passes come from the inventory order: the first node upgrades each of the others, then the second upgrades the first.</figcaption></figure>
+<p>For each pass, <code>compute_pass.yml</code>:</p>
+<ol>
+<li>Skips the pass if the controller record lists it in <code>compute_done</code>.</li>
+<li>On the runner, creates <code>/radump/zdlra_compute/&lt;run id&gt;/</code> and writes a <code>db_nodes</code> file holding only the target.</li>
+<li>Reads where the runner's jobs stand and the target's version. A target already on <code>TARGET_COMPUTE_VERSION</code> is not upgraded again.</li>
+<li>Runs <code>patchmgr -dbnodes ... -precheck</code> (fresh each time), checks it with <code>compute_check.yml</code>, then <code>-upgrade</code>. Both run detached on the runner, with the PID file and log in the runner's compute folder. The check needs no <code>FAILED</code> lines, exit 0, a completed run and every node in state <code>SUCCESS</code>. A run that ended badly with exit 0 is recorded as exit 98, so it starts again next time. <code>SUCCESS WITH WARNING(S)</code> is accepted and the warnings shown, unless <code>zdlra_compute_pause_on_warnings</code>.</li>
+<li>Waits for the target's <code>imageinfo</code> to show the target version, then for the node to be ready (<code>wait_for_connection</code>, then <code>zdlra_node_ready_cmd</code>: a database <code>pmon</code> running).</li>
+<li>Records the pass in the controller's JSON file.</li>
+</ol>
+<p>After the last pass the patch node has rebooted, so the playbook waits for it and reads the run's records again before going on to the switches.</p>
+
+<h2 id="s8">8. When something goes wrong</h2>
+<p>Any failed task jumps to the <code>rescue</code>, which runs <code>failed.yml</code>:</p>
+<ul>
+<li>Writes <code>failed in &lt;phase&gt;</code> to the run's status. A refusal before a phase starts (approval missing, a long command running) leaves the status as it was, as the script does.</li>
+<li>Prints the command to carry on once the problem is fixed: the same playbook with <code>-e zdlra_run_id=&lt;id&gt;</code>. Finished phases are skipped.</li>
+<li>Only if you mean to abandon the run, it lists how to undo what was done: resume the paused replication servers (<code>--tags resume</code>), resume the OEM jobs and end the blackout (<code>oem.yml</code>). It does not do any of this itself.</li>
+</ul>
+<h3>Picking up</h3>
+<table><thead><tr><th>What stopped</th><th>What happens when you run it again with the same <code>zdlra_run_id</code></th></tr></thead><tbody>
+<tr><td>Ansible (Ctrl-C, ssh dropped, laptop closed) while racli or patchmgr ran</td><td>The command kept running. <code>refuse_if_running</code> sees it is this run's own step, and <code>start</code> prints <code>RUNNING</code>: the playbook waits for it.</td></tr>
+<tr><td>Ansible, and the command finished meanwhile</td><td><code>start</code> prints <code>PENDING &lt;rc&gt;</code>: that result is checked and used.</td></tr>
+<tr><td>The wait passed <code>zdlra_wait_max_hours</code></td><td>Same as above: the command was never stopped.</td></tr>
+<tr><td>A step failed</td><td>Its result was collected, so the step runs again once you have fixed the cause. A cell patch or switch upgrade that worked is in <code>steps_done</code> and is never run again.</td></tr>
+<tr><td>A compute pass</td><td>Done passes are skipped. A patchmgr still running on the runner is waited for, a result left is used, a failed one starts again.</td></tr>
+<tr><td>The blackout already exists</td><td>This run's blackout, if still on, is kept (<code>oem_blackout_reuse</code>). Jobs already suspended are not suspended again.</td></tr>
+</tbody></table>
+<p><code>zdlra_rerun=[cells]</code> runs a finished phase again anyway.</p>
+
+<h2 id="s9">9. How approval works</h2>
+<ol>
+<li><code>approve.yml</code> works out a fingerprint (<code>fingerprint.yml</code>): a SHA-256 of the failure and warning name lists plus <code>staged=&lt;archive sha256&gt;</code>.</li>
+<li>It shows the review (failures, waived ones, warnings, exit code, the staged archive and its SHA-256) with <code>pause</code>, and waits for <code>APPROVE</code>. With no terminal the answer is empty, so the run stops. Nothing skips this.</li>
+<li>It saves <code>precheck_approval.txt</code> in the run folder: who (<code>SUDO_USER</code>, <code>USER</code> or <code>id -un</code>, at the jump server's host name), when, <code>precheck_dry_run</code>, the counts and the fingerprint.</li>
+<li>Before the blackout and before every patch phase, <code>require_approval.yml</code> reads it back and refuses if it is missing, from a dry run when this is a real run, older than <code>zdlra_precheck_approval_max_age_hours</code> (24), or if the fingerprint worked out now differs.</li>
+</ol>
+<p>The YES confirmations before each racli and patchmgr step are separate (<code>confirm.yml</code>) and can be turned off with <code>zdlra_confirm_steps=false</code>. The approval cannot.</p>
+
+<h2 id="s10">10. The OEM blackout and jobs</h2>
+<ul>
+<li><b>Login</b> (<code>roles/oem/tasks/login.yml</code>): <code>emcli sync</code>, or a login with <code>vault_oem_em_password</code> under <code>no_log</code>.</li>
+<li><b>Blackout</b> (<code>blackout.yml</code>): the name is kept in <code>~/zdlra_ansible_state/&lt;appliance&gt;.blackout</code>. Before creating one it asks EM whether the recorded one is over; only a clear "ended", "stopped" or "expired" counts. It refuses while another is on. Stop retires the record with a timestamp.</li>
+<li><b>Jobs</b> (<code>jobs.yml</code>): <code>sr_jobs_new.ksh</code> only writes a script with one emcli command per job. The role finds the one script it just wrote, runs it to a <code>.log</code>, and checks each job has a "successfully" line. Missing ones are warnings, none at all is a failure.</li>
+</ul>
+
+<h2 id="s11">11. Files on disk</h2>
+<h3>On the patch node: <code>/radump/zdlra_patch_runs/&lt;run id&gt;/</code></h3>
+<p>The same layout as the shell script, so <code>zdlra_status.yml</code> and a person reading the folder see the same thing.</p>
+<table><thead><tr><th>File</th><th>What it holds</th></tr></thead><tbody>
+<tr><td><code>status</code></td><td>One line: time and state (<code>running cells</code>, <code>failed in cells</code>, <code>completed</code>).</td></tr>
+<tr><td><code>phases_done</code>, <code>phases_skipped</code></td><td>One phase per line.</td></tr>
+<tr><td><code>steps_done</code></td><td>Steps that must never run twice: <code>cells_patch</code>, <code>switches_upgrade</code>, <code>admin_switches_upgrade</code>.</td></tr>
+<tr><td><code>precheck_approval.txt</code></td><td>Section 9.</td></tr>
+<tr><td><code>precheck_before/</code>, <code>precheck_after/</code></td><td>Oracle's precheck output, failure and warning lists.</td></tr>
+<tr><td><code>&lt;step&gt;.log</code>, <code>.log.rc</code></td><td>Each long step's output and exit status (<code>ra_update.log</code>, <code>cells_patch.log</code>, ...).</td></tr>
+<tr><td><code>detached.pid</code>, <code>detached.log</code></td><td>The running step's PID and log path, while it runs.</td></tr>
+<tr><td><code>replication_paused.txt</code>, <code>resumed_at</code></td><td>What quiesce paused, and when resume ran.</td></tr>
+<tr><td><code>snapshot_before/</code>, <code>versions.txt</code>, <code>report.txt</code></td><td>Snapshot, version table, report.</td></tr>
+<tr><td><code>zdlra_patch.log</code></td><td>One line per playbook run: run ID, dry run, tags.</td></tr>
+</tbody></table>
+<h3>On a compute runner: <code>/radump/zdlra_compute/&lt;run id&gt;/</code></h3>
+<p><code>db_nodes_&lt;target&gt;</code>, and <code>precheck_&lt;target&gt;.log</code> and <code>upgrade_&lt;target&gt;.log</code> with their <code>.rc</code> and <code>.pid</code> files.</p>
+<h3>On the jump server</h3>
+<table><thead><tr><th>Path</th><th>What it holds</th></tr></thead><tbody>
+<tr><td><code>~/zdlra_ansible_state/&lt;appliance&gt;_&lt;run id&gt;.json</code></td><td><code>blackout</code>, <code>jobs_suspended</code>, <code>compute_done</code>, <code>oem_finished_at</code>. Kept here because the patch node reboots during compute.</td></tr>
+<tr><td><code>~/zdlra_ansible_state/&lt;appliance&gt;.blackout</code></td><td>The current blackout's name.</td></tr>
+<tr><td><code>~/zdlra_ansible_logs/&lt;appliance&gt;_&lt;run id&gt;/</code></td><td>Copies of the compute patchmgr logs.</td></tr>
+<tr><td><code>ansible/logs/ansible.log</code></td><td>Ansible's own log of every task.</td></tr>
+</tbody></table>
+
+<h2 id="s12">12. What a dry run really does</h2>
+<p>A dry run (the default, or <code>--check</code>) still connects, reads and checks. It changes nothing on the appliance or in OEM.</p>
+<table><thead><tr><th>Runs for real</th><th>Only shown</th></tr></thead><tbody>
+<tr><td>racli version and status, <code>imageinfo</code>, <code>dcli</code> reads, switch versions, SQL queries, the free space check, emcli login and <code>get_blackout_reasons</code>, and Oracle's precheck (it is not read-only, but it is what the approval is about)</td><td><code>racli</code> upgrade steps, every <code>patchmgr</code>, pausing and resuming replication, <code>create_blackout</code>, <code>stop_blackout</code>, suspending and resuming OEM jobs</td></tr>
+</tbody></table>
+<p>A dry run writes the run folder, the precheck results and an approval marked <code>precheck_dry_run=1</code>, which a real run will not accept. It records no phase as done.</p>
+
+<h2 id="s13">13. A real run, traced</h2>
+<p>A real run on the stand-in appliance, with every step in order. <span class="who">jump</span> is the playbook on the jump server, <span class="who node">node</span> a task on a compute node, <span class="who oem">oem</span> an OEM step, <span class="who you">you</span> the operator.</p>
+<ol class="trace">
+<li class="you"><div class="h"><span class="who you">you</span><b>Start it in tmux</b></div><p><code>ansible-playbook zdlra_patch.yml -e zdlra=zdlra01 -e zdlra_execute=true --ask-vault-pass</code></p></li>
+<li><div class="h"><span class="who">jump</span><b>Setup</b><span class="loc">setup.yml</span></div><p>Group <code>zdlra01</code> found, patch node <code>zdlra01db01</code>. User is root, racli is there. Helpers copied to both nodes. A new run ID from the node's clock. Staged record and <code>patch.conf_&lt;SR&gt;</code> read.</p></li>
+<li class="oem"><div class="h"><span class="who oem">oem</span><b>OEM check</b><span class="loc">oem/tasks/blackout.yml</span></div><p>emcli login, the reason is a known one, targets set. Nothing created.</p></li>
+<li class="node"><div class="h"><span class="who node">node</span><b>precheck: quick checks</b><span class="loc">phase_precheck.yml</span></div><p>racli version and status, staged archive present, free space, SQL login as raAutomation.</p></li>
+<li class="node"><div class="h"><span class="who node">node</span><b>Oracle's precheck, detached</b><span class="loc">precheck_script.yml, detached.yml</span></div><p><code>start --fresh</code> prints <code>STARTED</code>. Polled every 30 s until <code>STATE=done RC=0</code>. Summary: 0 failures, 1 warning.</p></li>
+<li class="node"><div class="h"><span class="who node">node</span><b>Plan</b><span class="loc">plan.yml</span></div><p>Replication pair RA2DR, 0 incoming backups, RA files present, cell and switch versions against their targets.</p></li>
+<li class="you"><div class="h"><span class="who you">you</span><b>Review and type APPROVE</b><span class="loc">approve.yml</span></div><p><code>precheck_approval.txt</code> saved with the fingerprint.</p></li>
+<li class="oem"><div class="h"><span class="who oem">oem</span><b>Blackout and jobs</b><span class="tag">changes</span><span class="loc">zdlra_patch.yml</span></div><p>Approval checked. <code>create_blackout</code>, name recorded; <code>sr_jobs_new.ksh</code> generated and run, every job suspended. Both recorded in the controller JSON.</p></li>
+<li class="node"><div class="h"><span class="who node">node</span><b>quiesce</b><span class="tag">changes</span></div><p>RA2DR paused and written to <code>replication_paused.txt</code>. No incoming backups to wait for.</p></li>
+<li class="node"><div class="h"><span class="who node">node</span><b>snapshot, ra_preinstall, ra_alter, ra_update</b><span class="tag">changes</span><span class="loc">racli_step.yml</span></div><p>Each: approval checked, nothing else running, type YES, racli run detached, success line found, phase recorded.</p></li>
+<li class="node"><div class="h"><span class="who node">node</span><b>cells</b><span class="tag">changes</span><span class="loc">phase_cells.yml</span></div><p>Cells not on target. Prereq check passed, so no reset. <code>-patch</code>, then <code>cells_patch</code> in <code>steps_done</code>, then every cell on target.</p></li>
+<li class="node"><div class="h"><span class="who node">node</span><b>compute</b><span class="tag">changes</span><span class="loc">compute_pass.yml</span></div><p>db01 upgrades db02 (precheck, upgrade, version, ready), then db02 upgrades db01. Each pass recorded on the jump server. Waits for db01 to come back.</p></li>
+<li class="node"><div class="h"><span class="who node">node</span><b>switches</b><span class="tag">changes</span></div><p>RoCE precheck, upgrade, then each switch's version. Admin switches skipped (off).</p></li>
+<li class="node"><div class="h"><span class="who node">node</span><b>postcheck, resume, report</b></div><p>Every component OK in the version table. RA2DR resumed, <code>resumed_at</code> written. <code>report.txt</code> written.</p></li>
+<li class="oem"><div class="h"><span class="who oem">oem</span><b>OEM finish</b><span class="tag">changes</span></div><p>Jobs resumed, blackout stopped and its record retired. <code>oem_finished_at</code> recorded.</p></li>
+<li class="node"><div class="h"><span class="who node">node</span><b>verify, finish</b></div><p>New backups and replication arrived after <code>resumed_at</code>. Status <code>completed</code>, the report printed.</p></li>
+</ol>
+<p>The same run was also tested with Ansible killed during <code>ra_update</code>. racli kept going; running the same command with <code>-e zdlra_run_id=&lt;id&gt;</code> printed "Already running from an earlier attempt ... waiting for it, not starting it again", and the run finished with a single <code>ra_update.log</code>.</p>
+
+<h2 id="s14">14. Differences from the shell scripts</h2>
+<table><thead><tr><th>Shell scripts</th><th>Ansible version</th></tr></thead><tbody>
+<tr><td>Background mode after approval (<code>--background</code>)</td><td>None. Run it under <code>tmux</code> or <code>screen</code>, and run again with the same run ID if the session ends.</td></tr>
+<tr><td>Waits for a long command as long as it takes</td><td>Waits up to <code>zdlra_wait_max_hours</code> (12), then stops watching. The command carries on; run again to pick it up.</td></tr>
+<tr><td>One streamed run log</td><td>Ansible's task output and <code>logs/ansible.log</code>. Each long step still has its own log in the run folder.</td></tr>
+<tr><td>Settings in <code>zdlra_patch.conf</code></td><td>The same settings as <code>zdlra_*</code> variables: role defaults, <code>group_vars</code>, inventory groups. The staged <code>patch.conf_&lt;SR&gt;</code> is still read from the node.</td></tr>
+<tr><td>Passwords in the conf file</td><td>Ansible Vault (<code>vault.yml</code>).</td></tr>
+<tr><td>Approval time from the node</td><td>Approval time from the jump server's clock.</td></tr>
+<tr><td>Staging scripts</td><td>Unchanged: staging still uses <code>staging/</code> and the jump-server staging script.</td></tr>
+</tbody></table>
+
+<h2 id="ref">Task file reference</h2>
+<h3>Playbooks and role setup</h3>
+<div class="scroll"><table><thead><tr><th>File</th><th>What it does</th><th>Included from</th></tr></thead><tbody>
+<tr><td><code>zdlra_patch.yml</code></td><td>Sections 2 and 3.</td><td>you</td></tr>
+<tr><td><code>setup.yml</code></td><td>Checks, helpers, the run, the run folder.</td><td>playbook, always</td></tr>
+<tr><td><code>read_state.yml</code></td><td>Staged record, <code>patch.conf_&lt;SR&gt;</code>, <code>phases_done</code>, <code>steps_done</code>, <code>resumed_at</code>, switch type.</td><td>setup, compute, verify</td></tr>
+<tr><td><code>controller_state.yml</code></td><td>Reads or updates the JSON on the jump server.</td><td>playbook, compute, failed</td></tr>
+<tr><td><code>run_phase.yml</code></td><td>Section 4.</td><td>playbook, each phase</td></tr>
+<tr><td><code>set_status.yml</code>, <code>mark_phase.yml</code>, <code>step_mark_done.yml</code></td><td>Write <code>status</code>, <code>phases_done</code>/<code>phases_skipped</code>, <code>steps_done</code>.</td><td>run_phase, phases</td></tr>
+<tr><td><code>finish.yml</code>, <code>failed.yml</code></td><td>End of a run.</td><td>playbook</td></tr>
+</tbody></table></div>
+<h3>Guards and helpers</h3>
+<div class="scroll"><table><thead><tr><th>File</th><th>What it does</th><th>Included from</th></tr></thead><tbody>
+<tr><td><code>require_approval.yml</code>, <code>fingerprint.yml</code></td><td>Section 9.</td><td>run_phase, playbook (OEM)</td></tr>
+<tr><td><code>refuse_if_running.yml</code></td><td>Refuses while a long command runs, except this phase's own.</td><td>run_phase</td></tr>
+<tr><td><code>detached.yml</code></td><td>Section 5.</td><td>racli_step, patchmgr_step, precheck_script, compute_pass</td></tr>
+<tr><td><code>racli_step.yml</code>, <code>patchmgr_step.yml</code></td><td>One step, run detached, log checked.</td><td>RA phases, cells, switches</td></tr>
+<tr><td><code>confirm.yml</code></td><td>The YES prompt.</td><td>steps that change something</td></tr>
+<tr><td><code>sql.yml</code></td><td>One SQL statement through <code>zdlra_sql.sh</code>, <code>no_log</code>; sets <code>zdlra_sql_rows</code>.</td><td>quiesce, plan, resume, verify</td></tr>
+<tr><td><code>patch_location.yml</code></td><td>Finds a patch folder from a <code>FILES_*</code> zip name.</td><td>plan, cells, switches</td></tr>
+<tr><td><code>cell_versions.yml</code>, <code>switch_versions.yml</code>, <code>versions.yml</code></td><td>Versions, and the version table.</td><td>plan, cells, switches, postcheck</td></tr>
+<tr><td><code>node_ready.yml</code></td><td>Waits for a node to answer and its database to run.</td><td>compute</td></tr>
+</tbody></table></div>
+<h3>Phases</h3>
+<p>See the table in section 6.</p>
+</main></div>
+</body></html>
