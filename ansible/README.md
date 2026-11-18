@@ -11,6 +11,10 @@ do not mix them within one run.
 
 ## What it does
 
+For a detailed walkthrough with diagrams, see
+[docs/how-it-works-ansible.html](../docs/how-it-works-ansible.html) (download it and open it
+in a browser).
+
 Ansible runs from the jump server (the OMS host) and connects to the appliance's compute
 nodes as root. One playbook covers the whole patch, in the same order as the scripts:
 
