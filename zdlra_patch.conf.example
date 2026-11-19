@@ -3,6 +3,12 @@
 
 RACLI="/opt/oracle.RecoveryAppliance/bin/racli"
 
+# The Oracle precheck, the racli upgrade steps and every patchmgr run in a screen
+# session of their own, as Oracle recommends for patchmgr. A node without screen
+# refuses to start them. "screen -r <session>" shows a running one's log; leave with
+# Ctrl-A then d. The command ignores Ctrl-C, so pressing it there does no harm.
+SCREEN="screen"
+
 # Record that staging/zdlra_stage.sh writes once the patches and the precheck are
 # in place. The precheck phase stops if it is missing, and the approval covers the
 # archive it names. It is written in the unzipped folder, /radump/patches.
@@ -49,7 +55,7 @@ PRECHECK_APPROVAL_MAX_AGE_HOURS=24
 POSTCHECK_RERUN_PRECHECK=1
 
 # --- RA software upgrade (ra_preinstall, ra_alter, ra_update) ----------------
-# Each racli step runs in a session of its own and is never stopped by the script;
+# Each racli step runs in a screen session and is never stopped by the script;
 # past its WARN minutes a warning is logged. In the arguments, {ra_release} is the
 # ZDLRA software zip from the staged record (ra_release=), and {gold_images_path} is
 # RA_GOLD_IMAGES_PATH. The precheck rolls back what ra_preinstall installs, so
@@ -77,7 +83,7 @@ CELL_GROUP_FILE="/root/cell_group"
 CELL_PREREQ_STEP=-patch_check_prereq
 CELL_RECOVERY_STEPS=(-reset_force -cleanup)
 CELL_PATCH_EXTRA_ARGS=()             # none needed (-ignore_alerts is not used); e.g. (-smtp_from ...)
-# patchmgr runs in a session of its own and is never stopped by the script (an
+# patchmgr runs in a screen session and is never stopped by the script (an
 # interrupted patchmgr session can cause major problems). Past this long, the script
 # only logs a warning and keeps waiting.
 CELL_PATCH_WARN_MINUTES=360          # per patchmgr command; about 2 hours for 17 cells
