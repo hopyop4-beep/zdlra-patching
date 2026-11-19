@@ -18,3 +18,4 @@ ansible/inventory/group_vars/*.yml
 ansible/inventory/host_vars/
 ansible/logs/*
 !ansible/logs/.gitkeep
+__pycache__/

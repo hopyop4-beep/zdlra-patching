@@ -41,7 +41,7 @@ are only shown; read-only commands still run. `--check` is also a dry run.
 On the jump server:
 
 ```bash
-python3 -m pip install --user ansible-core    # tested with ansible-core 2.22
+python3 -m pip install --user 'ansible-core>=2.16,<2.17'   # see "Python on the nodes" below
 cd ansible
 cp inventory/hosts.yml.example inventory/hosts.yml
 vi inventory/hosts.yml
@@ -69,6 +69,18 @@ vi inventory/group_vars/all/main.yml          # blackout reason, waivers, verify
   staging scripts as before.
 
 `inventory/hosts.yml`, `vault.yml` and `logs/` are in `.gitignore`.
+
+### Python on the nodes
+
+ZDLRA compute nodes have Python 3.6 (3.6.8). ansible-core 2.17 and later cannot run modules
+on Python 3.6, so use **ansible-core 2.16** on the jump server (2.16 needs Python 3.10 to 3.12
+on the jump server itself). No newer Python is needed on the appliance: leave the nodes'
+Python as it is. If a newer ansible-core is installed by mistake, setup stops at once and
+says so. `zdlra_node_python` (default `/usr/bin/python3`) is the interpreter that check
+reads.
+
+Tested on the stand-in with ansible-core 2.16.3 and 2.16.20 against Python 3.6.15 nodes, and
+with 2.22 against newer Python.
 
 ## Usage
 
