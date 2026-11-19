@@ -67,6 +67,15 @@
   loop_control:
     label: "{{ item.0 }}:{{ item.1 }}"
 
+# The precheck, racli and patchmgr run only in screen sessions: find out now, not mid-window.
+- name: Check screen is on every compute node
+  ansible.builtin.command: "{{ zdlra_detached }} screen_ok"
+  environment:
+    ZDLRA_SCREEN: "{{ zdlra_screen }}"
+  delegate_to: "{{ item }}"
+  loop: "{{ zdlra_nodes }}"
+  changed_when: false
+
 # --- The run --------------------------------------------------------------------------
 - name: Use the run given
   when: zdlra_run_id | length > 0

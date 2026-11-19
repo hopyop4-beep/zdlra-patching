@@ -56,7 +56,7 @@ a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-off
 
 <h2 id="rules" style="border:0;margin-top:24px;padding-top:0">Ground rules the code is built around</h2>
 <div class="rules">
-<div class="rule"><b>Long commands are never killed</b>racli, patchmgr and the Oracle precheck run detached on the node, through <code>zdlra_detached.sh</code>. Ansible only starts them and polls them.</div>
+<div class="rule"><b>Long commands are never killed</b>racli, patchmgr and the Oracle precheck run in a detached screen session on the node, through <code>zdlra_detached.sh</code>. Ansible only starts them and polls them.</div>
 <div class="rule"><b>Nothing runs twice by accident</b>A command still running is waited for. A result an earlier attempt left is used. Versions are read before any repeat patch.</div>
 <div class="rule"><b>Files hold the state</b>The run folder on the node, plus one JSON file on the jump server. Ansible can stop at any point and be run again.</div>
 <div class="rule"><b>No change without approval</b>Patch phases refuse unless the precheck is approved, under 24 hours old, real, and unchanged.</div>
@@ -76,7 +76,7 @@ a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-off
 <rect class="b soft" x="35" y="210" width="260" height="42" rx="5"/><text class="t" x="165" y="228">emcli, sr_jobs_new.ksh</text><text class="s" x="165" y="243">run locally by the oem role</text>
 <rect class="b soft" x="35" y="260" width="260" height="38" rx="5"/><text class="t" x="165" y="276">~/zdlra_ansible_state/</text><text class="s" x="165" y="290">controller record of the run</text>
 <rect class="b lane" x="390" y="20" width="260" height="290" rx="5"/><text class="hd" x="520" y="42" text-anchor="middle">Patch node (first host, db01)</text>
-<rect class="b" x="405" y="56" width="230" height="42" rx="5"/><text class="t" x="520" y="74">zdlra_detached.sh</text><text class="s" x="520" y="89">runs long commands detached</text>
+<rect class="b" x="405" y="56" width="230" height="42" rx="5"/><text class="t" x="520" y="74">zdlra_detached.sh</text><text class="s" x="520" y="89">runs long commands in screen</text>
 <rect class="b" x="405" y="106" width="230" height="42" rx="5"/><text class="t" x="520" y="124">zdlra_sql.sh</text><text class="s" x="520" y="139">SQL*Plus, login on stdin</text>
 <rect class="b ch" x="405" y="156" width="230" height="42" rx="5"/><text class="t" x="520" y="174">racli, precheck</text><text class="s" x="520" y="189">RA upgrade steps</text>
 <rect class="b ch" x="405" y="206" width="230" height="42" rx="5"/><text class="t" x="520" y="224">patchmgr cells, switches</text><text class="s" x="520" y="239">from the patch folders</text>
@@ -97,7 +97,7 @@ a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-off
 <tr><td><code>zdlra_status.yml</code></td><td>patch node</td><td>Shows status, finished and skipped phases, approval and the running step's log, or the report.</td></tr>
 <tr><td><code>roles/zdlra_patch</code></td><td>patch node (and runners)</td><td>Every phase, as task files. Its <code>defaults/main.yml</code> holds every setting of <code>zdlra_patch.conf</code>, with a <code>zdlra_</code> prefix.</td></tr>
 <tr><td><code>roles/oem</code></td><td>jump server</td><td>Login, blackout and jobs.</td></tr>
-<tr><td><code>zdlra_detached.sh</code></td><td>every compute node</td><td>Starts a command in a session of its own and reports on it. Section 5.</td></tr>
+<tr><td><code>zdlra_detached.sh</code></td><td>every compute node</td><td>Starts a command in a detached screen session of its own and reports on it. Section 5.</td></tr>
 <tr><td><code>zdlra_sql.sh</code></td><td>patch node</td><td>Runs SQL*Plus as <code>raAutomation</code>. The connect string and the SQL arrive on stdin, so neither shows in <code>ps</code> or the Ansible output (the tasks are <code>no_log</code>).</td></tr>
 <tr><td><code>filter_plugins/zdlra.py</code></td><td>jump server</td><td>Small parsers: <code>key=value</code> files, <code>imageinfo</code> versions, precheck summaries, the version table.</td></tr>
 </tbody></table>
@@ -140,7 +140,7 @@ a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-off
 <h3>zdlra_patch.yml</h3>
 <p>One play, on <code>&lt;zdlra&gt;[0]</code>, with <code>gather_facts: false</code>, <code>check_mode: false</code> and <code>any_errors_fatal: true</code>. Check mode is off on purpose: read-only commands (<code>racli status</code>, <code>imageinfo</code>, SQL queries) must give real answers in a dry run too. What changes is decided by <code>zdlra_dry_run</code> instead, which <code>--check</code> also sets.</p>
 <ol>
-<li><b>Setup</b> (<code>import_role ... tasks_from: setup</code>, tagged <code>always</code>). Checks the appliance was named and is an inventory group, the user is root and <code>racli</code> is there. Copies the two helpers to every compute node. Picks the run: <code>zdlra_run_id</code> if given (its folder must exist), otherwise a new ID from the node's clock. Creates the run folder and the controller folders, then reads the staged record, the <code>patch.conf_&lt;SR&gt;</code> it names, and the run's own records (<code>read_state.yml</code>).</li>
+<li><b>Setup</b> (<code>import_role ... tasks_from: setup</code>, tagged <code>always</code>). Checks the appliance was named and is an inventory group, the user is root and <code>racli</code> is there. Copies the two helpers to every compute node and checks <code>screen</code> is on each. Picks the run: <code>zdlra_run_id</code> if given (its folder must exist), otherwise a new ID from the node's clock. Creates the run folder and the controller folders, then reads the staged record, the <code>patch.conf_&lt;SR&gt;</code> it names, and the run's own records (<code>read_state.yml</code>).</li>
 <li><b>The patch</b>, one <code>block</code> with a <code>rescue</code>. Each phase is an <code>include_role ... tasks_from: run_phase</code> with <code>apply: {tags: [&lt;phase&gt;]}</code> and the condition <code>'&lt;phase&gt;' not in zdlra_skip_done</code>. <code>zdlra_skip_done</code> is the run's <code>phases_done</code> less anything listed in <code>zdlra_rerun</code>. So running the same command again carries on where it stopped.</li>
 <li><b>OEM steps</b> sit between the phases, tagged <code>oem</code>: a check before the precheck, then (after approval) blackout and jobs suspended, then at the end jobs resumed and blackout ended. A run whose OEM finish already happened is refused, unless its patching is complete.</li>
 <li><b>The end</b>: <code>finish.yml</code> on success, <code>failed.yml</code> in the rescue. Both are applied with tag <code>always</code>, so a run limited with <code>--tags</code> still records its outcome.</li>
@@ -167,7 +167,7 @@ a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-off
 <p>Within a phase, a step that changes the appliance usually goes: show the command (and stop there in a dry run), look for an earlier attempt's result, ask you to type <code>YES</code> (<code>confirm.yml</code>, unless <code>zdlra_confirm_steps=false</code>), run it through <code>racli_step.yml</code> or <code>patchmgr_step.yml</code>, check its log, then read the versions.</p>
 
 <h2 id="s5">5. How long commands are protected from being killed</h2>
-<p>An Ansible task that runs for hours over ssh would die with the connection, and <code>async</code> jobs are tied to Ansible's own bookkeeping. So patchmgr, the racli upgrade steps and Oracle's precheck run through <code>zdlra_detached.sh</code>, and <code>detached.yml</code> only talks to that helper.</p>
+<p>An Ansible task that runs for hours over ssh would die with the connection, and <code>async</code> jobs are tied to Ansible's own bookkeeping. So patchmgr, the racli upgrade steps and Oracle's precheck run through <code>zdlra_detached.sh</code>, and <code>detached.yml</code> only talks to that helper. The helper starts each in a detached <code>screen</code> session of its own, as Oracle recommends for patchmgr: the command has a terminal for anything that needs one (racli once hung without one), ignores Ctrl-C, Ctrl-\, Ctrl-Z and hangups, and writes straight to its log, so even ending the screen session does not stop it. The session's second window follows the log; <code>screen -r &lt;session&gt;</code> on the node shows it.</p>
 <figure><div class="scroll"><svg viewBox="0 0 960 250" style="min-width:760px" role="img" aria-label="How detached.yml starts and polls a long command">
 <defs><marker id="ah4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="currentColor"/></marker></defs>
 <rect class="b lane" x="20" y="20" width="300" height="210" rx="5"/><text class="hd" x="170" y="42" text-anchor="middle">Ansible (detached.yml)</text>
@@ -175,10 +175,10 @@ a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-off
 <rect class="b act" x="35" y="110" width="270" height="42" rx="5"/><text class="t" x="170" y="128">poll LOG PIDF  (until loop)</text><text class="s" x="170" y="143">up to the warn time, then up to 12h</text>
 <rect class="b" x="35" y="164" width="270" height="52" rx="5"/><text class="t" x="170" y="184">STATE=done RC=n</text><text class="s" x="170" y="200">tail the log, check it, collect</text>
 <rect class="b lane" x="400" y="20" width="540" height="210" rx="5"/><text class="hd" x="670" y="42" text-anchor="middle">Node (zdlra_detached.sh)</text>
-<rect class="b ch" x="415" y="56" width="250" height="42" rx="5"/><text class="t" x="540" y="74">setsid nohup wrapper</text><text class="s" x="540" y="89">no terminal, own session</text>
+<rect class="b ch" x="415" y="56" width="250" height="42" rx="5"/><text class="t" x="540" y="74">screen -dmS zdlra_&lt;run&gt;_...</text><text class="s" x="540" y="89">signals ignored, log window</text>
 <rect class="b ch" x="415" y="110" width="250" height="42" rx="5"/><text class="t" x="540" y="128">cd DIR; cmd &gt; LOG 2&gt;&amp;1</text><text class="s" x="540" y="143">no time limit</text>
 <rect class="b" x="415" y="164" width="250" height="52" rx="5"/><text class="t" x="540" y="184">echo $? &gt; LOG.rc</text><text class="s" x="540" y="200">97 = could not enter DIR</text>
-<rect class="b soft" x="690" y="56" width="235" height="160" rx="5"/><text class="t" x="807" y="78">files beside the log</text><text class="s" x="807" y="102">LOG: the output</text><text class="s" x="807" y="122">LOG.rc: exit status</text><text class="s" x="807" y="142">LOG.rc.collected: result used</text><text class="s" x="807" y="162">detached.pid: wrapper pid</text><text class="s" x="807" y="182">detached.log: which LOG runs</text>
+<rect class="b soft" x="690" y="56" width="235" height="160" rx="5"/><text class="t" x="807" y="78">files beside the log</text><text class="s" x="807" y="102">LOG: the output</text><text class="s" x="807" y="122">LOG.rc: exit status</text><text class="s" x="807" y="142">LOG.rc.collected: result used</text><text class="s" x="807" y="162">detached.pid, .screen: pid, session</text><text class="s" x="807" y="182">detached.log: which LOG runs</text>
 <path class="a" d="M305 77 L413 77" marker-end="url(#ah4)"/><path class="a" d="M540 98 L540 108" marker-end="url(#ah4)"/><path class="a" d="M540 152 L540 162" marker-end="url(#ah4)"/>
 <path class="a dash" d="M413 131 L307 131" marker-end="url(#ah4)"/><text class="l" x="360" y="124" text-anchor="middle">reads</text>
 </svg></div><figcaption>If Ansible dies, the wrapper and the command carry on. The next attempt's <code>start</code> sees the PID still alive and prints <code>RUNNING</code>, or sees <code>LOG.rc</code> and prints <code>PENDING</code>; either way it does not start the command again.</figcaption></figure>
@@ -186,6 +186,7 @@ a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-off
 <li><b>start</b> refuses to start a second copy. With a result left (<code>LOG.rc</code> not yet collected), it reports <code>PENDING &lt;rc&gt;</code> and that result is used, unless <code>--fresh</code> (always used for checks, such as the precheck and patchmgr prereq checks).</li>
 <li><b>poll</b> prints <code>STATE=running|done|gone RC= LINES= ELAPSED=</code>. <code>gone</code> means no exit status and no live process: it was killed or the node rebooted. Ansible records that as exit 99, so the next attempt starts it again.</li>
 <li><b>Two waits.</b> The first <code>until</code> loop runs to the step's warn time (for example 240 minutes for <code>ra_update</code>). Past that it prints a warning and keeps waiting, up to <code>zdlra_wait_max_hours</code> (12). Past that it stops watching and fails, saying the command is still running and how to pick it up.</li>
+<li><b>settle</b> waits, once the command has ended, for its screen session to close (it closes itself right after writing the exit status). Until then <code>ps</code> still shows the command line, and the next step would take it for a running command.</li>
 <li><b>collect</b> renames <code>LOG.rc</code> once its result has been used, so a later attempt runs the step again. A successful patch or upgrade is not collected until it is recorded in <code>steps_done</code>, so it can never run twice.</li>
 <li><b>running</b> lists any patchmgr run, racli upgrade step or Oracle precheck on the node (an awk port of the script's <code>find_long_command</code>). <code>refuse_if_running.yml</code> uses it so nothing starts over another long command, except this run's own step of the same phase, which is waited for instead.</li>
 </ul>
@@ -274,7 +275,7 @@ a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-off
 <tr><td><code>precheck_approval.txt</code></td><td>Section 9.</td></tr>
 <tr><td><code>precheck_before/</code>, <code>precheck_after/</code></td><td>Oracle's precheck output, failure and warning lists.</td></tr>
 <tr><td><code>&lt;step&gt;.log</code>, <code>.log.rc</code></td><td>Each long step's output and exit status (<code>ra_update.log</code>, <code>cells_patch.log</code>, ...).</td></tr>
-<tr><td><code>detached.pid</code>, <code>detached.log</code></td><td>The running step's PID and log path, while it runs.</td></tr>
+<tr><td><code>detached.pid</code>, <code>detached.log</code>, <code>detached.screen</code></td><td>The running step's PID, log path and screen session, while it runs.</td></tr>
 <tr><td><code>replication_paused.txt</code>, <code>resumed_at</code></td><td>What quiesce paused, and when resume ran.</td></tr>
 <tr><td><code>snapshot_before/</code>, <code>versions.txt</code>, <code>report.txt</code></td><td>Snapshot, version table, report.</td></tr>
 <tr><td><code>zdlra_patch.log</code></td><td>One line per playbook run: run ID, dry run, tags.</td></tr>

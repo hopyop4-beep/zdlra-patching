@@ -1,6 +1,7 @@
 ---
 # Run a command that must never be cut short (patchmgr, a racli upgrade step, Oracle's
-# precheck) through zdlra_detached.sh, and wait for it. Nothing here ever stops it.
+# precheck) through zdlra_detached.sh, in a detached screen session of its own, and wait
+# for it. Nothing here ever stops it. "screen -r <session>" on the node shows its log.
 #
 # In:  zdlra_job_what       label for messages
 #      zdlra_job_log        its log on the node (its exit status goes to <log>.rc)
@@ -23,6 +24,13 @@
     _job_host: "{{ zdlra_job_host | default(inventory_hostname) }}"
     _job_pid: "{{ zdlra_job_pidfile | default(zdlra_run_dir ~ '/detached.pid') }}"
     _job_own: "{{ zdlra_job_pidfile is not defined }}"
+    # The screen session's name starts with the run and the log, e.g. zdlra_<run>_ra_update.
+    _job_env:
+      ZDLRA_SCREEN: "{{ zdlra_screen }}"
+      ZDLRA_SESSION: >-
+        zdlra_{{ zdlra_run }}_{{ (zdlra_job_log | regex_replace('^' ~ (zdlra_run_dir | regex_escape) ~ '/', '')
+        if zdlra_job_log is match(zdlra_run_dir | regex_escape ~ '/') else zdlra_job_log | basename)
+        | regex_replace('[.](log|txt)$', '') | regex_replace('[^A-Za-z0-9_-]', '_') }}
 
 - name: "{{ zdlra_job_what }}: name its log for the status"
   ansible.builtin.copy:
@@ -31,7 +39,8 @@
     mode: "0640"
   when: _job_own
 
-- name: "{{ zdlra_job_what }}: start it in a session of its own"
+- name: "{{ zdlra_job_what }}: start it in a screen session of its own"
+  environment: "{{ _job_env }}"
   ansible.builtin.command:
     argv: >-
       {{ [zdlra_detached, 'start'] + (['--fresh'] if zdlra_job_fresh | default(false) | bool else [])
@@ -43,8 +52,9 @@
 - name: "{{ zdlra_job_what }}: what happened"
   ansible.builtin.debug:
     msg: >-
-      {% if zdlra_job_start.stdout is match('STARTED') %}Started (pid {{ zdlra_job_start.stdout.split()[1] }}): cd {{ zdlra_job_dir }} && {{ zdlra_job_cmd | join(' ') }}. Log on {{ _job_host }}: {{ zdlra_job_log }}
-      {% elif zdlra_job_start.stdout is match('RUNNING') %}Already running from an earlier attempt (pid {{ zdlra_job_start.stdout.split()[1] }}): waiting for it, not starting it again. Log: {{ zdlra_job_log }}
+      {% set _w = zdlra_job_start.stdout.split() %}{% set _watch = (' Watch it on ' ~ _job_host ~ ': screen -r ' ~ _w[2] ~ ' (leave with Ctrl-A then d)') if _w | length > 2 else '' %}
+      {% if zdlra_job_start.stdout is match('STARTED') %}Started (pid {{ _w[1] }}) in screen session {{ _w[2] | default('?') }}: cd {{ zdlra_job_dir }} && {{ zdlra_job_cmd | join(' ') }}. Log on {{ _job_host }}: {{ zdlra_job_log }}.{{ _watch }}
+      {% elif zdlra_job_start.stdout is match('RUNNING') %}Already running from an earlier attempt (pid {{ _w[1] }}): waiting for it, not starting it again. Log: {{ zdlra_job_log }}.{{ _watch }}
       {% else %}Already finished in an earlier attempt (exit {{ zdlra_job_start.stdout.split()[1] }}): using that result, not running it again. Log: {{ zdlra_job_log }}{% endif %}
 
 - name: "{{ zdlra_job_what }}: wait (up to {{ zdlra_job_warn_minutes }} min before a warning)"
@@ -104,6 +114,21 @@
 - name: "{{ zdlra_job_what }}: read its exit status"
   ansible.builtin.set_fact:
     zdlra_job_rc: "{{ zdlra_job_state | regex_search('RC=([0-9]+)', '\\1') | first | int }}"
+
+# The session closes right after the exit status is written. Until it has, ps still shows
+# the command line, and the next step would take it for a running command.
+- name: "{{ zdlra_job_what }}: wait for its screen session to close"
+  environment: "{{ _job_env }}"
+  ansible.builtin.command: "{{ zdlra_detached }} settle {{ _job_pid }}"
+  delegate_to: "{{ _job_host }}"
+  register: zdlra_job_settle
+  changed_when: false
+  failed_when: false
+
+- name: "{{ zdlra_job_what }}: its screen session is still open"
+  ansible.builtin.debug:
+    msg: "WARNING: screen session {{ zdlra_job_settle.stdout.split()[1] | default('?') }} on {{ _job_host }} is still open after the command finished; close it with: {{ zdlra_screen }} -S {{ zdlra_job_settle.stdout.split()[1] | default('<session>') }} -X quit"
+  when: zdlra_job_settle.stdout is match('OPEN')
 
 - name: "{{ zdlra_job_what }}: tidy up"
   ansible.builtin.file:

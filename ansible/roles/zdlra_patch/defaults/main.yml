@@ -32,6 +32,7 @@ zdlra_min_free_gb: 50
 zdlra_required_user: root
 zdlra_helper_dir: /root/zdlra-ansible           # where the role copies its two helper scripts
 zdlra_dcli: dcli
+zdlra_screen: screen                             # on every compute node: the precheck, racli and patchmgr run in screen
 zdlra_node_python: /usr/bin/python3                 # only read, to check ansible-core suits it
 
 # Ansible polls a long command every this many seconds, and gives up watching after

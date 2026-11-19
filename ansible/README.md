@@ -143,9 +143,13 @@ its name, after you have reviewed it).
 
 ## Long steps
 
-patchmgr, racli and Oracle's precheck are never cut short. They run detached on the node
-(`setsid`, `nohup`), with their exit code and PID recorded beside their log in the run
-folder. Ansible checks on them every `zdlra_poll_seconds` (30). After the step's warn time it
+patchmgr, racli and Oracle's precheck are never cut short. Each runs in a detached `screen`
+session of its own on the node, as Oracle recommends for patchmgr (and as the shell script
+does from v0.8.0). The command ignores Ctrl-C, hangups and the like and writes straight to its
+log, with its exit code and PID recorded beside the log in the run folder. Every compute node
+needs `screen` (`zdlra_screen`); setup checks for it before anything starts. To watch a step
+live, run the `screen -r <session>` command the playbook prints on that node (leave with
+Ctrl-A then d); `zdlra_status.yml` shows it too. Ansible checks on them every `zdlra_poll_seconds` (30). After the step's warn time it
 says so and keeps waiting, up to `zdlra_wait_max_hours` (12). If Ansible stops for any
 reason (the SSH session drops, Ctrl-C, the wait limit), the command keeps running.
 `zdlra_status.yml` shows it and the last lines of its log. Run the playbook again with the
