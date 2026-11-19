@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZDLRA code tracer</title>
+<style>
+:root{--bg:#f4f5f2;--panel:#fff;--ink:#1c2422;--muted:#5a6663;--line:#d3d8d2;--accent:#0b5c6b;--accent-soft:#d9ebee;--sel:#fff3c4;--task:#eef5f0;--soft:#eceee9;--code:#fbfbf9;
+--c-com:#6b7a76;--c-key:#0b5c6b;--c-str:#7a4a12;--c-jin:#6a3f9a;--c-mod:#2f6b3a;--c-num:#9a3412;
+--body:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;color-scheme:light}
+:root[data-theme="dark"]{--bg:#141918;--panel:#1c2321;--ink:#e6ebe8;--muted:#9aa7a2;--line:#33403c;--accent:#6cc3d4;--accent-soft:#17353b;--sel:#3d3618;--task:#1a2a24;--soft:#252c2a;--code:#171d1b;
+--c-com:#7f8f8a;--c-key:#6cc3d4;--c-str:#e0b878;--c-jin:#c4a7f0;--c-mod:#86d196;--c-num:#f0a070;color-scheme:dark}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--body);display:flex;flex-direction:column;overflow:hidden}
+a{color:var(--accent);cursor:pointer;text-decoration:none}a:hover{text-decoration:underline}
+button{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:3px 10px;cursor:pointer}button:hover{border-color:var(--accent)}
+header{display:flex;align-items:center;gap:14px;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:15px;margin:0;white-space:nowrap}header .rev{font:12px var(--mono);color:var(--muted)}
+#search{flex:1;max-width:520px;position:relative}#search input{width:100%;font:inherit;padding:5px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)}
+#results{position:absolute;top:34px;left:0;right:0;background:var(--panel);border:1px solid var(--line);border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,.15);max-height:60vh;overflow:auto;z-index:20;display:none}
+#results div{padding:5px 10px;cursor:pointer;border-bottom:1px solid var(--soft)}#results div:hover,#results div.on{background:var(--accent-soft)}#results small{color:var(--muted);margin-left:6px}
+.spacer{flex:1}
+#main{flex:1;display:grid;grid-template-columns:260px minmax(0,1fr) 430px;min-height:0}
+#side,#explain{overflow:auto;background:var(--panel);min-height:0}#side{border-right:1px solid var(--line)}#explain{border-left:1px solid var(--line);padding:0 16px 40px}
+.tabs{display:flex;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel);z-index:2}.tabs button{flex:1;border:0;border-radius:0;padding:8px 4px;background:none;color:var(--muted);border-bottom:2px solid transparent}.tabs button.on{color:var(--ink);border-bottom-color:var(--accent);font-weight:600}
+#sidebody{padding:8px 0}
+.dir{font-size:12px;color:var(--muted);padding:8px 12px 2px;font-weight:600;letter-spacing:.02em}
+.fl{display:block;padding:2px 12px 2px 20px;color:var(--ink);font:13px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.fl:hover{background:var(--soft);text-decoration:none}.fl.on{background:var(--accent-soft);font-weight:600}.fl .star{color:#c08a00}
+.ol{display:block;padding:2px 10px;color:var(--ink);font-size:13px;border-left:2px solid transparent}.ol:hover{background:var(--soft);text-decoration:none}.ol.on{border-left-color:var(--accent);background:var(--accent-soft)}.ol small{color:var(--muted);font:11px var(--mono)}
+.gl{padding:6px 12px;border-bottom:1px solid var(--soft)}.gl b{font:600 13px var(--mono)}.gl p{margin:2px 0 0;font-size:13px;color:var(--muted)}
+#center{display:flex;flex-direction:column;min-height:0;min-width:0}
+#filehead{padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+#filehead .path{font:600 14px var(--mono)}#filehead .meta{color:var(--muted);font-size:12px;margin-left:8px}
+#filehead details{margin-top:6px}#filehead summary{cursor:pointer;color:var(--muted);font-size:13px}#filehead pre{white-space:pre-wrap;font:13px/1.45 var(--body);margin:6px 0 0;max-height:110px;overflow:auto}
+#code{flex:1;overflow:auto;position:relative;background:var(--code);font:13px/1.55 var(--mono);padding:6px 0 40vh}
+.L{display:flex;white-space:pre;cursor:pointer;min-width:max-content}.L:hover{background:var(--soft)}.L.task{background:var(--task)}.L.sel{background:var(--sel)!important}
+.L .n{flex:none;width:52px;text-align:right;padding-right:14px;color:var(--muted);user-select:none}.L .t{padding-right:24px}
+.L .t a{border-bottom:1px dotted currentColor;color:inherit}.L .t a:hover{background:var(--accent-soft);text-decoration:none}
+.L .t a.k-file,.L .t a.k-role{color:var(--accent);border-bottom-style:solid}
+.com{color:var(--c-com);font-style:italic}.key{color:var(--c-key)}.str{color:var(--c-str)}.jin{color:var(--c-jin)}.mod{color:var(--c-mod);font-weight:600}.num{color:var(--c-num)}
+#explain h2{font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:20px 0 8px;font-weight:600}
+#explain .snip{font:12.5px/1.5 var(--mono);background:var(--code);border:1px solid var(--line);border-radius:6px;padding:6px 10px;white-space:pre-wrap;word-break:break-word;margin-top:14px}
+.card{border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:6px;padding:8px 12px;margin:0 0 8px;background:var(--panel)}
+.card b{display:block;font-size:13.5px}.card p{margin:3px 0 0;font-size:13.5px}.card .doc{white-space:pre-wrap;font-size:13px;color:var(--ink);background:var(--soft);border-radius:4px;padding:5px 8px;margin-top:5px}
+.card.task{border-left-color:#2f6b3a}.card.conn{border-left-color:#7a5c12}.card.concept{border-left-color:#5b4a8a}.card.note{border-left-color:var(--muted)}.card.hi{box-shadow:0 0 0 2px var(--accent)}
+.card ul{margin:4px 0 0;padding-left:18px}.card li{margin:2px 0;font-size:13px}.card .src{font:12px var(--mono);color:var(--muted);display:block;white-space:pre;overflow:hidden;text-overflow:ellipsis}
+.where{font:12px var(--mono)}
+.chain{font:12px var(--mono);margin:4px 0;padding:5px 8px;background:var(--soft);border-radius:4px;line-height:1.7}.chain .arrow{color:var(--muted);padding:0 4px}
+.pill{display:inline-block;font:600 11px var(--body);padding:0 6px;border-radius:3px;background:var(--accent-soft);color:var(--ink);margin-right:4px;vertical-align:1px}
+.empty{color:var(--muted);font-size:13.5px;margin-top:20px}
+textarea{width:100%;font:13px var(--body);border:1px solid var(--line);border-radius:6px;padding:6px 8px;background:var(--bg);color:var(--ink);min-height:60px}
+.row{display:flex;gap:8px;align-items:center;margin-top:6px}.ok{color:#2f6b3a;font-size:13px}
+.help{font-size:13px;color:var(--muted)}.help kbd{font:11px var(--mono);border:1px solid var(--line);border-radius:3px;padding:0 4px;background:var(--soft)}
+@media (max-width:1100px){#main{grid-template-columns:200px minmax(0,1fr) 340px}}
+</style></head><body>
+<header>
+  <h1>ZDLRA code tracer</h1><span class="rev" id="rev"></span>
+  <div id="search"><input id="q" placeholder="Find a file, variable, function, filter or concept…" autocomplete="off"><div id="results"></div></div>
+  <span class="spacer"></span>
+  <button id="back" title="Back (Alt+Left)">← Back</button>
+  <button id="theme" title="Light / dark">Light/Dark</button>
+</header>
+<div id="main">
+  <aside id="side"><div class="tabs"><button data-tab="files" class="on">Files</button><button data-tab="outline">Outline</button><button data-tab="concepts">Concepts</button></div><div id="sidebody"></div></aside>
+  <section id="center"><div id="filehead"></div><div id="code" tabindex="0"></div></section>
+  <aside id="explain"></aside>
+</div>
+<script>const DATA=/*__DATA__*/null;</script>
+<script>
+"use strict";
+const F = DATA.files, S = DATA.symbols, GL = DATA.glossary, CH = DATA.chains;
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let cur = {file: null, line: null, focus: null}, tab = "files";
+
+// ---------- theme ----------
+const prefersDark = matchMedia("(prefers-color-scheme: dark)").matches;
+document.documentElement.dataset.theme = localStorage.getItem("tracer-theme") || (prefersDark ? "dark" : "light");
+$("#theme").onclick = () => { const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = t; localStorage.setItem("tracer-theme", t); };
+$("#rev").textContent = DATA.branch + " @ " + DATA.rev;
+$("#back").onclick = () => history.back();
+
+// ---------- navigation (the URL hash is file:line, so Back works) ----------
+function go(file, line, focus) {
+  const h = "#" + encodeURIComponent(file) + (line != null ? ":" + (line + 1) : "") + (focus ? "|" + encodeURIComponent(focus) : "");
+  if (location.hash !== h) location.hash = h; else route();
+}
+function route() {
+  let h = decodeURIComponent(location.hash.slice(1)), focus = null;
+  if (h.includes("|")) { [h, focus] = [h.slice(0, h.indexOf("|")), h.slice(h.indexOf("|") + 1)]; }
+  let m = h.match(/^(.*?)(?::(\d+))?$/), file = m && m[1], line = m && m[2] ? +m[2] - 1 : null;
+  if (!F[file]) { file = DATA.entries[0]; line = null; }
+  const changed = file !== cur.file;
+  cur = {file, line, focus};
+  if (changed) renderFile();
+  select(line, !changed || line != null);
+  renderSide();
+}
+window.addEventListener("hashchange", route);
+
+// ---------- syntax colouring ----------
+function colour(text, lang) {
+  const cls = new Array(text.length).fill("");
+  const paint = (re, c, grp) => { let m; re.lastIndex = 0; while ((m = re.exec(text))) { let s = m.index, e = s + m[0].length; if (grp) { s = m.index + m[0].indexOf(m[grp]); e = s + m[grp].length; } for (let i = s; i < e; i++) cls[i] = c; if (!m[0].length) re.lastIndex++; } };
+  if (lang === "yaml" || lang === "jinja") {
+    paint(/"(?:[^"\\]|\\.)*"|'[^']*'/g, "str");
+    paint(/^\s*(?:- )?([A-Za-z_][\w.]*)(?=:(\s|$))/g, "key", 1);
+    paint(/\b(ansible\.(builtin|posix|legacy)\.\w+)\b/g, "mod");
+    paint(/\b(true|false|yes|no)\b/g, "num");
+    paint(/\{\{.*?\}\}|\{%.*?%\}/g, "jin");
+    paint(/(^|\s)#.*$/g, "com");
+  } else if (lang === "bash" || lang === "powershell" || lang === "ini") {
+    paint(/"(?:[^"\\]|\\.)*"|'[^']*'/g, "str");
+    paint(/\$\{?[A-Za-z_][\w]*\}?|\$[0-9#?@*$]/g, "jin");
+    paint(/^\s*([A-Za-z_][\w]*)(?=\(\))/g, "mod", 1);
+    paint(/\b(if|then|else|elif|fi|for|while|do|done|case|esac|in|function|return|local|exit)\b/g, "key");
+    paint(/(^|\s)#.*$/g, "com");
+  } else if (lang === "python") {
+    paint(/"(?:[^"\\]|\\.)*"|'[^']*'/g, "str");
+    paint(/\b(def|class|return|for|in|if|elif|else|import|not|and|or|None|True|False)\b/g, "key");
+    paint(/^\s*def\s+(\w+)/g, "mod", 1);
+    paint(/#.*$/g, "com");
+  } else if (lang === "markdown") {
+    paint(/^#+ .*$/g, "key"); paint(/`[^`]*`/g, "jin");
+  }
+  return cls;
+}
+function lineHTML(file, i) {
+  const f = F[file], text = f.lines[i], cls = colour(text, f.lang);
+  const toks = (f.tokens[i] || []).slice().sort((a, b) => a[0] - b[0]);
+  let out = "", pos = 0;
+  const run = (s, e) => { let j = s; while (j < e) { let k = j; while (k < e && cls[k] === cls[j]) k++; const t = esc(text.slice(j, k)); out += cls[j] ? `<span class="${cls[j]}">${t}</span>` : t; j = k; } };
+  for (const [s, e, kind, key] of toks) {
+    if (s < pos) continue;
+    run(pos, s);
+    out += `<a class="k-${kind}" data-k="${esc(key)}" data-kind="${kind}">${esc(text.slice(s, e))}</a>`;
+    pos = e;
+  }
+  run(pos, text.length);
+  return out || " ";
+}
+
+// ---------- the file ----------
+function renderFile() {
+  const f = F[cur.file];
+  const incoming = f.incoming.filter(x => x[2] !== "mention");
+  const mentions = f.incoming.filter(x => x[2] === "mention");
+  let h = `<span class="path">${esc(cur.file)}</span><span class="meta">${f.lines.length} lines · ${esc(kindName(f))}</span>`;
+  if (f.summary) h += `<details open><summary>What this file is for (from its opening comment)</summary><pre>${esc(f.summary)}</pre></details>`;
+  if (f.error) h += `<p class="help">Could not read this as YAML: ${esc(f.error)}</p>`;
+  $("#filehead").innerHTML = h;
+  const code = $("#code");
+  let html = "";
+  for (let i = 0; i < f.lines.length; i++) html += `<div class="L" data-i="${i}"><span class="n">${i + 1}</span><span class="t">${lineHTML(cur.file, i)}</span></div>`;
+  code.innerHTML = html;
+  code.scrollTop = 0;
+}
+function kindName(f) {
+  return ({playbook: "Ansible playbook (where a run starts)", tasks: "Ansible tasks file", defaults: "role defaults (variables)", vars: "inventory variables",
+    inventory: "Ansible inventory (hosts and groups)", config: "YAML settings", bash: "Bash script", python: "Python (Ansible plugin)", jinja: "Jinja template",
+    ini: "Ansible configuration", markdown: "notes", powershell: "PowerShell script", text: "text"})[f.kind] || f.kind;
+}
+$("#code").addEventListener("click", e => {
+  const a = e.target.closest("a[data-k]"), L = e.target.closest(".L");
+  if (!L) return;
+  const i = +L.dataset.i;
+  if (a && (a.dataset.kind === "file") && !a.dataset.k.startsWith("glob:") && (e.metaKey || e.ctrlKey || e.detail === 2)) { go(a.dataset.k, null); return; }
+  go(cur.file, i, a ? a.dataset.k : null);
+});
+
+function select(line, scroll) {
+  document.querySelectorAll(".L.sel,.L.task").forEach(n => n.classList.remove("sel", "task"));
+  const f = F[cur.file];
+  if (line != null) {
+    const t = f.tasks[f.taskOf[line]];
+    if (t) for (let i = t.start; i <= t.end; i++) { const n = $("#code").children[i]; if (n) n.classList.add("task"); }
+    const n = $("#code").children[line];
+    if (n) { n.classList.add("sel"); if (scroll) { const c = $("#code"), r = n.offsetTop; if (r < c.scrollTop + 40 || r > c.scrollTop + c.clientHeight - 80) c.scrollTop = r - c.clientHeight / 3; } }
+  }
+  renderExplain();
+}
+
+// keyboard: up/down (or j/k) move between lines
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+  const f = F[cur.file];
+  if (["ArrowDown", "j"].includes(e.key) || ["ArrowUp", "k"].includes(e.key)) {
+    e.preventDefault();
+    const d = (e.key === "ArrowDown" || e.key === "j") ? 1 : -1;
+    const n = Math.max(0, Math.min(f.lines.length - 1, (cur.line == null ? -1 : cur.line) + d));
+    history.replaceState(null, "", "#" + encodeURIComponent(cur.file) + ":" + (n + 1));
+    cur.line = n; cur.focus = null; select(n, true); renderSide();
+  } else if (e.key === "/") { e.preventDefault(); $("#q").focus(); }
+});
+
+// ---------- explanations ----------
+function concept(key) {
+  if (GL[key]) return GL[key];
+  return null;
+}
+function lineConcepts(f, i) {
+  const keys = (f.concepts[i] || []).slice(), text = f.lines[i];
+  if (f.lang === "yaml") {
+    if (/^\s*- /.test(text) && !keys.includes("yaml:comment")) keys.unshift("yaml:list_item");
+    if (/:\s*["']\{\{/.test(text) && !keys.includes("yaml:quoted")) keys.push("yaml:quoted");
+  }
+  return keys;
+}
+function where(f, l, label) { return `<a class="where" onclick="go('${esc(f)}',${l})">${esc(label || (f.split("/").pop() + ":" + (l + 1)))}</a>`; }
+function srcLine(f, l) { return F[f] ? `<span class="src">${esc(F[f].lines[l].trim().slice(0, 110))}</span>` : ""; }
+
+function symbolCard(key, hi) {
+  if (key.startsWith("glob:")) {
+    const fs = key.slice(5).split("|");
+    return `<div class="card conn ${hi ? "hi" : ""}"><b>Leads to one of ${fs.length} files</b><p>The file name has a variable in it, so which file runs depends on its value at run time.</p><ul>${fs.map(p => `<li><a onclick="go('${esc(p)}',null)">${esc(p.split("/").pop())}</a></li>`).join("")}</ul></div>`;
+  }
+  if (F[key]) {
+    const f = F[key];
+    return `<div class="card conn ${hi ? "hi" : ""}"><b>Opens <a onclick="go('${esc(key)}',null)">${esc(key)}</a></b><p>${esc(kindName(f))}${f.summary ? ": " + esc(f.summary.split("\n").slice(0, 3).join(" ")) : ""}</p><p class="help">Click the link (or double-click the name in the code) to open it.</p></div>`;
+  }
+  if (key.startsWith("role:")) {
+    const r = key.slice(5);
+    const fs = Object.keys(F).filter(p => p.startsWith(`ansible/roles/${r}/`));
+    return `<div class="card conn ${hi ? "hi" : ""}"><b>Role <code>${esc(r)}</code></b><p>A role is a folder of related tasks, defaults and files under ansible/roles/${esc(r)}/. Its tasks/ files are run with include_role, its defaults/main.yml supplies default variables, its files/ and templates/ are copied to the hosts.</p><ul>${fs.slice(0, 12).map(p => `<li><a onclick="go('${esc(p)}',null)">${esc(p.slice(15 + r.length))}</a></li>`).join("")}${fs.length > 12 ? `<li>… ${fs.length - 12} more in Files</li>` : ""}</ul></div>`;
+  }
+  const s = S[key];
+  if (!s) { const g = concept(key); return g ? `<div class="card concept ${hi ? "hi" : ""}"><b>${esc(g[0])}</b><p>${esc(g[1])}</p></div>` : ""; }
+  const kindTxt = {var: "Ansible variable", shvar: "Shell variable", func: "Function", filter: "Custom Jinja filter", test: "Custom Jinja test"}[s.kind] || s.kind;
+  let h = `<div class="card conn ${hi ? "hi" : ""}"><b><span class="pill">${kindTxt}</span><code>${esc(s.title)}</code></b>`;
+  const magic = GL["magic:" + s.title];
+  if (magic && s.kind === "var") h += `<p>${esc(magic[1])}</p>`;
+  if (s.defs.length) {
+    h += `<p>${s.defs.length === 1 ? "Defined" : `Defined in ${s.defs.length} places`}:</p><ul>`;
+    for (const d of s.defs.slice(0, 12)) h += `<li>${where(d.f, d.l)} <span class="help">${esc(d.how)}</span>${srcLine(d.f, d.l)}${d.doc ? `<div class="doc">${esc(d.doc)}</div>` : ""}</li>`;
+    if (s.defs.length > 12) h += `<li class="help">… and ${s.defs.length - 12} more</li>`;
+    h += `</ul>`;
+    if (s.kind === "var" && s.defs.some(d => /role default/.test(d.how))) h += `<p class="help">A role default can be overridden in inventory group_vars, or with -e ${esc(s.title)}=… on the command line.</p>`;
+  } else if (s.kind === "var") {
+    h += `<p class="help">Not set anywhere in the code: it comes from the command line (-e ${esc(s.title)}=…) or Ansible itself.</p>`;
+  }
+  const uses = s.uses;
+  if (uses.length) {
+    const id = "u" + Math.random().toString(36).slice(2);
+    h += `<p>Used in ${uses.length} place${uses.length > 1 ? "s" : ""}:</p><ul id="${id}">`;
+    uses.forEach((u, n) => { h += `<li ${n >= 15 ? 'style="display:none"' : ""}>${where(u.f, u.l)}${srcLine(u.f, u.l)}</li>`; });
+    h += `</ul>${uses.length > 15 ? `<a onclick="document.querySelectorAll('#${id} li').forEach(x=>x.style.display='');this.remove()">Show all ${uses.length}</a>` : ""}`;
+  }
+  return h + `</div>`;
+}
+
+function taskCard(f, t) {
+  const g = GL["module:" + t.module];
+  const chain = [];
+  let p = t.parent;
+  while (p != null) { chain.unshift(f.tasks[p]); p = f.tasks[p].parent; }
+  let h = `<div class="card task"><b>${t.kind === "function" ? "Inside the function " : t.module === "block" ? "Inside the block " : "Part of the task "}“${esc(t.name || "(no name)")}”</b>`;
+  h += `<p class="where">${where(cur.file, t.start, "lines " + (t.start + 1) + "–" + (t.end + 1))}</p>`;
+  if (chain.length) h += `<p class="help">Inside: ${chain.map(c => where(cur.file, c.start, "“" + (c.name || c.module) + "”")).join(" › ")}</p>`;
+  if (t.comment) h += `<div class="doc">${esc(t.comment)}</div>`;
+  if (g && t.kind !== "function") h += `<p><b style="display:inline">${esc(g[0])}:</b> ${esc(g[1])}</p>`;
+  const kws = (t.keys || []).filter(k => ["when", "loop", "delegate_to", "register", "until", "block", "rescue", "tags", "no_log", "run_once"].includes(k));
+  if (kws.length) h += `<p class="help">This task also uses: ${kws.map(k => `<code>${k}</code>`).join(", ")}${kws.includes("when") ? " (it may be skipped)" : ""}${kws.includes("loop") ? " (it repeats)" : ""}${kws.includes("delegate_to") ? " (it runs on another machine)" : ""}.</p>`;
+  if (t.leads_to && t.leads_to.length) h += `<p>Runs: ${t.leads_to.map(p => `<a onclick="go('${esc(p)}',null)">${esc(p.split("/").pop())}</a>`).join(", ")}</p>`;
+  return h + `</div>`;
+}
+
+function chainsHTML(file) {
+  const cs = CH[file];
+  if (!cs) return "";
+  return cs.slice(0, 5).map(c => `<div class="chain">${c.map(([f, l]) => where(f, l, f.split("/").pop() + ":" + (l + 1))).join('<span class="arrow">→</span>')}<span class="arrow">→</span><b>${esc(file.split("/").pop())}</b></div>`).join("") + (cs.length > 5 ? `<p class="help">… and ${cs.length - 5} more paths</p>` : "");
+}
+
+function renderExplain() {
+  const f = F[cur.file], i = cur.line, ex = $("#explain");
+  let h = "";
+  if (i == null) {
+    h += `<h2>How to use this</h2><p class="help">Click any line of code to see what it does, the Ansible or Bash idea behind it, and where it connects. Underlined words are links: click one to see where it is defined and used. Double-click a file name to open it. <kbd>↑</kbd>/<kbd>↓</kbd> move line by line, <kbd>/</kbd> searches, Back returns to where you were.</p>`;
+    h += fileContext(f);
+    ex.innerHTML = h; return;
+  }
+  const text = f.lines[i];
+  h += `<div class="snip"><span class="help">${esc(cur.file.split("/").pop())}:${i + 1}</span>\n${esc(text) || " "}</div>`;
+
+  // what the line connects to
+  const toks = f.tokens[i] || [];
+  const seen = new Set(), conns = [];
+  for (const [s, e, kind, key] of toks) {
+    if (seen.has(key) || kind === "gloss" || kind === "module") continue;
+    seen.add(key); conns.push(key);
+  }
+  if (cur.focus && conns.includes(cur.focus)) { conns.splice(conns.indexOf(cur.focus), 1); conns.unshift(cur.focus); }
+  if (cur.focus && !conns.includes(cur.focus) && (S[cur.focus] || GL[cur.focus])) conns.unshift(cur.focus);
+
+  let connH = "";
+  if (conns.length) {
+    connH = `<h2>Where it connects</h2>`;
+    conns.forEach(k => { connH += symbolCard(k, k === cur.focus); });
+  }
+  if (cur.focus) h += connH;
+
+  // concepts on this line
+  const cks = lineConcepts(f, i).filter(k => !(cur.focus && k === cur.focus));
+  const notes = f.notes[i] || [];
+  if (notes.length || cks.length) {
+    h += `<h2>What this line is</h2>`;
+    for (const n of notes) h += `<div class="card note"><p>${esc(n)}</p></div>`;
+    for (const k of cks) { const g = concept(k); if (g) h += `<div class="card concept"><b>${esc(g[0])}</b><p>${esc(g[1])}</p></div>`; }
+  }
+  if (!text.trim()) h += `<p class="empty">A blank line: it separates tasks or sections, and means nothing to Ansible.</p>`;
+
+  if (!cur.focus) h += connH;
+
+  const t = f.tasks[f.taskOf[i]];
+  if (t) h += `<h2>The bigger picture</h2>` + taskCard(f, t);
+  h += fileContext(f, !!t);
+  h += askBox(f, i, t);
+  ex.innerHTML = h;
+  ex.scrollTop = 0;
+  wireAsk();
+}
+
+function fileContext(f, small) {
+  let h = "";
+  const ch = chainsHTML(cur.file);
+  if (ch) h += `<h2>How a run gets to this file</h2><p class="help">Each line is a path from a playbook you run, through the includes, to here.</p>` + ch;
+  const inc = f.incoming.filter(x => x[2] !== "mention");
+  const men = f.incoming.filter(x => x[2] === "mention" && !inc.some(y => y[0] === x[0]));
+  if (inc.length) h += `<h2>Included or copied from</h2><div class="card conn"><ul>${inc.slice(0, 30).map(([ff, l, how]) => `<li>${where(ff, l)} <span class="help">${esc(how)}</span>${srcLine(ff, l)}</li>`).join("")}</ul></div>`;
+  if (men.length) h += `<h2>Mentioned in</h2><div class="card note"><ul>${men.slice(0, 20).map(([ff, l]) => `<li>${where(ff, l)}${srcLine(ff, l)}</li>`).join("")}</ul>${men.length > 20 ? `<p class="help">… and ${men.length - 20} more</p>` : ""}</div>`;
+  if (!ch && !inc.length && DATA.entries.includes(cur.file)) h += `<h2>Where it starts</h2><div class="card note"><p>This is a starting point: you run it yourself${f.lang === "yaml" ? " with ansible-playbook" : ""}. Nothing includes it.</p></div>`;
+  return h;
+}
+
+// ---------- ask Claude ----------
+function askBox(f, i, t) {
+  return `<h2>Ask Claude about this line</h2><textarea id="askq" placeholder="Your question (optional)">${esc(localStorage.getItem("tracer-q") || "")}</textarea>
+  <div class="row"><button id="askcopy">Copy question with the code</button><span id="askok" class="ok"></span></div>
+  <p class="help">Copies your question, this line and the task around it, so you can paste it into a chat with Claude.</p>`;
+}
+function wireAsk() {
+  const b = $("#askcopy"); if (!b) return;
+  $("#askq").oninput = e => localStorage.setItem("tracer-q", e.target.value);
+  b.onclick = async () => {
+    const f = F[cur.file], i = cur.line, t = f.tasks[f.taskOf[i]];
+    const s = t ? t.start : Math.max(0, i - 8), e = t ? Math.min(t.end, t.start + 60) : Math.min(f.lines.length - 1, i + 8);
+    let snippet = "";
+    for (let n = s; n <= e; n++) snippet += (n === i ? ">> " : "   ") + String(n + 1).padStart(4) + "  " + f.lines[n] + "\n";
+    const q = $("#askq").value.trim() || "Explain what the marked line does in this script, and the Ansible (or Bash) concept behind it. I'm new to Ansible.";
+    const txt = `I'm learning Ansible by reading the zdlra-patching repo (${DATA.branch} @ ${DATA.rev}).\n\nFile: ${cur.file}, line ${i + 1}` + (t ? `, in ${t.kind === "function" ? "the function" : "the task"} "${t.name}"` : "") + `\n\n\`\`\`\n${snippet}\`\`\`\n\n${q}`;
+    try { await navigator.clipboard.writeText(txt); }
+    catch (err) { const ta = document.createElement("textarea"); ta.value = txt; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+    $("#askok").textContent = "Copied. Paste it into Claude.";
+    setTimeout(() => { const o = $("#askok"); if (o) o.textContent = ""; }, 4000);
+  };
+}
+
+// ---------- sidebar ----------
+document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => { tab = b.dataset.tab; document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x === b)); renderSide(); });
+function renderSide() {
+  const body = $("#sidebody");
+  if (tab === "files") {
+    const groups = {};
+    for (const p of Object.keys(F).sort()) { const d = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "(top)"; (groups[d] = groups[d] || []).push(p); }
+    const order = Object.keys(groups).sort((a, b) => (a.startsWith("ansible") ? 0 : 1) - (b.startsWith("ansible") ? 0 : 1) || a.localeCompare(b));
+    let h = `<div class="dir">Start here (★ = you run it)</div>` + DATA.entries.map(p => `<a class="fl ${p === cur.file ? "on" : ""}" onclick="go('${p}',null)" title="${p}"><span class="star">★</span> ${esc(p)}</a>`).join("");
+    for (const d of order) h += `<div class="dir">${esc(d)}/</div>` + groups[d].map(p => `<a class="fl ${p === cur.file ? "on" : ""}" onclick="go('${p}',null)" title="${p}">${esc(p.split("/").pop())}</a>`).join("");
+    if (body.dataset.tab !== "files") { body.innerHTML = h; body.dataset.tab = "files"; }
+    else { body.innerHTML = h; }
+  } else if (tab === "outline") {
+    const f = F[cur.file], cur_t = cur.line != null ? f.taskOf[cur.line] : null;
+    let h = f.tasks.length ? "" : `<p class="empty" style="padding:0 12px">No tasks or functions in this file.</p>`;
+    for (const t of f.tasks) h += `<a class="ol ${t.id === cur_t ? "on" : ""}" style="padding-left:${10 + t.depth * 14}px" onclick="go(cur.file,${t.start})">${esc(t.name || "(" + t.module + ")")} <small>${t.start + 1}</small></a>`;
+    body.innerHTML = h;
+  } else {
+    const groups = [["module", "Modules (what a task does)"], ["task", "Task keywords"], ["play", "Play keywords"], ["filter", "Jinja filters"], ["test", "Jinja tests"], ["magic", "Built-in variables"], ["jinja", "Jinja syntax"], ["yaml", "YAML syntax"], ["bash", "Bash"], ["tool", "Oracle tools"], ["cfg", "ansible.cfg"]];
+    let h = "";
+    for (const [g, label] of groups) {
+      h += `<div class="dir">${label}</div>`;
+      for (const k of Object.keys(GL).filter(k => k.startsWith(g + ":"))) h += `<div class="gl"><b>${esc(GL[k][0])}</b><p>${esc(GL[k][1])}</p></div>`;
+    }
+    body.innerHTML = h;
+  }
+}
+
+// ---------- search ----------
+const index = [];
+for (const p of Object.keys(F)) index.push({label: p.split("/").pop(), sub: p, go: () => go(p, null), kind: 0});
+for (const [k, s] of Object.entries(S)) {
+  const d = s.defs[0] || s.uses[0];
+  if (d) index.push({label: s.title, sub: ({var: "variable", shvar: "shell variable", func: "function", filter: "filter", test: "test"}[s.kind] || s.kind) + " · " + d.f.split("/").pop(), go: () => go(d.f, d.l, k), kind: 1});
+}
+for (const [k, g] of Object.entries(GL)) if (!k.startsWith("note:") && !k.startsWith("cfilter") && !k.startsWith("ctest")) index.push({label: g[0], sub: "concept", go: () => { tab = "concepts"; document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x.dataset.tab === "concepts")); renderSide(); $("#explain").innerHTML = `<h2>Concept</h2><div class="card concept"><b>${esc(g[0])}</b><p>${esc(g[1])}</p></div>`; }, kind: 2});
+let hits = [], hsel = 0;
+$("#q").addEventListener("input", e => {
+  const q = e.target.value.trim().toLowerCase(), r = $("#results");
+  if (!q) { r.style.display = "none"; return; }
+  hits = index.filter(x => x.label.toLowerCase().includes(q) || x.sub.toLowerCase().includes(q))
+    .sort((a, b) => (a.label.toLowerCase().startsWith(q) ? 0 : 1) - (b.label.toLowerCase().startsWith(q) ? 0 : 1) || a.kind - b.kind || a.label.length - b.label.length).slice(0, 40);
+  hsel = 0; showHits();
+});
+function showHits() {
+  const r = $("#results");
+  r.innerHTML = hits.map((x, n) => `<div data-n="${n}" class="${n === hsel ? "on" : ""}">${esc(x.label)}<small>${esc(x.sub)}</small></div>`).join("") || `<div>No match</div>`;
+  r.style.display = "block";
+}
+$("#results").addEventListener("mousedown", e => { const d = e.target.closest("[data-n]"); if (d) { hits[+d.dataset.n].go(); $("#results").style.display = "none"; $("#q").blur(); } });
+$("#q").addEventListener("keydown", e => {
+  if (e.key === "ArrowDown") { hsel = Math.min(hits.length - 1, hsel + 1); showHits(); e.preventDefault(); }
+  else if (e.key === "ArrowUp") { hsel = Math.max(0, hsel - 1); showHits(); e.preventDefault(); }
+  else if (e.key === "Enter" && hits[hsel]) { hits[hsel].go(); $("#results").style.display = "none"; $("#q").blur(); }
+  else if (e.key === "Escape") { $("#results").style.display = "none"; $("#q").blur(); }
+});
+$("#q").addEventListener("blur", () => setTimeout(() => $("#results").style.display = "none", 150));
+
+route();
+</script>
+</body></html>
