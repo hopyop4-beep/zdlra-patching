@@ -185,6 +185,7 @@ oem_state_dir: $Z/ctl
 oem_emcli: $Z/bin/emcli
 oem_jobs_dir: $Z/oem
 oem_blackout_reason: Patch
+zdlra_node_python: $(command -v python3)
 V
 cat > "$Z/inventory.yml" <<V
 all:

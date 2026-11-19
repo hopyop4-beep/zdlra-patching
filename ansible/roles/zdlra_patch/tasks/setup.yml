@@ -23,6 +23,28 @@
     zdlra_current_phase: setup
     zdlra_preserve_status: true
 
+# ansible-core 2.17 and later cannot run modules on Python 3.6, which ZDLRA nodes have
+# (3.6.8). Their failure is cryptic, so this asks first, without Python (raw).
+- name: Read the node's Python version
+  ansible.builtin.raw: "{{ zdlra_node_python }} -c 'import sys; print(\"%d.%d\" % sys.version_info[:2])'"
+  register: zdlra_node_py
+  changed_when: false
+  failed_when: false
+
+- name: Check this ansible-core can run on it
+  vars:
+    _py: "{{ zdlra_node_py.stdout | default('') | trim }}"
+  ansible.builtin.assert:
+    that: >-
+      _py is not match('^[0-9]+\.[0-9]+$')
+      or _py is version('3.7', '>=')
+      or ansible_version.full is version('2.17', '<')
+    fail_msg: >-
+      {{ inventory_hostname }} has Python {{ _py }}, which ansible-core {{ ansible_version.full }} cannot
+      use (2.17 and later need Python 3.7 or later on the nodes). Install ansible-core 2.16 on this
+      host: python3 -m pip install --user 'ansible-core>=2.16,<2.17' (it needs Python 3.10 to 3.12 here).
+    quiet: true
+
 - name: Check the user on the node
   ansible.builtin.command: id -un
   register: zdlra_id
@@ -44,6 +66,15 @@
   loop: "{{ zdlra_nodes | product(['zdlra_detached.sh', 'zdlra_sql.sh']) | list }}"
   loop_control:
     label: "{{ item.0 }}:{{ item.1 }}"
+
+# The precheck, racli and patchmgr run only in screen sessions: find out now, not mid-window.
+- name: Check screen is on every compute node
+  ansible.builtin.command: "{{ zdlra_detached }} screen_ok"
+  environment:
+    ZDLRA_SCREEN: "{{ zdlra_screen }}"
+  delegate_to: "{{ item }}"
+  loop: "{{ zdlra_nodes }}"
+  changed_when: false
 
 # --- The run --------------------------------------------------------------------------
 - name: Use the run given

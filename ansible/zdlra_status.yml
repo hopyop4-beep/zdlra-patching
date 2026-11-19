@@ -39,6 +39,8 @@
               p=$(tr -dc 0-9 < "$dir/detached.pid" 2>/dev/null)
               if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then echo "Running: pid $p"; fi
               log="$step"; echo "Step log: $log"
+              scr="$(cat "$dir/detached.screen" 2>/dev/null)"
+              [ -z "$scr" ] || echo "Screen:  screen -r $scr   (leave with Ctrl-A then d)"
             fi
             echo "Last log lines:"
             tail -n 15 "$log" 2>/dev/null | sed 's/^/  /'
