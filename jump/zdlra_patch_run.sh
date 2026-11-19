@@ -23,11 +23,12 @@
 #
 # Compute nodes ("compute" in the phase list): patchmgr runs on one compute node and
 # upgrades another, which reboots. First the first node upgrades each of the others,
-# one at a time; then the second node upgrades the first. Each patchmgr runs detached
-# on its node (own session, log and exit-status file there), so nothing can cut it
+# one at a time; then the second node upgrades the first. Each patchmgr runs in a
+# screen session on its node (log and exit-status file there), so nothing can cut it
 # short; this script only starts it over ssh and polls it, through the reboots. For
 # each pass, a db_nodes file listing only the node being patched is written for this
-# run. Each pass: patchmgr -precheck (-nomodify_at_prereq), then -upgrade, then
+# run. "screen -r" on that node shows the log, as Oracle recommends for patchmgr.
+# Each pass: patchmgr -precheck (-nomodify_at_prereq), then -upgrade, then
 # imageinfo on the patched node must show TARGET_COMPUTE_VERSION.
 #
 # Ctrl-C while watching stops watching only; the work on the node continues.
@@ -100,6 +101,7 @@ COMPUTE_TMP_DIR="/radump/patches/tmp"          # where staging unzipped the db_s
 COMPUTE_FILES_DIR="/radump/patches/patches"    # the computepatch (iso repo) is here
 COMPUTE_WORK_DIR="/radump/zdlra_compute"       # per run: db_nodes files, logs, exit status
 NODE_DCLI="dcli"
+NODE_SCREEN="screen"           # on the compute nodes: every patchmgr runs in a screen session
 COMPUTE_WARN_MINUTES=240        # past this, a warning only; patchmgr is never stopped
 COMPUTE_POLL_SECONDS=60
 COMPUTE_VERSION_WAIT_MINUTES=60 # a patched node not answering after this long stops the run (patchmgr has ended)
@@ -494,15 +496,20 @@ compute_passes() {
     echo "${C_NODES[1]} ${C_NODES[0]}"
 }
 
-# Start patchmgr detached on a node. Fails if one is already running there.
+# Start patchmgr in a screen session on a node, as Oracle recommends. Fails if one is
+# already running there. The command ignores Ctrl-C, Ctrl-\, Ctrl-Z and hangups and
+# writes straight to its log, so neither ssh nor ending the session can stop it; the
+# session's second window follows the log, and is what "screen -r" shows.
 # $1 = runner, $2 = job name (log/rc/pid file prefix), rest = patchmgr arguments.
 start_remote_patchmgr() {
     local runner="$1" job="$2"; shift 2
-    local work="${COMPUTE_WORK_DIR}/${RUN_ID}" a args=""
+    local work="${COMPUTE_WORK_DIR}/${RUN_ID}" a args="" session
+    session="zdlra_${RUN_ID}_${job}_$(date +%H%M%S)"
     for a in "$@"; do args+=" '$a'"; done
-    on_script "$runner" "bash -s -- '$C_DIR' '$work' '$job' $args" <<'REMOTE'
-dir=$1 work=$2 job=$3; shift 3
+    on_script "$runner" "bash -s -- '$NODE_SCREEN' '$session' '$C_DIR' '$work' '$job' $args" <<'REMOTE'
+scr=$1 session=$2 dir=$3 work=$4 job=$5; shift 5
 log=$work/$job.log rc=$work/$job.rc pidf=$work/$job.pid
+command -v "$scr" >/dev/null 2>&1 || { echo "ERROR screen not found on $(hostname) ($scr): patchmgr runs only in a screen session"; exit 1; }
 if ps -eo args= 2>/dev/null | grep -Eq '[p]atchmgr .*(-dbnodes|-cells|--roceswitches)'; then
     echo "ERROR a patchmgr is already running on $(hostname)"; exit 3
 fi
@@ -510,14 +517,18 @@ mkdir -p "$work" || { echo "ERROR cannot create $work"; exit 1; }
 # Keep the log of an earlier attempt: it may be the only record of what happened.
 [ ! -s "$log" ] || mv -f "$log" "$log.$(date +%Y%m%d_%H%M%S)"
 : > "$log"; rm -f "$rc" "$pidf"
-L="nohup"; command -v setsid >/dev/null 2>&1 && L="setsid nohup"
-$L bash -c 'echo $$ > "$1"; cp "$1" "$(dirname "$1")/running.pid"; cd "$2" || { echo 97 > "$0"; exit; }; shift 3; ./patchmgr "$@"; echo $? > "$0"' \
-    "$rc" "$pidf" "$dir" _ "$@" >> "$log" 2>&1 < /dev/null &
-# However slow the start, wait for its own record of its pid while it is alive.
-p=$!
-while [ ! -s "$pidf" ] && [ ! -s "$rc" ] && kill -0 "$p" 2>/dev/null; do sleep 1; done
-[ -s "$pidf" ] || [ -s "$rc" ] || { echo "ERROR patchmgr did not start"; exit 1; }
-echo "STARTED pid $(cat "$pidf")"
+w='trap "" INT QUIT TSTP HUP; echo $$ > "$1"; cp "$1" "$(dirname "$1")/running.pid"; cd "$2" || { echo 97 > "$0"; exit 97; }; l=$3; shift 3; ./patchmgr "$@" >> "$l" 2>&1; echo $? > "$0"; "$ZDLRA_SCREEN" -S "$STY" -X quit >/dev/null 2>&1'
+ZDLRA_SCREEN="$scr" "$scr" -dmS "$session" bash -c "$w" "$rc" "$pidf" "$dir" "$log" "$@" < /dev/null >> "$log" 2>&1 \
+    || { echo "ERROR could not start a screen session on $(hostname)"; exit 1; }
+# However slow the start, wait for its own record of its pid while the session is there.
+n=0
+while [ ! -s "$pidf" ] && [ ! -s "$rc" ]; do
+    if ! "$scr" -ls 2>/dev/null | grep -q "[0-9]\.$session[[:space:]]" && [ "$n" -ge 10 ]; then break; fi
+    sleep 1; n=$((n + 1))
+done
+[ -s "$pidf" ] || [ -s "$rc" ] || { echo "ERROR patchmgr did not start in screen session $session"; exit 1; }
+"$scr" -S "$session" -X screen -t log tail -n +1 -F "$log" >/dev/null 2>&1 || true
+echo "STARTED pid $(cat "$pidf" 2>/dev/null) in screen session $session"
 REMOTE
 }
 
@@ -562,6 +573,10 @@ wait_remote_patchmgr() {
         fi
         sleep "$COMPUTE_POLL_SECONDS"
     done
+    # The screen session closes right after the exit status is written. Until it has, ps
+    # there still shows the patchmgr command line, and the next start would refuse.
+    on "$runner" "for i in \$(seq 30); do $NODE_SCREEN -ls 2>/dev/null | grep -q '[0-9]\.zdlra_${RUN_ID}_${job}_[0-9]*[[:space:]]' || exit 0; sleep 1; done; exit 1" 2>/dev/null \
+        || warn "The screen session of $job on $runner is still open (or $runner isn't answering); carrying on."
     [[ ! -s "$local_log" ]] || mv -f "$local_log" "${local_log}.$(date +%Y%m%d_%H%M%S)"
     local tries=0
     until on "$runner" "cat '$work/$job.log'" > "$local_log" 2>/dev/null; do
@@ -692,6 +707,7 @@ compute_pass() {
                 || die "$runner: a patchmgr is running there, or dbnodeupdate.zip could not be unzipped in $C_DIR"
             out="$(start_remote_patchmgr "$runner" "precheck_${target}" "${common[@]}" -precheck -nomodify_at_prereq)" || die "$runner: $out"
             info "$runner: patchmgr -precheck ${out#STARTED }"
+            info "  Watch it: ssh -t ${SSH_USER}@${runner} $NODE_SCREEN -r ${out##* }   (leave with Ctrl-A then d)"
         fi
     fi
     if [[ "$from" == precheck || "$from" == precheck_wait ]]; then
@@ -719,6 +735,7 @@ compute_pass() {
                     [[ -n "$ver" ]] || warn "Could not read the version of $target before starting."
                     out="$(start_remote_patchmgr "$runner" "upgrade_${target}" "${common[@]}" -upgrade)" || die "$runner: $out"
                     info "$runner: patchmgr -upgrade ${out#STARTED } ($target reboots)"
+                    info "  Watch it: ssh -t ${SSH_USER}@${runner} $NODE_SCREEN -r ${out##* }   (leave with Ctrl-A then d)"
                 fi ;;
         esac
     fi
@@ -791,6 +808,8 @@ step_preflight() {
     on_node true || die "Cannot ssh to ${SSH_USER}@${NODE} without a password."
     on_node "[ -x '$REMOTE_SCRIPT' ] && [ -f '$REMOTE_CONFIG' ]" \
         || die "${NODE}: $REMOTE_SCRIPT or $REMOTE_CONFIG not found."
+    on_node "command -v '$NODE_SCREEN' >/dev/null 2>&1" \
+        || die "${NODE}: screen not found ($NODE_SCREEN). The precheck, racli and patchmgr run only in screen sessions."
     # A dry-run blackout start checks the emcli login, reason and targets without creating anything.
     local saved=$DRY_RUN
     DRY_RUN=1; blackout start || { DRY_RUN=$saved; die "Blackout settings are not ready (see above)."; }
@@ -841,7 +860,7 @@ check_phase_list() {
 compute_check_nodes() {
     local n out sha first=""
     for n in "${C_NODES[@]}"; do
-        out="$(on "$n" "[ -f '$C_ISO' ] || echo 'MISSING $C_ISO'; [ -x '$C_DIR/patchmgr' ] || echo 'MISSING $C_DIR/patchmgr'; echo \"SHA \$(sed -n 's/^sha256=//p' '$NODE_STAGED_RECORD' 2>/dev/null)\"" 2>/dev/null)" \
+        out="$(on "$n" "[ -f '$C_ISO' ] || echo 'MISSING $C_ISO'; [ -x '$C_DIR/patchmgr' ] || echo 'MISSING $C_DIR/patchmgr'; command -v '$NODE_SCREEN' >/dev/null 2>&1 || echo 'MISSING screen ($NODE_SCREEN)'; echo \"SHA \$(sed -n 's/^sha256=//p' '$NODE_STAGED_RECORD' 2>/dev/null)\"" 2>/dev/null)" \
             || die "$n isn't answering, so can't check its compute patch."
         ! grep -q '^MISSING' <<<"$out" || die "$n: $(grep '^MISSING' <<<"$out" | tr '\n' ' ')"
         sha="$(sed -n 's/^SHA //p' <<<"$out")"

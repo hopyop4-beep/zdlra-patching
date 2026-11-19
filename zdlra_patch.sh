@@ -23,7 +23,7 @@
 #               precheck put in /radump: installs the new grid and DB homes
 #   ra_update   racli update appliance --ignore_incidents: patches the appliance
 #               (about 2 hours). The three racli steps need an approved precheck,
-#               run in a session of their own and are never cut short
+#               run in screen sessions of their own and are never cut short
 #   cells       patch the storage cells with patchmgr from the cell patch folder,
 #               then check every cell is on TARGET_CELL_VERSION (needs an approved
 #               precheck)
@@ -73,7 +73,7 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
-VERSION="0.7.8"
+VERSION="0.8.0"
 
 ALL_PHASES=(precheck quiesce snapshot ra_preinstall ra_alter ra_update cells switches admin_switches postcheck resume report verify)
 
@@ -99,6 +99,9 @@ SKIP_BACKUP_WAIT=0
 CONTINUE=0
 
 RACLI="/opt/oracle.RecoveryAppliance/bin/racli"
+# The Oracle precheck, the racli upgrade steps and patchmgr run in screen sessions; a
+# node without screen refuses to start them.
+SCREEN="screen"
 # Written by staging/zdlra_stage.sh once the patches and precheck are in place.
 # It names the archive and the patch.conf_<SR> it set up (patch_conf=...).
 STAGED_RECORD="/radump/patches/ZDLRA_STAGED.txt"
@@ -128,8 +131,8 @@ POSTCHECK_RERUN_PRECHECK=1      # 1 = run the same script again after patching
 
 # RA software upgrade (ra_preinstall, ra_alter, ra_update). In the arguments,
 # {ra_release} is the ZDLRA software zip from the staged record (ra_release=) and
-# {gold_images_path} is RA_GOLD_IMAGES_PATH. Each step runs in a session of its own
-# and is never stopped by this script; past its WARN minutes a warning is logged.
+# {gold_images_path} is RA_GOLD_IMAGES_PATH. Each step runs in a screen session of its
+# own and is never stopped by this script; past its WARN minutes a warning is logged.
 RA_PREINSTALL_ARGS=(run preinstall --zdlra_release_file={ra_release})
 RA_PREINSTALL_SUCCESS="End: ra_preinstall post cleanup"
 RA_PREINSTALL_FAIL_RE='(CHECK|HOST):.*FAIL'     # any such line fails the step
@@ -531,6 +534,9 @@ show_status() {
     if [[ -f "$step_log" ]]; then
         log="$step_log"
         echo "Step log: $log"
+        local session
+        session="$(cat "${dir}/detached.screen" 2>/dev/null || true)"
+        [[ -z "$session" ]] || echo "Screen:  screen -r $session   (leave with Ctrl-A then d)"
     fi
     echo "Last log lines:"
     tail -n 15 "$log" 2>/dev/null | sed 's/^/  /'
@@ -558,8 +564,8 @@ log_item_changes() {
 
 # Run the external precheck script, in dry-run mode too, so a dry run gives real
 # answers. It is not read-only: it installs and rolls back an RPM and moves the gold
-# images. So, like patchmgr and racli, it runs in a session of its own and is never
-# stopped by this script (run_detached).
+# images. So, like patchmgr and racli, it runs in a screen session of its own and is
+# never stopped by this script (run_detached).
 # Failures and warnings are read from the lines after PRECHECK_SUMMARY_HEADER, e.g.
 #   FAILURE SUMMARY
 #   ***********************************
@@ -903,6 +909,8 @@ phase_precheck() {
     # patch steps refuse until this one passes and is approved.
     rm -f -- "${RUN_DIR}/precheck_passed" "${RUN_DIR}/precheck_approval.txt"
     phase_undone precheck
+    # Every long command runs in screen: find out now, not in the window.
+    screen_ready
     run_ro "$RACLI" version || warn "racli version failed"
     run_ro "$RACLI" status appliance || die "Appliance status check failed"
 
@@ -1223,22 +1231,42 @@ report_cell_plan() {
 # ---------------------------------------------------------------------------
 # Commands that must never be cut short (patchmgr, and the racli upgrade steps)
 # ---------------------------------------------------------------------------
-# run_detached starts the command in a session of its own (setsid, nohup, no
-# terminal), writing straight to its log: nothing that happens to this script or the
-# operator's ssh session can reach it. This script only waits, shows the log as it
-# grows, and reads the exit status from a file. Nothing here ever stops the command:
+# run_detached starts the command in a detached screen session of its own, as Oracle
+# recommends for patchmgr: the command has a terminal (the screen window) for anything
+# that needs one, and nothing that happens to this script or the operator's ssh session
+# can reach it. The command ignores Ctrl-C, Ctrl-\, Ctrl-Z and hangups, and writes
+# straight to its log file, so even ending the screen session doesn't stop it. The
+# session's second window follows the log, and is what "screen -r" shows. This script
+# only waits, shows the log as it grows, and reads the exit status from a file. Nothing here ever stops the command:
 # there is no time limit (past WARN minutes a warning is logged), and if this script
 # itself stops, the run's status says the command is still running and the lock
 # passes to it, so nothing can start over it.
 DETACHED_PID=""
 DETACHED_LOG=""
 DETACHED_WHAT=""
+DETACHED_SCREEN=""
 DETACHED_RC=""
 DETACHED_POLL_SECONDS=10
 DETACHED_QUIET=0                # 1 = do not show the log as it grows, or add it to the run log
 DETACHED_FRESH=0                # 1 = always run the command, ignoring a result left by an earlier attempt
 
 detached_pidfile() { echo "${RUN_DIR}/detached.pid"; }
+
+# Is screen here? Every long command needs it: there is no other way to start one.
+screen_ready() {
+    command -v "$SCREEN" >/dev/null 2>&1 \
+        || die "screen not found ($SCREEN): the precheck, racli and patchmgr run only in a screen session. Install screen, or set SCREEN in $CONFIG_FILE."
+}
+
+# Does a screen session with exactly this name exist? $1 = name
+screen_session_exists() { "$SCREEN" -ls 2>/dev/null | grep -q "[0-9]\.${1}[[:space:]]"; }
+
+# What a session's first window runs: ignore Ctrl-C, Ctrl-\, Ctrl-Z and hangups (the
+# command inherits that), record its pid, run the command with its output going straight
+# to the log, record the exit status, then close the session.
+# $0 = .rc file, $1 = pid file, $2 = folder, $3 = log, rest = the command.
+# shellcheck disable=SC2016
+DETACHED_WRAPPER='trap "" INT QUIT TSTP HUP; echo $$ > "$1"; cd "$2" || { echo 97 > "$0"; exit 97; }; l=$3; shift 3; "$@" >> "$l" 2>&1; echo $? > "$0"; "$ZDLRA_SCREEN" -S "$STY" -X quit >/dev/null 2>&1'
 
 # The command this run started, if it is still running: prints "pid N".
 detached_running() {
@@ -1256,7 +1284,7 @@ detached_leave_running() {
     # A signal just as it started: its own record of its pid may be all there is.
     [[ -z "$DETACHED_WHAT" || -n "$DETACHED_PID" ]] || DETACHED_PID="$(cat "$(detached_pidfile)" 2>/dev/null || true)"
     [[ -n "$DETACHED_PID" ]] && kill -0 "$DETACHED_PID" 2>/dev/null || return 1
-    err "Stopping the script, NOT ${DETACHED_WHAT}: it keeps running (pid $DETACHED_PID). Log: $DETACHED_LOG"
+    err "Stopping the script, NOT ${DETACHED_WHAT}: it keeps running (pid $DETACHED_PID${DETACHED_SCREEN:+, screen session $DETACHED_SCREEN}). Log: $DETACHED_LOG"
     err "Do not start it again until it has finished."
     set_status "${DETACHED_WHAT} still running (pid $DETACHED_PID), log $DETACHED_LOG; do not start it again until it finishes"
     echo "$DETACHED_PID" > "$LOCK_FILE"
@@ -1293,7 +1321,7 @@ run_detached() {
     fi
     if (( ! DETACHED_FRESH )) && pending_result "$log"; then
         DETACHED_RC="$(tr -dc '0-9' < "$rcfile")"
-        rm -f -- "$pidfile" "${RUN_DIR}/detached.log"
+        rm -f -- "$pidfile" "${RUN_DIR}/detached.log" "${RUN_DIR}/detached.screen"
         warn "$what already finished in an earlier attempt (exit $DETACHED_RC): using that result, not running it again. Log: $log"
         (( DETACHED_QUIET )) || cat "$log" >> "$LOG_FILE"
         if (( DETACHED_RC == 97 )); then
@@ -1302,37 +1330,51 @@ run_detached() {
         fi
         return 0
     fi
+    screen_ready
     rm -f -- "$rcfile" "$pidfile"
     echo "$log" > "${RUN_DIR}/detached.log"
     # Keep the log of an earlier attempt: it may be the only record of what happened.
     [[ ! -s "$log" ]] || mv -f -- "$log" "${log}.$(date +%Y%m%d_%H%M%S)"
     : > "$log"
-    info "[exec] cd $dir && $* (own session; log: $log)"
+    # Named after the run and the log, with the time, so no two attempts share a name.
+    local session base
+    base="${log#"${RUN_DIR}/"}"; base="${base%.log}"
+    session="zdlra_${RUN_ID}_$(tr -c 'A-Za-z0-9_\n-' '_' <<<"$base")_$(date +%H%M%S)"
+    echo "$session" > "${RUN_DIR}/detached.screen"
+    info "[exec] cd $dir && $* (screen session $session; log: $log)"
 
-    local launcher=(nohup)
-    if command -v setsid >/dev/null 2>&1; then
-        launcher=(setsid nohup)
-    else
-        warn "setsid not found: $what runs with nohup only."
-    fi
     # Set first, so a signal at any moment from here leaves the command alone and hands
     # it the lock.
     DETACHED_LOG="$log"
     DETACHED_WHAT="$what"
+    DETACHED_SCREEN="$session"
     trap detached_on_signal INT TERM HUP
-    # The inner bash records its pid, runs the command, then writes the exit status.
-    "${launcher[@]}" bash -c 'echo $$ > "$1"; cd "$2" || { echo 97 > "$0"; exit 97; }; shift 3; "$@"; echo $? > "$0"' \
-        "$rcfile" "$pidfile" "$dir" _ "$@" >> "$log" 2>&1 < /dev/null &
-    DETACHED_PID=$!
-    # However slow the start, wait for its own record of its pid while it is alive.
-    while [[ ! -s "$pidfile" && ! -s "$rcfile" ]] && kill -0 "$DETACHED_PID" 2>/dev/null; do sleep 1; done
+    if ! ZDLRA_SCREEN="$SCREEN" "$SCREEN" -dmS "$session" bash -c "$DETACHED_WRAPPER" \
+            "$rcfile" "$pidfile" "$dir" "$log" "$@" < /dev/null >> "$log" 2>&1; then
+        DETACHED_PID=""
+        script_signal_traps
+        die "$what: could not start a screen session. Log: $log"
+    fi
+    # However slow the start, wait for its own record of its pid while the session is
+    # there. A session that hasn't appeared after 10 seconds didn't start.
+    local waited=0
+    while [[ ! -s "$pidfile" && ! -s "$rcfile" ]]; do
+        if ! screen_session_exists "$session" && (( waited >= 10 )); then break; fi
+        sleep 1; waited=$((waited + 1))
+    done
     if [[ -s "$pidfile" ]]; then
         DETACHED_PID="$(cat "$pidfile")"
     elif [[ ! -s "$rcfile" ]]; then
         DETACHED_PID=""
         script_signal_traps
-        die "$what did not start. Log: $log"
+        die "$what did not start in screen session $session. Log: $log"
     fi
+    # The window "screen -r" shows: the log, so Ctrl-C there only stops tail.
+    "$SCREEN" -S "$session" -X screen -t log tail -n +1 -F "$log" >/dev/null 2>&1 \
+        || ! screen_session_exists "$session" \
+        || warn "Could not add the log window to screen session $session; the log is $log"
+    info "$what is running in screen session $session. Watch it with: screen -r $session"
+    info "  (leave with Ctrl-A then d; Ctrl-C there only stops the log view, and the command ignores it)"
 
     # Show the log as it grows: print the lines added since the last look, and once
     # more at the end so nothing is missed.
@@ -1362,10 +1404,15 @@ run_detached() {
         sleep "$DETACHED_POLL_SECONDS"
     done
     show_new_lines
+    # The session closes right after the exit status is written. Wait for that: until it
+    # has, ps still shows the command line, and the next step would see it as running.
+    local closing=0
+    while screen_session_exists "$session" && (( closing < 30 )); do sleep 1; closing=$((closing + 1)); done
+    (( closing < 30 )) || warn "Screen session $session is still open after the command finished; close it with: $SCREEN -S $session -X quit"
     script_signal_traps
     DETACHED_RC="$(tr -dc '0-9' < "$rcfile")"
     DETACHED_PID=""
-    rm -f -- "$pidfile" "${RUN_DIR}/detached.log"
+    rm -f -- "$pidfile" "${RUN_DIR}/detached.log" "${RUN_DIR}/detached.screen"
     (( DETACHED_QUIET )) || cat "$log" >> "$LOG_FILE"
     if (( DETACHED_RC == 97 )); then
         collect_result "$log"

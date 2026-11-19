@@ -15,10 +15,21 @@ How far each finding was checked:
   check it on the real system. That applies most to 27b and 37.
 - The other findings come from the review and have not been checked separately.
 
+## Changed 2026-11-13: long commands run in screen
+
+The Oracle precheck, the three racli steps and every `patchmgr` (cells, switches, admin switches and
+the compute passes from the jump server) now run in a detached `screen` session instead of
+`setsid nohup` with no terminal. racli once hung by hand under `nohup ... &` when it wanted the
+terminal, and Oracle recommends screen or VNC for `patchmgr`. The wrapper ignores Ctrl-C, Ctrl-\,
+Ctrl-Z and hangups, and the output still goes straight to the log file, so ending the session
+doesn't stop the command. A node without screen refuses the step. The scripts wait for the session
+to close before the next step, so its command line in `ps` isn't taken for a running command.
+Tested with a `screen` stand-in on the PC only.
+
 ## Fixed: was "fix before any real run"
 
 Fixed on `main`, tested with stand-ins on a PC only. Still to check on a real appliance:
-`sqlplus` really running the blocks, `setsid`, and `ps` output.
+`sqlplus` really running the blocks, `screen`, and `ps` output.
 
 1. **Replication never paused or resumed.** PL/SQL blocks had no closing `/`. `sql_exec` now adds
    one to blocks only, so a plain statement doesn't run twice. The `sqlplus` stand-in now only runs

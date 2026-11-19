@@ -38,13 +38,18 @@ step 5.
 
 Run these by hand on node 1, and note what each prints.
 
-- [ ] **`setsid` keeps a command alive.** This is the protection against `patchmgr` and `racli` being
-      cut short. It couldn't be tested on the PC. Run this, close the ssh session, log back in after
-      2 minutes, and check the file exists:
+- [ ] **A screen session keeps a command alive.** This is the protection against `patchmgr` and
+      `racli` being cut short. It was tested on the PC with a stand-in only. Run this, then attach with
+      `screen -r ztest`, press Ctrl-C (it must be ignored), detach with Ctrl-A then d, close the ssh
+      session, log back in after 2 minutes, and check the file says `survived 0`:
 
   ```bash
-  setsid nohup bash -c 'sleep 90; echo survived > /tmp/setsid_test' >/dev/null 2>&1 </dev/null &
+  screen -dmS ztest bash -c 'trap "" INT QUIT TSTP HUP; sleep 90 >> /tmp/screen_test.log 2>&1; echo "survived $?" > /tmp/screen_test'
   ```
+
+- [ ] **racli under screen.** The first real `ra_preinstall` shows whether racli is happy in a screen
+      session (it once hung under `nohup ... &` by hand). Watch it with the `screen -r` command the
+      script prints, and note anything odd.
 
 - [ ] **Version formats:**
   - Does `racli version` contain `TARGET_RA_VERSION` as written in the conf file?
