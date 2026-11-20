@@ -38,6 +38,8 @@ header h1{font-size:15px;margin:0;white-space:nowrap}header .rev{font:12px var(-
 #explain .snip{font:12.5px/1.5 var(--mono);background:var(--code);border:1px solid var(--line);border-radius:6px;padding:6px 10px;white-space:pre-wrap;word-break:break-word;margin-top:14px}
 .card{border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:6px;padding:8px 12px;margin:0 0 8px;background:var(--panel)}
 .card b{display:block;font-size:13.5px}.card p{margin:3px 0 0;font-size:13.5px}.card .doc{white-space:pre-wrap;font-size:13px;color:var(--ink);background:var(--soft);border-radius:4px;padding:5px 8px;margin-top:5px}
+.card.plain{border-left-color:#c08a00}.card.plain p{margin:0 0 5px}.card.plain p:last-child{margin-bottom:0}.card code,.card.plain code{font:12.5px var(--mono);background:var(--soft);border-radius:3px;padding:0 3px}
+.calls{margin:4px 0 0;padding-left:18px}.calls li{font-size:13px;margin:2px 0}.calls .how{color:var(--muted);font-size:12px}
 .card.task{border-left-color:#2f6b3a}.card.conn{border-left-color:#7a5c12}.card.concept{border-left-color:#5b4a8a}.card.note{border-left-color:var(--muted)}.card.hi{box-shadow:0 0 0 2px var(--accent)}
 .card ul{margin:4px 0 0;padding-left:18px}.card li{margin:2px 0;font-size:13px}.card .src{font:12px var(--mono);color:var(--muted);display:block;white-space:pre;overflow:hidden;text-overflow:ellipsis}
 .where{font:12px var(--mono)}
@@ -74,6 +76,20 @@ const prefersDark = matchMedia("(prefers-color-scheme: dark)").matches;
 document.documentElement.dataset.theme = localStorage.getItem("tracer-theme") || (prefersDark ? "dark" : "light");
 $("#theme").onclick = () => { const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = t; localStorage.setItem("tracer-theme", t); };
 $("#rev").textContent = DATA.branch + " @ " + DATA.rev;
+if (DATA.title) { document.querySelector("header h1").textContent = DATA.title; document.title = DATA.title; }
+if (DATA.placeholder) $("#q").placeholder = DATA.placeholder;
+const LEARN = DATA.learning || "Ansible";
+const NODES = DATA.nodes || {}, CALLS = DATA.calls || {}, FCH = DATA.fchains || {};
+// `code` and {{L:n}} (a line of this file) in the plain-words sentences
+function md(s) {
+  return esc(s).replace(/`([^`]*)`/g, (m, c) => `<code>${c}</code>`).replace(/\{\{L:(\d+)\}\}/g, (m, n) => where(cur.file, +n - 1, "line " + n))
+    .replace(/\b(lines?) (\d+)( (?:to|and) (\d+))?/g, (m, w, a, rest, b) => `${w} ${where(cur.file, +a - 1, a)}${rest ? rest.replace(b, where(cur.file, +b - 1, b)) : ""}`);
+}
+function nodeLink(k, l, f) {
+  const n = NODES[k];
+  if (!n) return esc(k);
+  return where(f != null ? f : n.f, l != null ? l : n.l, n.label + (l != null ? " · line " + (l + 1) : ""));
+}
 $("#back").onclick = () => history.back();
 
 // ---------- navigation (the URL hash is file:line, so Back works) ----------
@@ -154,7 +170,8 @@ function renderFile() {
 function kindName(f) {
   return ({playbook: "Ansible playbook (where a run starts)", tasks: "Ansible tasks file", defaults: "role defaults (variables)", vars: "inventory variables",
     inventory: "Ansible inventory (hosts and groups)", config: "YAML settings", bash: "Bash script", python: "Python (Ansible plugin)", jinja: "Jinja template",
-    ini: "Ansible configuration", markdown: "notes", powershell: "PowerShell script", text: "text"})[f.kind] || f.kind;
+    ini: "Ansible configuration", markdown: "notes", powershell: "PowerShell script (not explained here)", text: "text",
+    conf: "settings file (the script reads it with source)"})[f.kind] || f.kind;
 }
 $("#code").addEventListener("click", e => {
   const a = e.target.closest("a[data-k]"), L = e.target.closest(".L");
@@ -221,6 +238,9 @@ function symbolCard(key, hi) {
   }
   const s = S[key];
   if (!s) { const g = concept(key); return g ? `<div class="card concept ${hi ? "hi" : ""}"><b>${esc(g[0])}</b><p>${esc(g[1])}</p></div>` : ""; }
+  if (s.kind === "dyn") {
+    return `<div class="card conn ${hi ? "hi" : ""}"><b><span class="pill">Function picked at run time</span><code>${esc(s.title)}</code></b><p>The function's name is built from a variable, so which one runs depends on its value. It can be any of these ${s.defs.length}:</p><ul>${s.defs.map(d => `<li>${where(d.f, d.l, d.how)}${d.doc ? ` <span class="help">${esc(d.doc)}</span>` : ""}</li>`).join("")}</ul></div>`;
+  }
   const kindTxt = {var: "Ansible variable", shvar: "Shell variable", func: "Function", filter: "Custom Jinja filter", test: "Custom Jinja test"}[s.kind] || s.kind;
   let h = `<div class="card conn ${hi ? "hi" : ""}"><b><span class="pill">${kindTxt}</span><code>${esc(s.title)}</code></b>`;
   const magic = GL["magic:" + s.title];
@@ -234,6 +254,12 @@ function symbolCard(key, hi) {
   } else if (s.kind === "var") {
     h += `<p class="help">Not set anywhere in the code: it comes from the command line (-e ${esc(s.title)}=…) or Ansible itself.</p>`;
   }
+  if (s.kind === "func" && s.defs.length) {
+    const fk = key;
+    const c = CALLS[fk];
+    if (c && c.callers.length) h += `<p class="help">Called from ${c.callers.length} place${c.callers.length > 1 ? "s" : ""}; open the definition to see them all and the chain of calls that leads there.</p>`;
+  }
+  if (s.kind === "shvar" && s.value != null && s.defs.length) h += `<p class="help">Default value: <code>${esc(s.value.slice(0, 120))}</code></p>`;
   const uses = s.uses;
   if (uses.length) {
     const id = "u" + Math.random().toString(36).slice(2);
@@ -249,7 +275,7 @@ function taskCard(f, t) {
   const chain = [];
   let p = t.parent;
   while (p != null) { chain.unshift(f.tasks[p]); p = f.tasks[p].parent; }
-  let h = `<div class="card task"><b>${t.kind === "function" ? "Inside the function " : t.module === "block" ? "Inside the block " : "Part of the task "}“${esc(t.name || "(no name)")}”</b>`;
+  let h = `<div class="card task"><b>${t.kind === "function" ? "Inside the function " : t.kind === "heredoc" ? "Inside the here-document " : t.module === "block" ? "Inside the block " : "Part of the task "}“${esc(t.name || "(no name)")}”</b>`;
   h += `<p class="where">${where(cur.file, t.start, "lines " + (t.start + 1) + "–" + (t.end + 1))}</p>`;
   if (chain.length) h += `<p class="help">Inside: ${chain.map(c => where(cur.file, c.start, "“" + (c.name || c.module) + "”")).join(" › ")}</p>`;
   if (t.comment) h += `<div class="doc">${esc(t.comment)}</div>`;
@@ -257,7 +283,67 @@ function taskCard(f, t) {
   const kws = (t.keys || []).filter(k => ["when", "loop", "delegate_to", "register", "until", "block", "rescue", "tags", "no_log", "run_once"].includes(k));
   if (kws.length) h += `<p class="help">This task also uses: ${kws.map(k => `<code>${k}</code>`).join(", ")}${kws.includes("when") ? " (it may be skipped)" : ""}${kws.includes("loop") ? " (it repeats)" : ""}${kws.includes("delegate_to") ? " (it runs on another machine)" : ""}.</p>`;
   if (t.leads_to && t.leads_to.length) h += `<p>Runs: ${t.leads_to.map(p => `<a onclick="go('${esc(p)}',null)">${esc(p.split("/").pop())}</a>`).join(", ")}</p>`;
-  return h + `</div>`;
+  h += `</div>`;
+  if (t.key) h += callsHTML(t.key, t.name);
+  else if (t.kind === "heredoc") {
+    const k = Object.keys(NODES).find(k => k === "top:" + cur.file + "@" + (t.start + 2));
+    if (k) h += callsHTML(k, "this script");
+  }
+  return h;
+}
+function callsHTML(key, name) {
+  const c = CALLS[key] || {callers: [], calls: []};
+  let h = "";
+  const ch = FCH[key];
+  if (ch && ch.length) {
+    h += `<h2>How a run gets here</h2><p class="help">Each line is a chain of calls, from a script you run down to ${esc(name)}.</p>`;
+    h += ch.map(path => `<div class="chain">${path.map(([k, f, l, how]) => nodeLink(k, l, f) + (how && how !== "call" ? ` <span class="help">(${esc(how)})</span>` : "")).join('<span class="arrow">→</span>')}<span class="arrow">→</span><b>${esc(name)}</b></div>`).join("");
+  } else if (!c.callers.length) {
+    h += `<h2>How a run gets here</h2><p class="help">Nothing in this repo calls ${esc(name)} by name${key.startsWith("func:") ? "" : ""}.</p>`;
+  }
+  const list = (arr, id, isCaller) => {
+    let out = `<ul class="calls" id="${id}">`;
+    arr.forEach(([k, f, l, how], n) => {
+      const site = where(f, l, (NODES[k] ? NODES[k].label : k) + " · line " + (l + 1));
+      out += `<li ${n >= 12 ? 'style="display:none"' : ""}>${isCaller ? site : where(NODES[k] ? NODES[k].f : f, NODES[k] ? NODES[k].l : l, NODES[k] ? NODES[k].label : k) + ` <span class="how">at ${where(f, l, "line " + (l + 1))}</span>`}${how && how !== "call" ? ` <span class="how">${esc(how)}</span>` : ""}${isCaller ? srcLine(f, l) : ""}</li>`;
+    });
+    return out + `</ul>` + (arr.length > 12 ? `<a onclick="document.querySelectorAll('#${id} li').forEach(x=>x.style.display='');this.remove()">Show all ${arr.length}</a>` : "");
+  };
+  if (c.callers.length) h += `<h2>Called from (${c.callers.length})</h2><div class="card conn">${list(c.callers, "cr" + Math.random().toString(36).slice(2), true)}</div>`;
+  const uniq = [], seen = new Set();
+  for (const x of c.calls) if (!seen.has(x[0])) { seen.add(x[0]); uniq.push(x); }
+  if (uniq.length) h += `<h2>It calls (${uniq.length})</h2><div class="card conn">${list(uniq, "cl" + Math.random().toString(36).slice(2), false)}</div>`;
+  return h;
+}
+function topLevelCard(f, i) {
+  let h = `<div class="card task"><b>Outside any function</b><p>Bash reads a script from the top and runs each line outside a function when it gets to it. A function definition is only remembered; its lines run later, when something calls it.</p>`;
+  if (f.start === i) h += `<p>This is the line where the script's real work starts: everything above it only set defaults and defined functions.</p>`;
+  else if (f.start != null) h += `<p>In this script the real work starts at ${where(cur.file, f.start, "line " + (f.start + 1))}${f.start > i ? ", after every function is defined" : ""}.</p>`;
+  h += `</div>`;
+  const key = "top:" + cur.file;
+  if (CALLS[key] && CALLS[key].callers.length) h += `<h2>This script is run by</h2><div class="card conn"><ul class="calls">${CALLS[key].callers.map(([k, ff, l, how]) => `<li>${where(ff, l, (NODES[k] ? NODES[k].label : k) + " · line " + (l + 1))} <span class="how">${esc(how)}</span>${srcLine(ff, l)}</li>`).join("")}</ul></div>`;
+  return h;
+}
+// The nearest comment block above line i, inside the same function (not its header comment).
+function noteAbove(f, i) {
+  if (/^\s*#/.test(f.lines[i]) || !f.lines[i].trim()) return null;
+  const t = f.tasks[f.taskOf[i]];
+  const lo = t ? t.start + 1 : 0;
+  const ind = x => x.match(/^\s*/)[0].length, mine = ind(f.lines[i]);
+  let j = i - 1;
+  while (j >= lo && !/^\s*#/.test(f.lines[j])) {
+    const l = f.lines[j];
+    if (l.trim() === "") return null;
+    // left this block, or passed the end of another one: that comment is about something else
+    if (ind(l) < mine || (ind(l) === mine && /^\s*(fi|done|esac|\})\b/.test(l))) return null;
+    j--;
+  }
+  if (j < lo) return null;
+  let s = j;
+  while (s - 1 >= lo && /^\s*#/.test(f.lines[s - 1])) s--;
+  if (/^#!/.test(f.lines[s])) return null;
+  const text = f.lines.slice(s, j + 1).map(x => x.replace(/^\s*# ?/, "")).filter(x => !/^-{5,}$/.test(x.trim())).join("\n").trim();
+  return text ? {start: s, text} : null;
 }
 
 function chainsHTML(file) {
@@ -270,12 +356,16 @@ function renderExplain() {
   const f = F[cur.file], i = cur.line, ex = $("#explain");
   let h = "";
   if (i == null) {
-    h += `<h2>How to use this</h2><p class="help">Click any line of code to see what it does, the Ansible or Bash idea behind it, and where it connects. Underlined words are links: click one to see where it is defined and used. Double-click a file name to open it. <kbd>↑</kbd>/<kbd>↓</kbd> move line by line, <kbd>/</kbd> searches, Back returns to where you were.</p>`;
+    h += DATA.help ? `<h2>How to use this</h2><p class="help">${esc(DATA.help)}</p>` : `<h2>How to use this</h2><p class="help">Click any line of code to see what it does, the Ansible or Bash idea behind it, and where it connects. Underlined words are links: click one to see where it is defined and used. Double-click a file name to open it. <kbd>↑</kbd>/<kbd>↓</kbd> move line by line, <kbd>/</kbd> searches, Back returns to where you were.</p>`;
     h += fileContext(f);
     ex.innerHTML = h; return;
   }
   const text = f.lines[i];
   h += `<div class="snip"><span class="help">${esc(cur.file.split("/").pop())}:${i + 1}</span>\n${esc(text) || " "}</div>`;
+  const plain = f.plain && f.plain[i];
+  if (plain && plain.length) h += `<h2>In plain words</h2><div class="card plain">${plain.map(p => `<p>${md(p)}</p>`).join("")}</div>`;
+  const above = f.plain ? noteAbove(f, i) : null;
+  if (above) h += `<div class="card note"><b>The comment above this part</b><div class="doc">${esc(above.text)}</div><p class="help">${where(cur.file, above.start, "line " + (above.start + 1))}</p></div>`;
 
   // what the line connects to
   const toks = f.tokens[i] || [];
@@ -302,12 +392,13 @@ function renderExplain() {
     for (const n of notes) h += `<div class="card note"><p>${esc(n)}</p></div>`;
     for (const k of cks) { const g = concept(k); if (g) h += `<div class="card concept"><b>${esc(g[0])}</b><p>${esc(g[1])}</p></div>`; }
   }
-  if (!text.trim()) h += `<p class="empty">A blank line: it separates tasks or sections, and means nothing to Ansible.</p>`;
+  if (!text.trim()) h += `<p class="empty">A blank line: it separates ${LEARN === "Bash" ? "parts of the script" : "tasks or sections"}, and means nothing to ${esc(LEARN)}.</p>`;
 
   if (!cur.focus) h += connH;
 
   const t = f.tasks[f.taskOf[i]];
   if (t) h += `<h2>The bigger picture</h2>` + taskCard(f, t);
+  else if (f.lang === "bash" && f.plain && text.trim() && !/^\s*#/.test(text)) h += `<h2>The bigger picture</h2>` + topLevelCard(f, i);
   h += fileContext(f, !!t);
   h += askBox(f, i, t);
   ex.innerHTML = h;
@@ -317,13 +408,14 @@ function renderExplain() {
 
 function fileContext(f, small) {
   let h = "";
+  if (FCH["file:" + cur.file]) h += `<h2>How a run gets to this file</h2><p class="help">Each line is a chain of calls from a script you run to the line that reads this file.</p>` + FCH["file:" + cur.file].map(path => `<div class="chain">${path.map(([k, ff, l, how]) => nodeLink(k, l, ff) + (how && how !== "call" ? ` <span class="help">(${esc(how)})</span>` : "")).join('<span class="arrow">→</span>')}<span class="arrow">→</span><b>${esc(cur.file.split("/").pop())}</b></div>`).join("");
   const ch = chainsHTML(cur.file);
   if (ch) h += `<h2>How a run gets to this file</h2><p class="help">Each line is a path from a playbook you run, through the includes, to here.</p>` + ch;
   const inc = f.incoming.filter(x => x[2] !== "mention");
   const men = f.incoming.filter(x => x[2] === "mention" && !inc.some(y => y[0] === x[0]));
   if (inc.length) h += `<h2>Included or copied from</h2><div class="card conn"><ul>${inc.slice(0, 30).map(([ff, l, how]) => `<li>${where(ff, l)} <span class="help">${esc(how)}</span>${srcLine(ff, l)}</li>`).join("")}</ul></div>`;
   if (men.length) h += `<h2>Mentioned in</h2><div class="card note"><ul>${men.slice(0, 20).map(([ff, l]) => `<li>${where(ff, l)}${srcLine(ff, l)}</li>`).join("")}</ul>${men.length > 20 ? `<p class="help">… and ${men.length - 20} more</p>` : ""}</div>`;
-  if (!ch && !inc.length && DATA.entries.includes(cur.file)) h += `<h2>Where it starts</h2><div class="card note"><p>This is a starting point: you run it yourself${f.lang === "yaml" ? " with ansible-playbook" : ""}. Nothing includes it.</p></div>`;
+  if (!ch && DATA.entries.includes(cur.file)) h += `<h2>Where it starts</h2><div class="card note"><p>This is a starting point: you run it yourself${f.lang === "yaml" ? " with ansible-playbook" : ""}.${inc.length ? "" : " Nothing includes it."}</p>${f.start != null ? `<p>Its work begins at ${where(cur.file, f.start, "line " + (f.start + 1))}, the call at the bottom; everything above it only sets defaults and defines functions.</p>` : ""}</div>`;
   return h;
 }
 
@@ -331,7 +423,7 @@ function fileContext(f, small) {
 function askBox(f, i, t) {
   return `<h2>Ask Claude about this line</h2><textarea id="askq" placeholder="Your question (optional)">${esc(localStorage.getItem("tracer-q") || "")}</textarea>
   <div class="row"><button id="askcopy">Copy question with the code</button><span id="askok" class="ok"></span></div>
-  <p class="help">Copies your question, this line and the task around it, so you can paste it into a chat with Claude.</p>`;
+  <p class="help">Copies your question, this line and the ${LEARN === "Bash" ? "function" : "task"} around it, so you can paste it into a chat with Claude.</p>`;
 }
 function wireAsk() {
   const b = $("#askcopy"); if (!b) return;
@@ -341,8 +433,8 @@ function wireAsk() {
     const s = t ? t.start : Math.max(0, i - 8), e = t ? Math.min(t.end, t.start + 60) : Math.min(f.lines.length - 1, i + 8);
     let snippet = "";
     for (let n = s; n <= e; n++) snippet += (n === i ? ">> " : "   ") + String(n + 1).padStart(4) + "  " + f.lines[n] + "\n";
-    const q = $("#askq").value.trim() || "Explain what the marked line does in this script, and the Ansible (or Bash) concept behind it. I'm new to Ansible.";
-    const txt = `I'm learning Ansible by reading the zdlra-patching repo (${DATA.branch} @ ${DATA.rev}).\n\nFile: ${cur.file}, line ${i + 1}` + (t ? `, in ${t.kind === "function" ? "the function" : "the task"} "${t.name}"` : "") + `\n\n\`\`\`\n${snippet}\`\`\`\n\n${q}`;
+    const q = $("#askq").value.trim() || (LEARN === "Bash" ? "Explain what the marked line does in this script, and the Bash concept behind it. I'm learning Bash." : "Explain what the marked line does in this script, and the Ansible (or Bash) concept behind it. I'm new to Ansible.");
+    const txt = `I'm learning ${LEARN} by reading the zdlra-patching repo (${DATA.branch} @ ${DATA.rev}).\n\nFile: ${cur.file}, line ${i + 1}` + (t ? `, in ${t.kind === "function" ? "the function" : "the task"} "${t.name}"` : "") + `\n\n\`\`\`\n${snippet}\`\`\`\n\n${q}`;
     try { await navigator.clipboard.writeText(txt); }
     catch (err) { const ta = document.createElement("textarea"); ta.value = txt; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
     $("#askok").textContent = "Copied. Paste it into Claude.";
@@ -357,7 +449,7 @@ function renderSide() {
   if (tab === "files") {
     const groups = {};
     for (const p of Object.keys(F).sort()) { const d = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "(top)"; (groups[d] = groups[d] || []).push(p); }
-    const order = Object.keys(groups).sort((a, b) => (a.startsWith("ansible") ? 0 : 1) - (b.startsWith("ansible") ? 0 : 1) || a.localeCompare(b));
+    const order = Object.keys(groups).sort((a, b) => (a === "(top)" ? -1 : b === "(top)" ? 1 : 0) || (a.startsWith("ansible") ? 0 : 1) - (b.startsWith("ansible") ? 0 : 1) || a.localeCompare(b));
     let h = `<div class="dir">Start here (★ = you run it)</div>` + DATA.entries.map(p => `<a class="fl ${p === cur.file ? "on" : ""}" onclick="go('${p}',null)" title="${p}"><span class="star">★</span> ${esc(p)}</a>`).join("");
     for (const d of order) h += `<div class="dir">${esc(d)}/</div>` + groups[d].map(p => `<a class="fl ${p === cur.file ? "on" : ""}" onclick="go('${p}',null)" title="${p}">${esc(p.split("/").pop())}</a>`).join("");
     if (body.dataset.tab !== "files") { body.innerHTML = h; body.dataset.tab = "files"; }
@@ -365,10 +457,15 @@ function renderSide() {
   } else if (tab === "outline") {
     const f = F[cur.file], cur_t = cur.line != null ? f.taskOf[cur.line] : null;
     let h = f.tasks.length ? "" : `<p class="empty" style="padding:0 12px">No tasks or functions in this file.</p>`;
-    for (const t of f.tasks) h += `<a class="ol ${t.id === cur_t ? "on" : ""}" style="padding-left:${10 + t.depth * 14}px" onclick="go(cur.file,${t.start})">${esc(t.name || "(" + t.module + ")")} <small>${t.start + 1}</small></a>`;
+    const secs = (f.sections || []).slice();
+    for (const t of f.tasks) {
+      while (secs.length && secs[0][0] <= t.start) { const [l, name] = secs.shift(); h += `<div class="dir" style="cursor:pointer" onclick="go(cur.file,${l})">${esc(name)}</div>`; }
+      h += `<a class="ol ${t.id === cur_t ? "on" : ""}" style="padding-left:${10 + t.depth * 14}px" onclick="go(cur.file,${t.start})">${esc(t.name || "(" + t.module + ")")} <small>${t.start + 1}</small></a>`;
+    }
+    for (const [l, name] of secs) h += `<div class="dir" style="cursor:pointer" onclick="go(cur.file,${l})">${esc(name)}</div>`;
     body.innerHTML = h;
   } else {
-    const groups = [["module", "Modules (what a task does)"], ["task", "Task keywords"], ["play", "Play keywords"], ["filter", "Jinja filters"], ["test", "Jinja tests"], ["magic", "Built-in variables"], ["jinja", "Jinja syntax"], ["yaml", "YAML syntax"], ["bash", "Bash"], ["tool", "Oracle tools"], ["cfg", "ansible.cfg"]];
+    const groups = DATA.groups || [["module", "Modules (what a task does)"], ["task", "Task keywords"], ["play", "Play keywords"], ["filter", "Jinja filters"], ["test", "Jinja tests"], ["magic", "Built-in variables"], ["jinja", "Jinja syntax"], ["yaml", "YAML syntax"], ["bash", "Bash"], ["tool", "Oracle tools"], ["cfg", "ansible.cfg"]];
     let h = "";
     for (const [g, label] of groups) {
       h += `<div class="dir">${label}</div>`;
@@ -383,7 +480,7 @@ const index = [];
 for (const p of Object.keys(F)) index.push({label: p.split("/").pop(), sub: p, go: () => go(p, null), kind: 0});
 for (const [k, s] of Object.entries(S)) {
   const d = s.defs[0] || s.uses[0];
-  if (d) index.push({label: s.title, sub: ({var: "variable", shvar: "shell variable", func: "function", filter: "filter", test: "test"}[s.kind] || s.kind) + " · " + d.f.split("/").pop(), go: () => go(d.f, d.l, k), kind: 1});
+  if (d) index.push({label: s.title, sub: ({var: "variable", shvar: "shell variable", func: "function", filter: "filter", test: "test", dyn: "function picked at run time"}[s.kind] || s.kind) + " · " + d.f.split("/").pop(), go: () => go(d.f, d.l, k), kind: s.kind === "dyn" ? 3 : 1});
 }
 for (const [k, g] of Object.entries(GL)) if (!k.startsWith("note:") && !k.startsWith("cfilter") && !k.startsWith("ctest")) index.push({label: g[0], sub: "concept", go: () => { tab = "concepts"; document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x.dataset.tab === "concepts")); renderSide(); $("#explain").innerHTML = `<h2>Concept</h2><div class="card concept"><b>${esc(g[0])}</b><p>${esc(g[1])}</p></div>`; }, kind: 2});
 let hits = [], hsel = 0;
