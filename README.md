@@ -10,6 +10,8 @@ A phased Bash script to automate patching of the Oracle Zero Data Loss Recovery 
 
 **Learning the code?** Open [docs/code-tracer.html](docs/code-tracer.html) in a browser (download it first, as GitHub shows HTML as source). Click any line of the Ansible or shell code to see what it does, the Ansible or Bash idea behind it, and where it connects: the variable's definition, the file an include runs, the chain of includes from the playbook. See [tools/code_tracer/README.md](tools/code_tracer/README.md).
 
+For the Bash version on its own, open [docs/code-tracer-bash.html](docs/code-tracer-bash.html). Each line of `zdlra_patch.sh`, `jump/` and `staging/` gets a plain-words reading ("If `$DRY_RUN` is on, leaves the function..."), the Bash idea behind it, and, for every function, who calls it and the chain of calls from the script you run (`zdlra_patch.sh` → `main()` → `phase_cells()` → `run_patchmgr()` → ...).
+
 For a detailed walkthrough with diagrams, see [docs/how-it-works.html](docs/how-it-works.html). It covers how the scripts and functions connect, the stages, failure handling and the files they leave behind, and section 13 traces a real run step by step through the code. GitHub shows HTML as source, so download it and open it in a browser. It describes v0.8.0, so its line numbers may drift as the scripts change.
 
 The script breaks a patch into phases. You can run them one at a time or all together:

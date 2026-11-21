@@ -37,3 +37,41 @@ It needs Python 3.6+ and PyYAML (which Ansible already installs), and writes
 The "what this does in the script" side comes from the repo itself: task names, the
 comments above tasks and variables, and each file's opening comment. Better comments in
 the code make better explanations here.
+
+## The Bash version: docs/code-tracer-bash.html
+
+A second page covers only the shell version (`zdlra_patch.sh`, `jump/`, `staging/` and their
+config examples), and goes deeper into Bash:
+
+- **In plain words.** Every line gets a sentence that reads the code out:
+  `[[ -n "$RUN_ID" ]] || die "..."` becomes "Makes sure that `$RUN_ID` is not empty; if not,
+  stops the script with the error ...". `if`, `for`, `while` and `case` say which lines they
+  cover; `fi`, `done` and `}` say where their block started. The cards below it explain the
+  Bash syntax and commands on the line (with the options used, e.g. `grep -qxF`).
+- **Functions.** Click a function name to jump to its definition. The definition shows the
+  comment above it, every place that calls it, every function it calls, and **how a run gets
+  here**: the chains of calls from the script you run, e.g. `zdlra_patch.sh` → `main()` →
+  `"phase_${p}"` → `phase_cells()` → `run_patchmgr()` → `patchmgr_attempt()`. A name built at
+  run time (`"phase_${p}"`, `"do_${ACTION}"`) lists every function it can be.
+- **Variables.** A `local` variable links only within its function. A setting links to its
+  default in the script and to the line of the config example that replaces it.
+- **Across scripts.** The jump server's calls to `zdlra_patch.sh` over ssh and to
+  `oem_blackout.sh`, the `source` of the config file, and the scripts sent to the nodes in
+  quoted here-documents (`<<'REMOTE'`) are followed too; lines inside such a here-document
+  say that they run on the node, not where they are written.
+
+Rebuild it after the scripts change:
+
+    python3 tools/code_tracer/build_bash.py
+
+It needs only Python 3.6+ (no PyYAML) and writes `docs/code-tracer-bash.html`.
+
+| File | What it holds |
+|---|---|
+| `build_bash.py` | Reads the shell scripts, works out functions, calls, variables and blocks, writes the plain-words reading of each line, and writes the page. |
+| `shlex_lite.py` | A small Bash reader: which words are commands, where blocks start and end, here-documents, strings over several lines. |
+| `glossary_bash.py` | The Bash explanations: commands and their options, syntax, test operators, traps. Add or reword an entry, then rebuild. |
+
+The plain-words reading is worked out from the code by rules, not by hand, so an unusual
+line may read awkwardly; the comment above it and "Ask Claude about this line" are there for
+those.
