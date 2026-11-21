@@ -1,3 +1,4 @@
 * text=auto eol=lf
 docs/code-tracer.html linguist-generated=true
 docs/code-tracer-bash.html linguist-generated=true
+docs/trainer/*.html linguist-generated=true
