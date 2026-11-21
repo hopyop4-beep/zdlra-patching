@@ -16,8 +16,6 @@ clone; it needs no server and no internet). Then:
 - **Outline** (left) lists the tasks or functions of the open file. **Concepts** is the
   whole glossary. **Search** (or `/`) finds files, variables, functions and concepts.
 - **↑ / ↓** move line by line. **Back** returns to where you were before following a link.
-- **Ask Claude about this line** copies your question with the line and its task, ready
-  to paste into a chat with Claude.
 
 ## Rebuilding it
 
@@ -26,13 +24,14 @@ The page is generated from the code, so rebuild it after the code changes:
     python3 tools/code_tracer/build.py
 
 It needs Python 3.6+ and PyYAML (which Ansible already installs), and writes
-`docs/code-tracer.html`. The commit it was built from shows at the top of the page.
+`docs/code-tracer.html` and `docs/trainer/code-tracer.html` (see "Two builds" below). The commit it was built from shows at the top of the page.
 
 | File | What it holds |
 |---|---|
 | `build.py` | Reads every file in the repo, works out the tasks, variables, includes and functions, and writes the page. |
 | `glossary.py` | The plain-language explanations. Add or reword an entry, then rebuild. |
 | `viewer.html` | The page itself (layout and script); `build.py` puts the data into it. |
+| `page.py` | Puts the data into `viewer.html` for each build: standalone (no Claude) or trainer (Ask Claude). |
 
 The "what this does in the script" side comes from the repo itself: task names, the
 comments above tasks and variables, and each file's opening comment. Better comments in
@@ -64,7 +63,8 @@ Rebuild it after the scripts change:
 
     python3 tools/code_tracer/build_bash.py
 
-It needs only Python 3.6+ (no PyYAML) and writes `docs/code-tracer-bash.html`.
+It needs only Python 3.6+ (no PyYAML) and writes `docs/code-tracer-bash.html` and
+`docs/trainer/code-tracer-bash.html`.
 
 | File | What it holds |
 |---|---|
@@ -73,5 +73,31 @@ It needs only Python 3.6+ (no PyYAML) and writes `docs/code-tracer-bash.html`.
 | `glossary_bash.py` | The Bash explanations: commands and their options, syntax, test operators, traps. Add or reword an entry, then rebuild. |
 
 The plain-words reading is worked out from the code by rules, not by hand, so an unusual
-line may read awkwardly; the comment above it and "Ask Claude about this line" are there for
+line may read awkwardly; the comment above it (and, in the trainer, Ask Claude) are there for
 those.
+
+## Two builds: standalone, and the Exadata Trainer's Code tracer tab
+
+Each build script writes the same tracer twice:
+
+| Page | Claude | Use it |
+|---|---|---|
+| `docs/code-tracer.html`, `docs/code-tracer-bash.html` | none at all | Standalone: download and open in any browser, no server, no internet. This is the one the main README links to. |
+| `docs/trainer/code-tracer.html`, `docs/trainer/code-tracer-bash.html` | **Ask Claude about this line** | Only inside the Exadata Trainer, which serves them in its **Code tracer** tab (Reference, in the sidebar). |
+
+In the trainer build, the explanation panel ends with a chat: type a question (or nothing, for
+"explain this line") and press Enter. Claude is shown the file with the line marked, the task or
+function around it and the tracer's plain-words reading, and answers in the panel; follow-up
+questions keep the conversation for that line. A picker chooses Claude Sonnet 5.5 (quicker, the
+default) or Claude Opus 5.5 (deeper).
+
+**How it reaches Claude, and why there is no API key.** The page never calls Claude itself. It
+posts the question to the trainer's own server (`POST /ai/tracer` on 127.0.0.1), which asks
+through the trainer's existing link to Claude (`claude_conn.py`: the Claude Code that the Claude
+desktop app installs, signed in once with `Claude Login.bat`, run with no tools). So no API key is
+typed, stored in the browser, or kept in this repo, and nothing is sent anywhere but Claude. The
+trainer serves the pages straight from this repo (`../zdlra-patching/docs/trainer/` next to the
+trainer, or `EXADATA_TRACER_DIR`), so `git pull` here updates the tab.
+
+The Claude code lives between `/*ASK-BEGIN*/` and `/*ASK-END*/` in `viewer.html`; `page.py`
+leaves it out of the standalone build. `--trainer-output ''` skips the trainer build.

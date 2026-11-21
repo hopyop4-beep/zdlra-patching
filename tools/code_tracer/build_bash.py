@@ -22,6 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import glossary_bash as GB  # noqa: E402
 import shlex_lite as SH  # noqa: E402
+import page as P  # noqa: E402
 
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 ENTRY_POINTS = ["zdlra_patch.sh", "jump/zdlra_patch_run.sh", "jump/oem_blackout.sh", "staging/zdlra_stage.sh"]
@@ -1619,7 +1620,7 @@ def chains_to(idx, fwd, rev, roots, target, limit=5, max_len=14):
 
 
 # ======================================================================================
-def build(out_path):
+def build(outputs):
     files = subprocess.check_output(["git", "ls-files"], cwd=REPO).decode().split("\n")
     idx = Index()
     for p in files:
@@ -1823,16 +1824,16 @@ def build(out_path):
         "entries": [e for e in ENTRY_POINTS if e in idx.files], "rev": rev_id, "branch": branch,
     }
     with open(os.path.join(HERE, "viewer.html"), encoding="utf-8") as fh:
-        page = fh.read()
-    blob = json.dumps(data, separators=(",", ":"), ensure_ascii=False).replace("</", "<\\/")
-    page = page.replace("<title>ZDLRA code tracer</title>", "<title>%s</title>" % data["title"])
-    page = page.replace("/*__DATA__*/null", blob)
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(page)
+        viewer = fh.read()
+    for path, mode in outputs:
+        page = P.render(viewer, data, mode, data["title"])
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(page)
     n_links = sum(len(t) for r in idx.files.values() for t in r["tokens"].values())
     n_plain = sum(len(r["plain"]) for r in idx.files.values())
     print("Wrote %s: %d files, %d functions, %d symbols, %d links, %d explained lines, %d KB" % (
-        os.path.relpath(out_path), len(idx.files), sum(1 for k in idx.nodes if k.startswith("func:")), len(idx.symbols),
+        ", ".join(os.path.relpath(p) for p, _ in outputs), len(idx.files), sum(1 for k in idx.nodes if k.startswith("func:")), len(idx.symbols),
         n_links, n_plain, len(page) // 1024))
 
 
@@ -1864,5 +1865,9 @@ def uses(idx):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("-o", "--output", default=os.path.join(REPO, "docs", "code-tracer-bash.html"))
-    build(ap.parse_args().output)
+    ap.add_argument("-o", "--output", default=os.path.join(REPO, "docs", "code-tracer-bash.html"),
+                    help="the standalone page, with no Claude (default: docs/code-tracer-bash.html)")
+    ap.add_argument("--trainer-output", default=os.path.join(REPO, "docs", "trainer", "code-tracer-bash.html"),
+                    help="the Exadata Trainer's page, with Ask Claude (default: docs/trainer/code-tracer-bash.html; '' to skip)")
+    a = ap.parse_args()
+    build([(a.output, "none")] + ([(a.trainer_output, "trainer")] if a.trainer_output else []))
