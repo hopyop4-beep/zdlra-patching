@@ -49,6 +49,9 @@ header h1{font-size:15px;margin:0;white-space:nowrap}header .rev{font:12px var(-
 textarea{width:100%;font:13px var(--body);border:1px solid var(--line);border-radius:6px;padding:6px 8px;background:var(--bg);color:var(--ink);min-height:60px}
 .row{display:flex;gap:8px;align-items:center;margin-top:6px}.ok{color:#2f6b3a;font-size:13px}
 .help{font-size:13px;color:var(--muted)}.help kbd{font:11px var(--mono);border:1px solid var(--line);border-radius:3px;padding:0 4px;background:var(--soft)}
+/*ASK-BEGIN*/.msg{font-size:13.5px;border-radius:6px;padding:6px 10px;margin:0 0 8px}.msg p{margin:0 0 6px}.msg p:last-child{margin-bottom:0}.msg ul{margin:2px 0 6px;padding-left:18px}.msg code{font:12.5px var(--mono);background:var(--soft);border-radius:3px;padding:0 3px}.msg .snip{margin:4px 0 6px}
+.msg.me{background:var(--accent-soft);white-space:pre-wrap}.msg.ai{border:1px solid var(--line);border-left:4px solid #5b4a8a}.msg.err{border:1px solid #b4532a;color:#b4532a}
+.row{flex-wrap:wrap}.row button{white-space:nowrap}#askmodel{font:13px var(--body);padding:2px 4px;border:1px solid var(--line);border-radius:5px;background:var(--bg);color:var(--ink);margin-left:auto}/*ASK-END*/
 @media (max-width:1100px){#main{grid-template-columns:200px minmax(0,1fr) 340px}}
 </style></head><body>
 <header>
@@ -419,28 +422,99 @@ function fileContext(f, small) {
   return h;
 }
 
+/*ASK-BEGIN*/
 // ---------- ask Claude ----------
+// Only in the trainer build (docs/trainer/), served by the Exadata Trainer at /tracer/...: questions go to the trainer's
+// own server (POST /ai/tracer), which asks Claude through the Claude Code that the Claude desktop app installs. No API key
+// is needed and none is kept here. The standalone build (docs/code-tracer*.html) has none of this code.
+const MODELS = [["claude-sonnet-5-5", "Claude Sonnet 5.5 (quicker)"], ["claude-opus-5-5", "Claude Opus 5.5 (deeper)"]];
+const convs = {};            // "file:line" -> [{q, a, note}], kept while the page is open
+let claudeOk = null;         // null until /ai/status answers
+fetch("/ai/status").then(r => r.json()).then(s => { claudeOk = !!s.available; }).catch(() => { claudeOk = false; });
+const tmodel = () => { const m = localStorage.getItem("tracer-claude-model"); return MODELS.some(x => x[0] === m) ? m : MODELS[0][0]; };
+
 function askBox(f, i, t) {
-  return `<h2>Ask Claude about this line</h2><textarea id="askq" placeholder="Your question (optional)">${esc(localStorage.getItem("tracer-q") || "")}</textarea>
-  <div class="row"><button id="askcopy">Copy question with the code</button><span id="askok" class="ok"></span></div>
-  <p class="help">Copies your question, this line and the ${LEARN === "Bash" ? "function" : "task"} around it, so you can paste it into a chat with Claude.</p>`;
+  const at = cur.file + ":" + i;
+  return `<h2>Ask Claude about this line</h2>
+  <div id="chat">${chatHtml(convs[at] || [])}</div>
+  <textarea id="askq" placeholder="Ask about this line… (Enter sends, Shift+Enter for a new line)">${esc(localStorage.getItem("tracer-q") || "")}</textarea>
+  <div class="row"><button id="asksend">Ask Claude</button><button id="asknew" title="Forget this conversation">New conversation</button>
+    <select id="askmodel" title="Which Claude answers">${MODELS.map(([id, label]) => `<option value="${id}"${id === tmodel() ? " selected" : ""}>${esc(label)}</option>`).join("")}</select></div>
+  <p class="help" id="askok">Claude sees this file with the line marked, the ${LEARN === "Bash" ? "function" : "task"} around it, and your question. Follow-up questions keep the conversation for this line. An answer takes a few seconds to a minute.</p>`;
 }
+
+function md(s) {
+  // Small, safe Markdown: escape everything first, then add code blocks, inline code, bold, lists and paragraphs.
+  const blocks = [];
+  s = s.replace(/```[^\n]*\n([\s\S]*?)(```|$)/g, (m, code) => { blocks.push(code); return "\u0000" + (blocks.length - 1) + "\u0000"; });
+  let h = esc(s).replace(/`([^`\n]+)`/g, "<code>$1</code>").replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  h = h.split(/\n{2,}/).map(p => {
+    if (/^\u0000\d+\u0000$/.test(p.trim())) return p.trim();
+    const lines = p.split("\n");
+    if (lines.every(l => /^\s*([-*]|\d+\.)\s/.test(l))) return "<ul>" + lines.map(l => "<li>" + l.replace(/^\s*([-*]|\d+\.)\s/, "") + "</li>").join("") + "</ul>";
+    if (/^#{1,4}\s/.test(p)) return "<p><b>" + p.replace(/^#{1,4}\s/, "") + "</b></p>";
+    return "<p>" + p.replace(/\n/g, "<br>") + "</p>";
+  }).join("");
+  return h.replace(/\u0000(\d+)\u0000/g, (m, n) => `<pre class="snip">${esc(blocks[+n])}</pre>`);
+}
+function chatHtml(turns) {
+  return turns.map(x => `<div class="msg me">${esc(x.q)}</div>` +
+    (x.a != null ? `<div class="msg ai">${md(x.a)}</div>` : x.err ? `<div class="msg err">${esc(x.err)}</div>` : `<div class="msg ai"><span class="help">Claude is thinking…</span></div>`)).join("");
+}
+
+// What Claude is shown: the whole file (or 300 lines around the line in a very long one), the line marked with >>.
+function contextFor(file, i) {
+  const f = F[file], t = f.tasks[f.taskOf[i]];
+  const big = f.lines.length > 1500;
+  const s = big ? Math.max(0, (t ? t.start : i) - 150) : 0, e = big ? Math.min(f.lines.length - 1, (t ? t.end : i) + 150) : f.lines.length - 1;
+  let code = "";
+  for (let n = s; n <= e; n++) code += (n === i ? ">> " : "   ") + String(n + 1).padStart(4) + "  " + f.lines[n] + "\n";
+  const plain = f.plain && f.plain[i] ? `\nThe tracer's own plain-words reading of that line (worked out by rules, so it may be clumsy): ${String(f.plain[i]).replace(/<[^>]+>/g, "")}\n` : "";
+  return `Repository: zdlra-patching (${DATA.branch} @ ${DATA.rev}). File: ${file}${big ? ` (lines ${s + 1}-${e + 1} of ${f.lines.length})` : ""}.\n` +
+    `The line asked about is line ${i + 1}, marked with >>` + (t ? `, inside the ${t.kind === "function" ? "function" : "task"} "${t.name}" (lines ${t.start + 1}-${t.end + 1})` : "") + `.\n${plain}\n${code}`;
+}
+
 function wireAsk() {
-  const b = $("#askcopy"); if (!b) return;
-  $("#askq").oninput = e => localStorage.setItem("tracer-q", e.target.value);
-  b.onclick = async () => {
-    const f = F[cur.file], i = cur.line, t = f.tasks[f.taskOf[i]];
-    const s = t ? t.start : Math.max(0, i - 8), e = t ? Math.min(t.end, t.start + 60) : Math.min(f.lines.length - 1, i + 8);
-    let snippet = "";
-    for (let n = s; n <= e; n++) snippet += (n === i ? ">> " : "   ") + String(n + 1).padStart(4) + "  " + f.lines[n] + "\n";
-    const q = $("#askq").value.trim() || (LEARN === "Bash" ? "Explain what the marked line does in this script, and the Bash concept behind it. I'm learning Bash." : "Explain what the marked line does in this script, and the Ansible (or Bash) concept behind it. I'm new to Ansible.");
-    const txt = `I'm learning ${LEARN} by reading the zdlra-patching repo (${DATA.branch} @ ${DATA.rev}).\n\nFile: ${cur.file}, line ${i + 1}` + (t ? `, in ${t.kind === "function" ? "the function" : "the task"} "${t.name}"` : "") + `\n\n\`\`\`\n${snippet}\`\`\`\n\n${q}`;
-    try { await navigator.clipboard.writeText(txt); }
-    catch (err) { const ta = document.createElement("textarea"); ta.value = txt; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
-    $("#askok").textContent = "Copied. Paste it into Claude.";
-    setTimeout(() => { const o = $("#askok"); if (o) o.textContent = ""; }, 4000);
-  };
+  const q = $("#askq"); if (!q) return;
+  const file = cur.file, line = cur.line, at = file + ":" + line;
+  if (claudeOk === false) $("#askok").textContent = "Claude Code was not found on this PC, so the trainer cannot ask Claude. Open the Claude desktop app once (or run \"Claude Login.bat\"), then reload.";
+  q.oninput = e => localStorage.setItem("tracer-q", e.target.value);
+  q.onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } e.stopPropagation(); };
+  $("#askmodel").onchange = e => localStorage.setItem("tracer-claude-model", e.target.value);
+  $("#askmodel").onkeydown = e => e.stopPropagation();
+  $("#asknew").onclick = () => { delete convs[at]; $("#chat").innerHTML = ""; };
+  $("#asksend").onclick = send;
+
+  async function send() {
+    const turns = convs[at] = convs[at] || [];
+    if (turns.some(x => x.a == null && !x.err)) return;   // one question at a time per line
+    const question = q.value.trim() || (LEARN === "Bash" ? "Explain what the marked line does, and the Bash idea behind it." : "Explain what the marked line does, and the Ansible (or Bash) idea behind it.");
+    const history = turns.filter(x => x.a != null).flatMap(x => [{role: "user", content: x.q}, {role: "assistant", content: x.a}]);
+    const turn = {q: question}; turns.push(turn);
+    q.value = ""; localStorage.removeItem("tracer-q");
+    show();
+    try {
+      const r = await fetch("/ai/tracer", {method: "POST", headers: {"Content-Type": "application/json", "X-Trainer": "1"},
+        body: JSON.stringify({learning: LEARN, context: contextFor(file, line), history, question, model: tmodel()})});
+      const j = r.ok ? await r.json() : {error: r.status === 404 ? "This trainer has no tracer support yet: restart the Exadata Trainer after updating it." : `The trainer answered ${r.status}.`};
+      if (j.error) turn.err = j.error; else turn.a = j.answer;
+    } catch (err) { turn.err = "Could not reach the Exadata Trainer. Is it still running?"; }
+    if (turn.err) {   // shown once, then dropped so it is not sent as history; the question goes back in the box
+      show(); turns.splice(turns.indexOf(turn), 1);
+      const box = $("#askq"); if (cur.file === file && cur.line === line && box && !box.value) box.value = question;
+      return;
+    }
+    show();
+  }
+  function show() {   // only if the learner is still on that line
+    if (cur.file !== file || cur.line !== line) return;
+    const c = $("#chat"); if (!c) return;
+    c.innerHTML = chatHtml(convs[at] || []);
+    const last = c.lastElementChild; if (last) last.scrollIntoView({block: "nearest"});
+    const b = $("#asksend"); if (b) b.disabled = (convs[at] || []).some(x => x.a == null && !x.err);
+  }
 }
+/*ASK-END*/
 
 // ---------- sidebar ----------
 document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => { tab = b.dataset.tab; document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x === b)); renderSide(); });
